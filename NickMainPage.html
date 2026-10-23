@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script>
+        window.FontAwesomeConfig = {
+          autoReplaceSvg: 'nest'
+        };
+      </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/js/all.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <meta charset="utf-8">
+    <title>Nick's Process Services | Professional Legal Document Delivery</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Fast, discreet, and reliable legal document delivery across Southern California. Serving attorneys, courts, and businesses with professional process services.">
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#064E3B',   /* Forest Green */
+                        accent: '#FBBF24',    /* Amber */
+                        ink: '#0f172a',       /* Near-black text */
+                        surface: '#ffffff',
+                        muted: '#6b7280',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        display: ['"Playfair Display"', 'serif'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .hero-gradient { background: linear-gradient(135deg, #064E3B 0%, #065F46 100%); }
+        .card-hover:hover { transform: translateY(-4px); transition: all 0.3s ease; }
+    </style>
+</head>
+<body class="bg-surface font-sans text-ink antialiased">
+
+    <!-- Header -->
+    <header class="border-b border-gray-100 bg-white sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
+            <a href="#" class="flex items-center gap-3">
+                <span class="w-10 h-10 rounded-lg bg-primary flex items-center justify-center text-accent text-xl"><i class="fa-solid fa-scale-balanced"></i></span>
+                <span class="font-display font-bold text-2xl tracking-tight text-primary">Nick's<span class="text-ink">Process</span></span>
+            </a>
+            <nav class="hidden md:flex items-center gap-8 text-sm font-medium text-gray-600">
+                <a href="#services" class="hover:text-primary transition-colors">Services</a>
+                <a href="#coverage" class="hover:text-primary transition-colors">Coverage</a>
+                <a href="#pricing" class="hover:text-primary transition-colors">Pricing</a>
+                <a href="#reviews" class="hover:text-primary transition-colors">Reviews</a>
+                <a href="#checkout" class="inline-flex items-center gap-2 bg-primary text-white px-5 py-2.5 rounded-lg hover:bg-opacity-90 transition-all">
+                    <i class="fa-solid fa-paper-plane"></i> Get Service
+                </a>
+            </nav>
+        </div>
+    </header>
+
+    <!-- Hero Section -->
+    <section class="hero-gradient text-white pt-20 pb-24">
+        <div class="max-w-7xl mx-auto px-6 grid lg:grid-cols-2 gap-12 items-center">
+            <div>
+                <h1 class="font-display text-5xl lg:text-6xl font-bold leading-tight mb-6">
+                    Fast, Discreet & Reliable Legal Document Delivery
+                </h1>
+                <p class="text-xl text-green-100 mb-8 max-w-lg">
+                    Professional process services for attorneys, courts, and businesses across Southern California. Your trusted partner for confidential document delivery.
+                </p>
+                <div class="flex flex-wrap gap-4">
+                    <button class="bg-accent text-gray-900 px-8 py-4 rounded-lg font-bold text-lg hover:bg-yellow-400 transition-colors flex items-center gap-2">
+                        <i class="fa-solid fa-bolt"></i> Emergency Rush
+                    </button>
+                    <a href="#coverage" class="border border-white/30 px-8 py-4 rounded-lg font-medium hover:bg-white/10 transition-colors">View Coverage</a>
+                </div>
+            </div>
+            <div class="relative">
+                <div class="bg-white p-8 rounded-2xl shadow-2xl text-gray-900">
+                    <h3 class="font-display text-2xl font-bold mb-6">Check Service Availability</h3>
+                    <div class="space-y-4">
+                        <label class="block text-sm font-medium text-gray-600">Enter ZIP code to verify coverage</label>
+                        <div class="flex gap-3">
+                            <input type="text" id="zip-input" placeholder="e.g. 90745" class="flex-1 border border-gray-300 rounded-lg px-4 py-3 focus:ring-2 focus:ring-primary focus:border-transparent outline-none">
+                            <button onclick="verifyZip()" class="bg-primary text-white px-6 py-3 rounded-lg font-medium hover:bg-opacity-90">Verify</button>
+                        </div>
+                        <p id="zip-result" class="text-xs text-gray-500">Serving Long Beach, Carson, Compton, and surrounding areas.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Trust Indicators -->
+    <section class="py-12 border-b border-gray-100">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-8 text-center">
+                <div>
+                    <p class="font-display text-4xl font-bold text-primary">15+</p>
+                    <p class="text-muted text-sm mt-1">Years Experience</p>
+                </div>
+                <div>
+                    <p class="font-display text-4xl font-bold text-primary">10k+</p>
+                    <p class="text-muted text-sm mt-1">Documents Served</p>
+                </div>
+                <div>
+                    <p class="font-display text-4xl font-bold text-primary">Same Day</p>
+                    <p class="text-muted text-sm mt-1">Service Available</p>
+                </div>
+                <div>
+                    <p class="font-display text-4xl font-bold text-primary">24/7</p>
+                    <p class="text-muted text-sm mt-1">Support Line</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Services Section -->
+    <section id="services" class="py-24">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="text-center mb-16">
+                <h2 class="font-display text-4xl font-bold mb-4">Our Process Services</h2>
+                <p class="text-muted text-lg max-w-2xl mx-auto">Comprehensive legal document delivery solutions tailored to meet your specific needs.</p>
+            </div>
+
+            <div class="grid md:grid-cols-3 gap-8">
+                <div class="p-8 border border-gray-100 rounded-2xl card-hover bg-white shadow-sm">
+                    <div class="w-14 h-14 bg-green-50 rounded-xl flex items-center justify-center text-primary text-2xl mb-6">
+                        <i class="fa-solid fa-file-signature"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-3">Standard Service</h3>
+                    <p class="text-muted mb-6">Regular business day delivery with full documentation and proof of service.</p>
+                    <ul class="space-y-2 text-sm">
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> Business hours service</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> Proof of service included</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> Email notifications</li>
+                    </ul>
+                </div>
+
+                <div class="p-8 border-2 border-primary rounded-2xl card-hover bg-white shadow-md relative">
+                    <div class="absolute -top-3 left-1/2 -translate-x-1/2 bg-accent text-gray-900 px-4 py-1 rounded-full text-xs font-bold uppercase tracking-wide">Most Popular</div>
+                    <div class="w-14 h-14 bg-green-50 rounded-xl flex items-center justify-center text-primary text-2xl mb-6">
+                        <i class="fa-solid fa-bolt"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-3">Expedited Service</h3>
+                    <p class="text-muted mb-6">Priority handling with faster turnaround times for urgent matters.</p>
+                    <ul class="space-y-2 text-sm">
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> Priority queue</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> Same-day option</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> Dedicated server</li>
+                    </ul>
+                </div>
+
+                <div class="p-8 border border-gray-100 rounded-2xl card-hover bg-white shadow-sm">
+                    <div class="w-14 h-14 bg-green-50 rounded-xl flex items-center justify-center text-primary text-2xl mb-6">
+                        <i class="fa-solid fa-shield-halved"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-3">Specialized Service</h3>
+                    <p class="text-muted mb-6">Advanced solutions including stakeouts and evasive defendant tracking.</p>
+                    <ul class="space-y-2 text-sm">
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> Stakeout services</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> GPS tracking</li>
+                        <li class="flex items-center gap-2"><i class="fa-solid fa-check text-primary"></i> Video evidence</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Coverage Section -->
+    <section id="coverage" class="py-24 bg-gray-50">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="grid lg:grid-cols-2 gap-16 items-center">
+                <div>
+                    <h2 class="font-display text-4xl font-bold mb-6">Southern California Coverage</h2>
+                    <p class="text-muted text-lg mb-8">We provide comprehensive process services throughout Los Angeles County and surrounding areas, ensuring fast and reliable delivery wherever you need it.</p>
+
+                    <div class="grid grid-cols-2 gap-6">
+                        <div class="flex items-start gap-4">
+                            <div class="w-10 h-10 bg-white rounded-lg flex items-center justify-center text-primary shadow-sm">
+                                <i class="fa-solid fa-location-dot"></i>
+                            </div>
+                            <div>
+                                <h4 class="font-bold">Long Beach</h4>
+                                <p class="text-sm text-muted">Full city coverage</p>
+                            </div>
+                        </div>
+                        <div class="flex items-start gap-4">
+                            <div class="w-10 h-10 bg-white rounded-lg flex items-center justify-center text-primary shadow-sm">
+                                <i class="fa-solid fa-location-dot"></i>
+                            </div>
+                            <div>
+                                <h4 class="font-bold">Carson</h4>
+                                <p class="text-sm text-muted">Full city coverage</p>
+                            </div>
+                        </div>
+                        <div class="flex items-start gap-4">
+                            <div class="w-10 h-10 bg-white rounded-lg flex items-center justify-center text-primary shadow-sm">
+                                <i class="fa-solid fa-location-dot"></i>
+                            </div>
+                            <div>
+                                <h4 class="font-bold">Compton</h4>
+                                <p class="text-sm text-muted">Full city coverage</p>
+                            </div>
+                        </div>
+                        <div class="flex items-start gap-4">
+                            <div class="w-10 h-10 bg-white rounded-lg flex items-center justify-center text-primary shadow-sm">
+                                <i class="fa-solid fa-location-dot"></i>
+                            </div>
+                            <div>
+                                <h4 class="font-bold">Surrounding Areas</h4>
+                                <p class="text-sm text-muted">Extended coverage</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-white p-2 rounded-2xl shadow-lg">
+                    <img class="w-full h-auto rounded-xl" src="https://storage.googleapis.com/uxpilot-auth.appspot.com/gen_6ecd9a17d0_ed96b9c46faac023.png" alt="Professional aerial map view of Southern California coastal cities including Long Beach Carson and C" />
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Pricing Section -->
+    <section id="pricing" class="py-24">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="text-center mb-16">
+                <h2 class="font-display text-4xl font-bold mb-4">Transparent Pricing</h2>
+                <p class="text-muted text-lg">Choose the service level that fits your timeline and budget.</p>
+            </div>
+
+            <div class="grid md:grid-cols-3 gap-8 max-w-5xl mx-auto">
+                <div class="p-8 border border-gray-100 rounded-2xl card-hover">
+                    <h3 class="text-xl font-bold mb-2">Standard</h3>
+                    <div class="flex items-baseline gap-1 mb-6">
+                        <span class="text-4xl font-bold">$75</span>
+                        <span class="text-muted">/service</span>
+                    </div>
+                    <p class="text-muted text-sm mb-8">For non-urgent documents with flexible timelines.</p>
+                    <button data-plan="standard" data-price="75" class="w-full py-3 border-2 border-primary text-primary rounded-lg font-bold hover:bg-primary hover:text-white transition-colors">Select Plan</button>
+                </div>
+
+                <div class="p-8 border-2 border-primary rounded-2xl card-hover bg-white shadow-lg relative">
+                    <div class="absolute -top-3 left-1/2 -translate-x-1/2 bg-accent text-gray-900 px-4 py-1 rounded-full text-xs font-bold">BEST VALUE</div>
+                    <h3 class="text-xl font-bold mb-2">Expedited</h3>
+                    <div class="flex items-baseline gap-1 mb-6">
+                        <span class="text-4xl font-bold">$125</span>
+                        <span class="text-muted">/service</span>
+                    </div>
+                    <p class="text-muted text-sm mb-8">Priority handling with same-day availability.</p>
+                    <button data-plan="expedited" data-price="125" class="w-full py-3 bg-primary text-white rounded-lg font-bold hover:bg-opacity-90 transition-colors">Select Plan</button>
+                </div>
+
+                <div class="p-8 border border-gray-100 rounded-2xl card-hover">
+                    <h3 class="text-xl font-bold mb-2">Same-Day</h3>
+                    <div class="flex items-baseline gap-1 mb-6">
+                        <span class="text-4xl font-bold">$175</span>
+                        <span class="text-muted">/service</span>
+                    </div>
+                    <p class="text-muted text-sm mb-8">Immediate dispatch for time-critical matters.</p>
+                    <button data-plan="sameday" data-price="175" class="w-full py-3 border-2 border-primary text-primary rounded-lg font-bold hover:bg-primary hover:text-white transition-colors">Select Plan</button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Checkout / Service Request Section -->
+    <section id="checkout" class="py-24 bg-gray-50">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="grid lg:grid-cols-2 gap-16">
+                <div>
+                    <h2 class="font-display text-4xl font-bold mb-6">Request Service</h2>
+                    <p class="text-muted text-lg mb-10">Complete your service request in minutes. Select your plan and add any additional services you may need.</p>
+
+                    <div class="space-y-8">
+                        <div class="flex items-center gap-6 p-4 bg-white rounded-xl shadow-sm">
+                            <div class="w-12 h-12 bg-green-50 rounded-full flex items-center justify-center text-primary">
+                                <i class="fa-solid fa-file-lines"></i>
+                            </div>
+                            <div class="flex-1">
+                                <h4 class="font-bold">Certified Mail Add-on</h4>
+                                <p class="text-sm text-muted">Additional $15 for certified mailing</p>
+                            </div>
+                            <input type="checkbox" class="w-5 h-5 text-primary rounded" checked>
+                        </div>
+
+                        <div class="flex items-center gap-6 p-4 bg-white rounded-xl shadow-sm">
+                            <div class="w-12 h-12 bg-green-50 rounded-full flex items-center justify-center text-primary">
+                                <i class="fa-solid fa-video"></i>
+                            </div>
+                            <div class="flex-1">
+                                <h4 class="font-bold">Video Proof of Service</h4>
+                                <p class="text-sm text-muted">Additional $25 for video documentation</p>
+                            </div>
+                            <input type="checkbox" class="w-5 h-5 text-primary rounded">
+                        </div>
+
+                        <div class="flex items-center gap-6 p-4 bg-white rounded-xl shadow-sm">
+                            <div class="w-12 h-12 bg-green-50 rounded-full flex items-center justify-center text-primary">
+                                <i class="fa-solid fa-eye"></i>
+                            </div>
+                            <div class="flex-1">
+                                <h4 class="font-bold">Stakeout Service</h4>
+                                <p class="text-sm text-muted">Additional $50 for surveillance</p>
+                            </div>
+                            <input type="checkbox" class="w-5 h-5 text-primary rounded">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white p-8 rounded-2xl shadow-lg border border-gray-100">
+                    <h3 class="text-2xl font-bold mb-8">Order Summary</h3>
+
+                    <div class="space-y-4 mb-8">
+                        <div class="flex justify-between py-3 border-b border-gray-100">
+                            <span class="text-muted">Selected Plan</span>
+                            <span class="font-bold" id="plan-name">Expedited Service</span>
+                        </div>
+                        <div class="flex justify-between py-3 border-b border-gray-100">
+                            <span class="text-muted">Base Price</span>
+                            <span class="font-bold" id="base-price">$125.00</span>
+                        </div>
+                        <div class="flex justify-between py-3 border-b border-gray-100">
+                            <span class="text-muted">Add-ons</span>
+                            <span class="font-bold" id="addons-total">$40.00</span>
+                        </div>
+                        <div class="flex justify-between py-4 text-xl font-bold">
+                            <span>Total</span>
+                            <span class="text-primary" id="total-price">$165.00</span>
+                        </div>
+                    </div>
+
+                    <div class="mb-8">
+                        <label class="block text-sm font-medium text-gray-600 mb-2">Special Instructions</label>
+                        <textarea class="w-full border border-gray-300 rounded-lg p-4 h-32 resize-none focus:ring-2 focus:ring-primary outline-none" placeholder="Any specific delivery instructions..."></textarea>
+                    </div>
+
+                    <button class="w-full bg-primary text-white py-4 rounded-xl font-bold text-lg hover:bg-opacity-90 transition-all flex items-center justify-center gap-3">
+                        <i class="fa-solid fa-lock"></i> Complete Secure Checkout
+                    </button>
+
+                    <p class="text-xs text-center text-gray-500 mt-4">Secure 256-bit SSL encryption • No hidden fees</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Reviews Section -->
+    <section id="reviews" class="py-24">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="text-center mb-12">
+                <h2 class="font-display text-4xl font-bold mb-4">Trusted by Professionals</h2>
+                <p class="text-muted text-lg">See what attorneys and businesses say about our services.</p>
+            </div>
+
+            <div class="flex flex-wrap justify-center gap-3 mb-12">
+                <button class="review-filter active bg-primary text-white px-6 py-2 rounded-full text-sm font-medium transition-colors" data-filter="all">All Reviews</button>
+                <button class="review-filter bg-gray-100 text-gray-600 px-6 py-2 rounded-full text-sm font-medium hover:bg-gray-200 transition-colors" data-filter="evading">Evading Defendants</button>
+                <button class="review-filter bg-gray-100 text-gray-600 px-6 py-2 rounded-full text-sm font-medium hover:bg-gray-200 transition-colors" data-filter="stakeouts">Stakeouts</button>
+                <button class="review-filter bg-gray-100 text-gray-600 px-6 py-2 rounded-full text-sm font-medium hover:bg-gray-200 transition-colors" data-filter="courts">Courts</button>
+            </div>
+
+            <div class="grid md:grid-cols-3 gap-8" id="reviews-grid">
+                <div class="p-8 bg-white border border-gray-100 rounded-2xl shadow-sm card-hover" data-category="evading">
+                    <div class="flex items-center gap-1 text-accent mb-4">
+                        <i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i>
+                    </div>
+                    <p class="text-gray-600 mb-6">"Successfully served an evading defendant who had been avoiding service for months. Their stakeout service was professional and effective."</p>
+                    <div class="flex items-center gap-3">
+                        <img class="w-12 h-12 rounded-full object-cover" src="https://storage.googleapis.com/uxpilot-auth.appspot.com/gen_87403c68f4_134ef68b65d43b11.png" alt="professional portrait headshot of a middle-aged male attorney in a dark suit, neutral expression, so" />
+                        <div>
+                            <p class="font-bold">Robert Chen</p>
+                            <p class="text-xs text-muted">Attorney at Law</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="p-8 bg-white border border-gray-100 rounded-2xl shadow-sm card-hover" data-category="courts">
+                    <div class="flex items-center gap-1 text-accent mb-4">
+                        <i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i>
+                    </div>
+                    <p class="text-gray-600 mb-6">"The court system relies on Nick's Process for consistent, reliable service. Their attention to detail and documentation is exceptional."</p>
+                    <div class="flex items-center gap-3">
+                        <img class="w-12 h-12 rounded-full object-cover" src="https://storage.googleapis.com/uxpilot-auth.appspot.com/gen_87403c68f4_9142e5937dea3998.png" alt="professional portrait headshot of a confident female judge or legal professional in her fifties, war" />
+                        <div>
+                            <p class="font-bold">Sarah Mitchell</p>
+                            <p class="text-xs text-muted">Court Administrator</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="p-8 bg-white border border-gray-100 rounded-2xl shadow-sm card-hover" data-category="stakeouts">
+                    <div class="flex items-center gap-1 text-accent mb-4">
+                        <i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star"></i><i class="fa-solid fa-star-half-stroke"></i>
+                    </div>
+                    <p class="text-gray-600 mb-6">"Needed a difficult service completed urgently. Their team handled it discreetly and provided excellent proof of service documentation."</p>
+                    <div class="flex items-center gap-3">
+                        <img class="w-12 h-12 rounded-full object-cover" src="https://storage.googleapis.com/uxpilot-auth.appspot.com/gen_87403c68f4_dab041e38b4887b6.png" alt="professional portrait headshot of a young male corporate executive in a navy blazer, friendly expres" />
+                        <div>
+                            <p class="font-bold">Michael Torres</p>
+                            <p class="text-xs text-muted">Business Owner</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- FAQ Section -->
+    <section class="py-24 bg-gray-50">
+        <div class="max-w-3xl mx-auto px-6">
+            <div class="text-center mb-16">
+                <h2 class="font-display text-4xl font-bold mb-4">Frequently Asked Questions</h2>
+            </div>
+
+            <div class="space-y-4">
+                <details class="group bg-white rounded-xl border border-gray-100 overflow-hidden" open>
+                    <summary class="flex justify-between items-center p-6 cursor-pointer list-none">
+                        <span class="font-bold text-lg">What documents can you serve?</span>
+                        <span class="text-primary group-hover:rotate-180 transition-transform"><i class="fa-solid fa-chevron-down"></i></span>
+                    </summary>
+                    <div class="px-6 pb-6 text-muted">
+                        We handle all types of legal documents including subpoenas, complaints, summons, evictions, and more. Contact us for specialized document requirements.
+                    </div>
+                </details>
+
+                <details class="group bg-white rounded-xl border border-gray-100 overflow-hidden">
+                    <summary class="flex justify-between items-center p-6 cursor-pointer list-none">
+                        <span class="font-bold text-lg">How quickly can you serve documents?</span>
+                        <span class="text-primary group-hover:rotate-180 transition-transform"><i class="fa-solid fa-chevron-down"></i></span>
+                    </summary>
+                    <div class="px-6 pb-6 text-muted">
+                        Our Same-Day service offers immediate dispatch. Standard services typically complete within 1-3 business days depending on location and difficulty.
+                    </div>
+                </details>
+
+                <details class="group bg-white rounded-xl border border-gray-100 overflow-hidden">
+                    <summary class="flex justify-between items-center p-6 cursor-pointer list-none">
+                        <span class="font-bold text-lg">Do you provide proof of service?</span>
+                        <span class="text-primary group-hover:rotate-180 transition-transform"><i class="fa-solid fa-chevron-down"></i></span>
+                    </summary>
+                    <div class="px-6 pb-6 text-muted">
+                        Yes, every service includes detailed proof of service documentation. Video proof and GPS tracking are available as add-ons for enhanced documentation.
+                    </div>
+                </details>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="bg-ink text-white pt-20 pb-10">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="grid md:grid-cols-4 gap-12 mb-16">
+                <div class="col-span-2">
+                    <a href="#" class="flex items-center gap-3 mb-6">
+                        <span class="w-10 h-10 rounded-lg bg-primary flex items-center justify-center text-accent text-xl"><i class="fa-solid fa-scale-balanced"></i></span>
+                        <span class="font-display font-bold text-2xl tracking-tight">Nick's<span class="text-white">Process</span></span>
+                    </a>
+                    <p class="text-gray-400 max-w-sm">Professional legal document delivery services across Southern California. Trusted by attorneys, courts, and businesses since 2009.</p>
+                </div>
+                <div>
+                    <h4 class="font-bold mb-6">Quick Links</h4>
+                    <ul class="space-y-3 text-gray-400">
+                        <li><a href="#services" class="hover:text-white transition-colors">Services</a></li>
+                        <li><a href="#coverage" class="hover:text-white transition-colors">Coverage Area</a></li>
+                        <li><a href="#pricing" class="hover:text-white transition-colors">Pricing</a></li>
+                        <li><a href="#reviews" class="hover:text-white transition-colors">Reviews</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4 class="font-bold mb-6">Contact</h4>
+                    <ul class="space-y-3 text-gray-400">
+                        <li class="flex items-center gap-3"><i class="fa-solid fa-phone text-accent"></i> (555) 123-4567</li>
+                        <li class="flex items-center gap-3"><i class="fa-solid fa-envelope text-accent"></i> service@nicksprocess.com</li>
+                        <li class="flex items-center gap-3"><i class="fa-solid fa-location-dot text-accent"></i> Long Beach, CA 90803</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="border-t border-gray-800 pt-8 flex flex-col md:flex-row justify-between items-center gap-4 text-sm text-gray-500">
+                <p>&copy; 2026 Nick's Process Services. All rights reserved.</p>
+                <div class="flex gap-6">
+                    <a href="#" class="hover:text-white">Privacy Policy</a>
+                    <a href="#" class="hover:text-white">Terms of Service</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        function verifyZip() {
+            const zip = document.getElementById('zip-input').value;
+            const result = document.getElementById('zip-result');
+            const validZips = ['90745', '90803', '90802', '90746', '90220', '90221']; // Mock examples
+            if (validZips.includes(zip)) {
+                result.innerHTML = '<span class="text-green-600 font-bold"><i class="fa-solid fa-circle-check"></i> We serve this area!</span> Long Beach/Carson/Compton coverage confirmed.';
+            } else if (zip.length === 5) {
+                result.innerHTML = '<span class="text-red-600 font-bold"><i class="fa-solid fa-circle-xmark"></i> Outside standard area.</span> Contact us for custom quotes.';
+            } else {
+                result.innerHTML = 'Enter a 5-digit Southern California ZIP code.';
+            }
+        }
+
+        // Pricing plan selection
+        const planButtons = document.querySelectorAll('[data-plan]');
+        const planNameEl = document.getElementById('plan-name');
+        const basePriceEl = document.getElementById('base-price');
+        const totalPriceEl = document.getElementById('total-price');
+        const addonsTotalEl = document.getElementById('addons-total');
+        const addonCheckboxes = document.querySelectorAll('#checkout input[type="checkbox"]');
+
+        const plans = {
+            standard: { name: 'Standard Service', price: 75 },
+            expedited: { name: 'Expedited Service', price: 125 },
+            sameday: { name: 'Same-Day Service', price: 175 }
+        };
+
+        function recalc() {
+            let addons = 0;
+            addonCheckboxes.forEach(cb => { if (cb.checked) addons += parseFloat(cb.closest('.flex').querySelector('.text-sm').textContent.match(/\$([0-9]+)/)?.[1] || '0'); });
+            const base = parseFloat(basePriceEl.textContent.replace('$', ''));
+            totalPriceEl.textContent = '$' + (base + addons).toFixed(2);
+            addonsTotalEl.textContent = '$' + addons.toFixed(2);
+        }
+
+        planButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                planButtons.forEach(b => b.classList.remove('bg-primary', 'text-white'));
+                planButtons.forEach(b => b.classList.add('border-2', 'border-primary', 'text-primary'));
+                btn.classList.remove('border-2', 'border-primary', 'text-primary');
+                btn.classList.add('bg-primary', 'text-white');
+                const p = plans[btn.dataset.plan];
+                planNameEl.textContent = p.name;
+                basePriceEl.textContent = '$' + p.price.toFixed(2);
+                recalc();
+            });
+        });
+
+        addonCheckboxes.forEach(cb => cb.addEventListener('change', recalc));
+
+        // Review filtering
+        const filters = document.querySelectorAll('.review-filter');
+        const cards = document.querySelectorAll('#reviews-grid > div');
+        filters.forEach(f => {
+            f.addEventListener('click', () => {
+                filters.forEach(x => { x.classList.remove('bg-primary', 'text-white'); x.classList.add('bg-gray-100', 'text-gray-600'); });
+                f.classList.remove('bg-gray-100', 'text-gray-600');
+                f.classList.add('bg-primary', 'text-white');
+                const filter = f.dataset.filter;
+                cards.forEach(c => {
+                    c.style.display = (filter === 'all' || c.dataset.category === filter) ? '' : 'none';
+                });
+            });
+        });
+    </script>
+</body>
+</html>
