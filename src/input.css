@@ -191,22 +191,22 @@
 
     /* Logo lockup: the artwork plus a live-text tagline. The artwork's own baked-in tagline was a few pixels tall in the
        header, so it is gone from the image and set here at a readable size. The tagline's left edge matches the "N" of
-       NICK'S (6.3% of the image width), and the negative margin puts that "N" on the page's text edge. */
-    .logo-lockup { --logo-w: 12rem; display: inline-flex; flex-direction: column; align-items: flex-start; width: var(--logo-w); margin-left: calc(var(--logo-w) * -0.063); }
+       NICK'S (5.7% of the image width), and the negative margin puts that "N" on the page's text edge. */
+    .logo-lockup { --logo-w: 13.9rem; display: inline-flex; flex-direction: column; align-items: flex-start; width: var(--logo-w); margin-left: calc(var(--logo-w) * -0.0567); }
     .logo-lockup img { display: block; width: 100%; height: auto; }
     .logo-tagline {
-        margin-top: 0.15rem; padding-left: calc(var(--logo-w) * 0.063); font-size: 0.625rem; font-weight: 600; line-height: 1.2;
-        letter-spacing: 0.09em; text-transform: uppercase; white-space: nowrap; color: var(--gold-soft);
+        margin-top: 0.15rem; padding-left: calc(var(--logo-w) * 0.0567); font-size: 0.65rem; font-weight: 600; line-height: 1.2;
+        letter-spacing: 0.15em; text-transform: uppercase; white-space: nowrap; color: var(--gold-soft);
     }
     @media (min-width: 1024px) {
-        .logo-lockup { --logo-w: 14rem; }
-        .logo-tagline { font-size: 0.6875rem; letter-spacing: 0.13em; }
+        .logo-lockup { --logo-w: 16.25rem; }
+        .logo-tagline { font-size: 0.7188rem; letter-spacing: 0.2em; }
     }
-    .logo-lockup-lg { --logo-w: 17rem; }
-    .logo-lockup-lg .logo-tagline { font-size: 0.78rem; letter-spacing: 0.15em; }
+    .logo-lockup-lg { --logo-w: 18rem; }
+    .logo-lockup-lg .logo-tagline { font-size: 0.84rem; letter-spacing: 0.155em; }
     @media (min-width: 1024px) {
-        .logo-lockup-lg { --logo-w: 20rem; }
-        .logo-lockup-lg .logo-tagline { font-size: 0.9rem; letter-spacing: 0.17em; }
+        .logo-lockup-lg { --logo-w: 21rem; }
+        .logo-lockup-lg .logo-tagline { font-size: 0.97rem; letter-spacing: 0.17em; }
     }
 
     /* Hero rosette: two engraved layers turning slowly in opposite directions (the moiré between them is the effect).
