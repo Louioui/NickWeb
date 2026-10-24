@@ -24,7 +24,7 @@
         --hair: rgba(239, 168, 51, 0.4);
         --hair-ink: rgba(16, 34, 26, 0.14);
     }
-    html { scroll-padding-top: 6.5rem; }
+    html { scroll-padding-top: 7.5rem; }
     body {
         background: var(--pearl);
         color: var(--ink);
@@ -188,6 +188,26 @@
         border: 1px solid var(--hair-ink); border-radius: 2px; color: #3d5247; transition: background-color .2s;
     }
     .modal-close:hover { background: var(--pine-mist); }
+
+    /* Logo lockup: the artwork plus a live-text tagline. The artwork's own baked-in tagline was a few pixels tall in the
+       header, so it is gone from the image and set here at a readable size. The tagline's left edge matches the "N" of
+       NICK'S (6.3% of the image width), and the negative margin puts that "N" on the page's text edge. */
+    .logo-lockup { --logo-w: 12rem; display: inline-flex; flex-direction: column; align-items: flex-start; width: var(--logo-w); margin-left: calc(var(--logo-w) * -0.063); }
+    .logo-lockup img { display: block; width: 100%; height: auto; }
+    .logo-tagline {
+        margin-top: 0.15rem; padding-left: calc(var(--logo-w) * 0.063); font-size: 0.625rem; font-weight: 600; line-height: 1.2;
+        letter-spacing: 0.09em; text-transform: uppercase; white-space: nowrap; color: var(--gold-soft);
+    }
+    @media (min-width: 1024px) {
+        .logo-lockup { --logo-w: 14rem; }
+        .logo-tagline { font-size: 0.6875rem; letter-spacing: 0.13em; }
+    }
+    .logo-lockup-lg { --logo-w: 17rem; }
+    .logo-lockup-lg .logo-tagline { font-size: 0.78rem; letter-spacing: 0.15em; }
+    @media (min-width: 1024px) {
+        .logo-lockup-lg { --logo-w: 20rem; }
+        .logo-lockup-lg .logo-tagline { font-size: 0.9rem; letter-spacing: 0.17em; }
+    }
 
     /* Hero rosette: two engraved layers turning slowly in opposite directions (the moiré between them is the effect).
        Each layer is a separate element so the browser rasterises it once and the GPU just rotates it. */
