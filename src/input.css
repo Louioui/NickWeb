@@ -1,0 +1,276 @@
+/* Self-hosted fonts (latin subset, SIL Open Font License). Paths are relative to index.html (the compiled CSS is inlined there). */
+@font-face { font-family: "Libre Caslon Display"; font-style: normal; font-weight: 400; font-display: swap; src: url("assets/fonts/librecaslondisplay-400.woff2") format("woff2"); }
+@font-face { font-family: "Libre Caslon Text"; font-style: normal; font-weight: 400; font-display: swap; src: url("assets/fonts/librecaslontext-400.woff2") format("woff2"); }
+@font-face { font-family: "Libre Caslon Text"; font-style: italic; font-weight: 400; font-display: swap; src: url("assets/fonts/librecaslontext-400-italic.woff2") format("woff2"); }
+@font-face { font-family: "Libre Caslon Text"; font-style: normal; font-weight: 700; font-display: swap; src: url("assets/fonts/librecaslontext-700.woff2") format("woff2"); }
+@font-face { font-family: "Montserrat"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("assets/fonts/montserrat-var.woff2") format("woff2"); }
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+    :root {
+        --pine: #0d422e;
+        --pine-deep: #082b1e;
+        --pine-mist: #e6eee9;
+        --gold: #efa833;
+        --gold-soft: #f6d9a0;
+        --gold-deep: #c98a1f;
+        --bronze: #8a6420;
+        --pearl: #f4f6f0;
+        --ink: #10221a;
+        --muted: #566860;
+        --hair: rgba(239, 168, 51, 0.4);
+        --hair-ink: rgba(16, 34, 26, 0.14);
+    }
+    html { scroll-padding-top: 6.5rem; }
+    body {
+        background: var(--pearl);
+        color: var(--ink);
+        font-family: 'Montserrat', sans-serif;
+        /* No line-height here on purpose: Tailwind's reset makes body inherit 1.5, which is the spacing the approved design was built with. */
+    }
+    ::selection { background: var(--gold); color: var(--pine-deep); }
+    :focus-visible { outline: 2px solid var(--pine); outline-offset: 3px; }
+    .on-dark :focus-visible { outline-color: var(--gold); }
+    /* The coverage card is a light surface inside the dark hero, so its focus ring goes back to pine. */
+    .on-dark .hero-card :focus-visible { outline-color: var(--pine); }
+    h1, h2, h3, h4 { font-weight: 400; }
+
+    /* The page's one orchestrated moment: the hero settles in once on load. */
+    /* Only the "from" state is declared and the fill is "backwards", so if animation never runs the content is simply visible. */
+    @keyframes rise {
+        from { opacity: 0; transform: translateY(14px); }
+    }
+    .rise { animation: rise 0.9s cubic-bezier(0.16, 1, 0.3, 1) backwards; animation-delay: var(--d, 0s); }
+
+    details > summary::-webkit-details-marker { display: none; }
+
+    @media (prefers-reduced-motion: reduce) {
+        html { scroll-behavior: auto; }
+        .rise, .fade-in, .rosette-a, .rosette-b { animation: none; }
+        * { transition-duration: 0.01ms !important; }
+    }
+}
+
+@layer components {
+    /* Hairlines */
+    .rule-t { border-top: 1px solid var(--hair-ink); }
+    .rule-b { border-bottom: 1px solid var(--hair-ink); }
+    .rule-gold-t { border-top: 1px solid var(--hair); }
+    .rule-gold-b { border-bottom: 1px solid var(--hair); }
+
+    /* Headings */
+    .eyebrow {
+        display: inline-flex; align-items: center; gap: 0.9rem;
+        font-family: 'Libre Caslon Text', Georgia, serif; font-style: italic;
+        font-size: 1.0625rem; line-height: 1.4; color: var(--bronze);
+    }
+    .eyebrow::before, .eyebrow-both::after { content: ""; width: 2.5rem; height: 1px; background: var(--gold); flex: none; }
+    .on-dark .eyebrow { color: var(--gold-soft); }
+    .section-title {
+        font-family: 'Libre Caslon Display', 'Libre Caslon Text', Georgia, serif;
+        font-size: clamp(2.1rem, 4.2vw, 3.25rem); line-height: 1.1; letter-spacing: -0.015em; color: var(--pine);
+    }
+    .on-dark .section-title { color: #fbf6ea; }
+    .lede { color: var(--muted); font-size: 1.0625rem; line-height: 1.8; }
+    .on-dark .lede { color: #bccdc3; }
+    .serif-title { font-family: 'Libre Caslon Text', Georgia, serif; font-weight: 400; color: var(--pine); line-height: 1.3; }
+
+    /* Buttons */
+    .btn {
+        display: inline-flex; align-items: center; justify-content: center; gap: 0.6rem;
+        padding: 1rem 1.75rem; border: 1px solid transparent; border-radius: 2px;
+        font-size: 0.75rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; line-height: 1.2; text-align: center;
+        cursor: pointer; transition: background-color .25s, color .25s, border-color .25s, box-shadow .25s, filter .25s;
+    }
+    .btn-sm { padding: 0.7rem 1.15rem; font-size: 0.6875rem; }
+    .btn-gold {
+        background: linear-gradient(135deg, #f8dc98 0%, #efa833 52%, #cf8f22 100%);
+        color: var(--pine-deep);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.45), 0 14px 28px -16px rgba(239,168,51,.7);
+    }
+    .btn-gold:hover { filter: brightness(1.07); }
+    .btn-ghost { border-color: rgba(246,217,160,.5); color: #f6e9cc; }
+    .btn-ghost:hover { border-color: var(--gold); background: rgba(239,168,51,.12); }
+    .btn-pine { background: var(--pine); border-color: var(--pine); color: #f6e9cc; }
+    .btn-pine:hover { background: var(--pine-deep); }
+    .btn-outline { border-color: var(--pine); color: var(--pine); background: transparent; }
+    .btn-outline:hover { background: var(--pine); color: #f6e9cc; }
+
+    .nav-link { position: relative; white-space: nowrap; padding: 0.4rem 0; font-size: 0.8125rem; font-weight: 500; letter-spacing: 0.06em; color: #e8e1cc; transition: color .25s; }
+    .nav-link::after { content: ""; position: absolute; left: 0; right: 0; bottom: -2px; height: 1px; background: var(--gold); transform: scaleX(0); transform-origin: left; transition: transform .3s; }
+    .nav-link:hover { color: var(--gold-soft); }
+    .nav-link:hover::after { transform: scaleX(1); }
+
+    /* Forms */
+    .field {
+        width: 100%; background: #fff; border: 1px solid #cdd7d1; border-radius: 2px;
+        padding: 0.72rem 0.9rem; font-size: 0.875rem; color: var(--ink);
+        transition: border-color .2s, box-shadow .2s;
+    }
+    .field::placeholder { color: #7b8a82; }
+    .field:focus { outline: 2px solid var(--pine); outline-offset: 1px; border-color: var(--pine); }
+    .field-label { display: block; margin-bottom: 0.4rem; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.02em; color: #2c4036; }
+
+    /* Surfaces */
+    .panel { background: #fff; border: 1px solid var(--hair-ink); border-radius: 2px; }
+    .hero-card {
+        position: relative; background: #fbfcf8; color: var(--ink); border: 1px solid var(--gold); border-radius: 2px;
+        padding: 1.75rem; box-shadow: 0 40px 80px -40px rgba(0,0,0,.6);
+    }
+    .hero-card::before, .modal-panel::before { content: ""; position: absolute; inset: 6px; border: 1px solid rgba(138,100,32,.28); pointer-events: none; }
+    @media (min-width: 640px) { .hero-card { padding: 2.25rem; } }
+    .frame-offset { position: relative; }
+    .frame-offset::before { content: ""; position: absolute; inset: 0; transform: translate(14px, 14px); border: 1px solid var(--gold); }
+    .frame-offset > * { position: relative; }
+
+    /* Lists */
+    .diamond-list li { position: relative; padding-left: 1.35rem; font-size: 0.875rem; line-height: 1.6; }
+    .diamond-list li::before { content: ""; position: absolute; left: 0.1rem; top: 0.6em; width: 5px; height: 5px; background: var(--gold-deep); transform: rotate(45deg); }
+    .on-dark .diamond-list li::before { background: var(--gold); }
+
+    /* Stats */
+    @media (min-width: 768px) { .stat + .stat { border-left: 1px solid var(--hair-ink); } }
+
+    /* How it works: a real sequence, so it gets numerals and a rail */
+    .step { position: relative; isolation: isolate; padding-top: 1.75rem; border-top: 1px solid var(--hair); }
+    .step::before { content: ""; position: absolute; top: -4px; left: 0; width: 7px; height: 7px; background: var(--gold); transform: rotate(45deg); }
+
+    /* Plans (selection state is toggled from JS) */
+    .plan-card {
+        position: relative; display: flex; flex-direction: column; justify-content: space-between;
+        background: #fff; border: 1px solid var(--hair-ink); border-radius: 2px; padding: 2.25rem 2rem;
+        transition: border-color .3s, box-shadow .3s;
+    }
+    .plan-card.is-selected { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold), 0 30px 50px -34px rgba(13,66,46,.55); }
+    .plan-btn.is-selected, .plan-btn.is-selected:hover { background: var(--pine); border-color: var(--pine); color: #f6e9cc; }
+    .summary-plan-btn {
+        padding: 0.6rem 0.4rem; background: #fff; border: 1px solid var(--hair-ink); border-radius: 2px;
+        font-size: 0.75rem; font-weight: 600; color: #3d5247; transition: background-color .2s, border-color .2s, color .2s;
+    }
+    .summary-plan-btn:hover { border-color: var(--pine); }
+    .summary-plan-btn.is-selected { background: var(--pine); border-color: var(--pine); color: #f6e9cc; }
+
+    /* Reviews */
+    .review-filter {
+        margin: 0 0.9rem; padding: 0.55rem 0.1rem; font-size: 0.8125rem; font-weight: 500; letter-spacing: 0.04em; color: var(--muted);
+        border-bottom: 1px solid transparent; transition: color .2s, border-color .2s;
+    }
+    .review-filter:hover { color: var(--pine); }
+    .review-filter.is-active { color: var(--pine); font-weight: 600; border-bottom-color: var(--gold); }
+
+    /* FAQ */
+    .faq-item { border-top: 1px solid var(--hair-ink); }
+    .faq-item:last-child { border-bottom: 1px solid var(--hair-ink); }
+    .faq-item summary {
+        display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; padding: 1.5rem 0; cursor: pointer; list-style: none;
+        font-family: 'Libre Caslon Text', Georgia, serif; font-size: 1.1875rem; line-height: 1.45; color: var(--pine);
+    }
+    .faq-chevron { flex: none; color: var(--bronze); transition: transform .3s; }
+    .faq-item[open] .faq-chevron { transform: rotate(180deg); }
+
+    /* Feedback boxes + status pills (class names are applied from JS) */
+    .result-box { padding: 0.9rem 1rem; border: 1px solid var(--hair-ink); border-radius: 2px; background: #fff; font-size: 0.75rem; line-height: 1.65; color: #3d5247; }
+    .result-ok   { background: var(--pine-mist); border-color: rgba(13,66,46,.35); color: var(--pine-deep); }
+    .result-warn { background: #fbf1dc; border-color: rgba(201,138,31,.5); color: #5f4310; }
+    .result-err  { background: #fbeceb; border-color: rgba(156,42,38,.4); color: #7a1f1c; }
+    .status-pill { padding: 0.25rem 0.65rem; border-radius: 2px; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.03em; }
+    .status-done { background: var(--pine-mist); color: var(--pine); }
+    .status-live { background: #fbf1dc; color: #7a5314; }
+
+    /* Modals */
+    .modal-panel { position: relative; background: #fbfcf8; border: 1px solid var(--gold); border-radius: 2px; box-shadow: 0 40px 90px -30px rgba(0,0,0,.7); }
+    .modal-panel-plain::before { display: none; }
+    .modal-close {
+        position: absolute; top: 1.1rem; right: 1.1rem; z-index: 1; width: 2.25rem; height: 2.25rem; display: flex; align-items: center; justify-content: center;
+        border: 1px solid var(--hair-ink); border-radius: 2px; color: #3d5247; transition: background-color .2s;
+    }
+    .modal-close:hover { background: var(--pine-mist); }
+
+    /* Hero rosette: two engraved layers turning slowly in opposite directions (the moiré between them is the effect).
+       Each layer is a separate element so the browser rasterises it once and the GPU just rotates it. */
+    @keyframes fade-in { from { opacity: 0; } }
+    @keyframes rosette-spin { to { transform: rotate(360deg); } }
+    .fade-in { animation: fade-in 1.8s ease 0.1s backwards; }
+    .rosette-layer { position: absolute; inset: 0; width: 100%; height: 100%; will-change: transform; }
+    .rosette-a { animation: rosette-spin 240s linear infinite; }
+    .rosette-b { animation: rosette-spin 320s linear infinite reverse; }
+    .rosette-glow { position: absolute; inset: 18%; border-radius: 9999px; background: radial-gradient(circle, rgba(239,168,51,.11), transparent 65%); }
+
+    /* How it works: Roman numerals with a soft golden glow */
+    .numeral-glow {
+        position: relative; display: inline-block; color: #f7d58b;
+        text-shadow: 0 0 6px rgba(246,200,110,.65), 0 0 20px rgba(239,168,51,.45), 0 0 44px rgba(239,168,51,.25);
+        transition: color .4s, text-shadow .4s;
+    }
+    .numeral-glow::before {
+        content: ""; position: absolute; left: 50%; top: 50%; width: 1.9em; height: 1.9em; transform: translate(-50%, -50%);
+        border-radius: 9999px; background: radial-gradient(circle, rgba(239,168,51,.2), transparent 68%); z-index: -1; pointer-events: none;
+    }
+    .step:hover .numeral-glow { color: #fbe3a6; text-shadow: 0 0 8px rgba(250,215,140,.8), 0 0 26px rgba(239,168,51,.6), 0 0 56px rgba(239,168,51,.35); }
+
+    /* Price lists: a menu-style row with a dotted leader */
+    .price-row { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.85rem 0; }
+    .price-label { font-family: 'Libre Caslon Text', Georgia, serif; font-size: 1.0625rem; line-height: 1.35; color: var(--ink); }
+    .price-note { margin-top: 0.15rem; font-size: 0.75rem; line-height: 1.5; color: var(--muted); }
+    .price-dots { flex: 1; min-width: 1rem; border-bottom: 1px dotted rgba(138,100,32,.5); }
+    .price-amount { font-family: 'Libre Caslon Display', 'Libre Caslon Text', Georgia, serif; font-size: 1.5rem; line-height: 1; color: var(--pine); white-space: nowrap; }
+
+    /* Service area city list (works as the keyboard-friendly way to use the map) */
+    .city-chip {
+        display: flex; align-items: center; gap: 0.6rem; width: 100%; padding: 0.55rem 0; text-align: left;
+        font-family: 'Libre Caslon Text', Georgia, serif; font-size: 1.0625rem; color: var(--ink);
+        border-bottom: 1px solid var(--hair-ink); transition: color .2s, border-color .2s;
+    }
+    .city-chip::before { content: ""; flex: none; width: 7px; height: 7px; background: var(--gold-deep); transform: rotate(45deg); }
+    .city-chip:hover, .city-chip[aria-pressed="true"] { color: var(--pine); border-bottom-color: var(--gold); }
+
+    /* Map overlays (these elements exist in the page markup) */
+    .map-gate { position: absolute; inset: 0; z-index: 500; display: flex; align-items: center; justify-content: center; background: rgba(8,43,30,.18); }
+    .map-gate-label {
+        padding: 0.7rem 1.25rem; background: var(--pine-deep); color: var(--gold-soft); border: 1px solid var(--gold); border-radius: 2px;
+        font-size: 0.75rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; box-shadow: 0 12px 24px -10px rgba(8,43,30,.6);
+    }
+    .map-fallback { padding: 3rem 1.5rem; text-align: center; font-size: 0.875rem; color: var(--muted); background: var(--pine-mist); }
+    .legend-pin { display: inline-block; flex: none; }
+    .legend-city { width: 11px; height: 11px; background: var(--pine); border: 2px solid var(--gold); border-radius: 50% 50% 50% 0; transform: rotate(-45deg); }
+    .legend-court { width: 9px; height: 9px; background: var(--gold); border: 2px solid var(--pine); transform: rotate(45deg); }
+
+    /* Reviews and demo labelling */
+    .avatar {
+        display: flex; align-items: center; justify-content: center; flex: none; width: 3rem; height: 3rem; border-radius: 9999px;
+        background: var(--pine); color: var(--gold-soft); font-family: 'Libre Caslon Text', Georgia, serif; font-size: 0.95rem; letter-spacing: 0.04em;
+        box-shadow: 0 0 0 1px var(--gold), 0 0 0 4px #fff;
+    }
+    .demo-note { font-family: 'Libre Caslon Text', Georgia, serif; font-style: italic; color: var(--bronze); }
+}
+
+/* Leaflet map. Leaflet creates these elements at runtime, so they are not in the markup and must live outside the
+   purged component layer. Nothing here sets display on an element that the page toggles with the "hidden" class. */
+.map-shell { position: relative; isolation: isolate; }
+#service-map { width: 100%; height: 26rem; background: #e8eee9; }
+@media (max-width: 639px) { #service-map { height: 21rem; } }
+.leaflet-container { font-family: 'Montserrat', sans-serif; }
+.leaflet-tile-pane { filter: grayscale(0.85) sepia(0.06) contrast(0.9) brightness(1.07); }
+.leaflet-control-attribution { font-size: 10px; }
+.leaflet-bar a { color: var(--pine); }
+
+.pin { background: none; border: 0; }
+.pin-city span {
+    position: absolute; left: 2px; top: 9px; width: 24px; height: 24px; background: var(--pine); border: 2px solid var(--gold);
+    border-radius: 50% 50% 50% 0; transform: rotate(-45deg); box-shadow: 0 6px 10px -4px rgba(8,43,30,.6); transition: transform .2s, box-shadow .2s;
+}
+.pin-city span::after { content: ""; position: absolute; inset: 0; margin: auto; width: 7px; height: 7px; border-radius: 50%; background: var(--gold); }
+.pin-city:hover span, .pin-city.is-active span { transform: rotate(-45deg) scale(1.2); }
+.pin-city.is-active span { box-shadow: 0 0 0 6px rgba(239,168,51,.3), 0 6px 10px -4px rgba(8,43,30,.6); }
+.pin-court span { position: absolute; inset: 3px; background: var(--gold); border: 2px solid var(--pine); transform: rotate(45deg); box-shadow: 0 4px 8px -3px rgba(8,43,30,.6); }
+
+.nick-popup-wrap .leaflet-popup-content-wrapper { padding: 0; border: 1px solid var(--gold); border-radius: 2px; background: #fbfcf8; box-shadow: 0 18px 40px -16px rgba(8,43,30,.55); }
+.nick-popup-wrap .leaflet-popup-tip { background: #fbfcf8; }
+.nick-popup-wrap .leaflet-popup-content { margin: 14px 18px; font-size: 12.5px; line-height: 1.55; color: var(--ink); }
+.nick-popup h4 { margin: 0 0 2px; font-family: 'Libre Caslon Display', 'Libre Caslon Text', Georgia, serif; font-size: 1.25rem; font-weight: 400; color: var(--pine); }
+.nick-popup p { margin: 0 0 6px; color: var(--muted); }
+.nick-popup .note { font-size: 11.5px; }
+.nick-popup a { color: var(--pine); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
