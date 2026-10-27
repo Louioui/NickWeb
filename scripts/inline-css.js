@@ -17,5 +17,9 @@ const pattern = /(<!-- site-css:start[^>]*-->)[\s\S]*?(<!-- site-css:end -->)/;
 if (!pattern.test(html)) throw new Error('site-css markers not found in index.html');
 
 const out = html.replace(pattern, (_m, start, end) => `${start}\n    <style>${css}</style>\n    ${end}`);
-fs.writeFileSync(htmlPath, out);
-console.log(`Inlined ${css.length.toLocaleString()} bytes of CSS into index.html`);
+if (out !== html) {
+    fs.writeFileSync(htmlPath, out);
+    console.log(`Inlined ${css.length.toLocaleString()} bytes of CSS into index.html`);
+} else {
+    console.log(`CSS in index.html is already up to date (${css.length.toLocaleString()} bytes)`);
+}
