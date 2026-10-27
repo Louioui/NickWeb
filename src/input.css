@@ -49,7 +49,7 @@
 
     @media (prefers-reduced-motion: reduce) {
         html { scroll-behavior: auto; }
-        .rise, .fade-in, .rosette-a, .rosette-b, .rosette-c, .rosette-glow, .logo-tagline, .shine-text, .btn-gold::after, .step::before, .step::after, .numeral-glow { animation: none !important; }
+        .rise, .fade-in, .logo-tagline, .shine-text, .btn-gold::after, .step::before, .step::after, .numeral-glow { animation: none !important; }
         .reveal-item { opacity: 1 !important; transform: none !important; transition: none !important; }
         * { transition-duration: 0.01ms !important; }
     }
@@ -495,23 +495,20 @@
         .logo-lockup-lg .logo-tagline { font-size: 0.97rem; letter-spacing: 0.17em; }
     }
 
-    /* Hero rosette: three counter-rotating metallic gold-foil guilloché intaglio layers + breathing aura + 3D parallax */
+    /* Hero geometry: nested polygon canvas ("Shapes in Shapes") + 3D parallax */
     @keyframes fade-in { from { opacity: 0; } }
-    @keyframes rosette-spin { to { transform: rotate(360deg); } }
-    @keyframes rosette-breathe {
-        0%, 100% { transform: scale(0.96); opacity: 0.82; }
-        50% { transform: scale(1.06); opacity: 1; }
-    }
     .fade-in { animation: fade-in 1.8s ease 0.1s backwards; }
     .rosette-parallax { position: absolute; inset: 0; will-change: transform; transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1); }
-    .rosette-layer { position: absolute; inset: 0; width: 100%; height: 100%; will-change: transform; }
-    .rosette-a { animation: rosette-spin 220s linear infinite; }
-    .rosette-b { animation: rosette-spin 300s linear infinite reverse; }
-    .rosette-c { animation: rosette-spin 165s linear infinite; }
-    .rosette-glow {
-        position: absolute; inset: 12%; border-radius: 9999px;
-        background: radial-gradient(circle, rgba(255,236,179,.18) 0%, rgba(239,168,51,.12) 36%, transparent 68%);
-        animation: rosette-breathe 9s ease-in-out infinite;
+    #hero-rosette canvas {
+        display: block;
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        border: none;
+        margin: 0;
+        z-index: -1;
     }
 
     /* How it works: 24k bullion Roman numerals inside the engraved seal medallion */
