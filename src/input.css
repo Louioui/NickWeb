@@ -471,8 +471,7 @@
        logo-base (scales + wordmark) and Nick's running man as a strip of 24 video frames (one full stride, 1s at 24fps),
        cut from NewRunningMan.mp4, with the connected paper background removed and a cream outline for contrast.
        The strip slides one frame at a time (steps), so the frames play like a flipbook.
-       He runs a few strides on page load, keeps running while the logo is hovered or focused, and otherwise rests on
-       the first frame (also what visitors who turn off motion see). */
+       He runs continuously while visible; visitors who turn off motion see the first frame. */
     .logo-art { position: relative; display: block; width: 100%; }
     .logo-lockup .logo-man {
         position: absolute; left: 38.684%; top: 9.536%; width: 21.06%; aspect-ratio: 180 / 160;
@@ -480,12 +479,10 @@
     }
     .logo-lockup .logo-man-run img {
         display: block; width: 2400%; max-width: none; height: 100%;
-        animation: logo-man-run 1s steps(24) 0.9s 4 backwards;
+        animation: logo-man-run 1s steps(24) infinite;
         animation-play-state: paused;
     }
     .logo-lockup.is-run-visible .logo-man-run img { animation-play-state: running; }
-    .logo-lockup:hover .logo-man-run img,
-    .logo-lockup:focus-visible .logo-man-run img { animation-iteration-count: infinite; }
     @keyframes logo-man-run { from { transform: translateX(0); } to { transform: translateX(-100%); } }
     @media (prefers-reduced-motion: reduce) {
         .logo-lockup .logo-man-run img { animation: none !important; }
