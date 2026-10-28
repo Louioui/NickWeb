@@ -396,7 +396,19 @@
         scrollbar-width: none; padding-block: 0.5rem; margin-block: -0.5rem;
     }
     .review-track::-webkit-scrollbar { display: none; }
+    .review-track { align-items: flex-start; }   /* an expanded card grows on its own, without stretching its neighbours */
     .review-track > .panel { flex: 0 0 100%; scroll-snap-align: start; }
+    .review-text { white-space: pre-line; }
+    .review-text.is-clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 9; line-clamp: 9; overflow: hidden; }
+    .review-more { align-self: flex-start; margin-top: 0.75rem; font-size: 0.8125rem; font-weight: 600; color: var(--pine); text-decoration: underline; text-underline-offset: 4px; }
+    .review-more[hidden] { display: none; }
+    .review-source {
+        margin-left: auto; display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap;
+        font-size: 0.75rem; font-weight: 600; color: var(--muted); transition: color .2s;
+    }
+    .review-source:hover { color: var(--pine); }
+    .review-filter-count { font-weight: 400; color: var(--muted); }
+    .review-filter[hidden] { display: none; }
     @media (min-width: 768px) { .review-track > .panel { flex-basis: calc((100% - 1.5rem) / 2); } }
     @media (min-width: 1024px) {
         .review-track { gap: 2rem; }
