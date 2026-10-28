@@ -468,19 +468,19 @@
     .logo-lockup img { display: block; width: 100%; height: auto; }
 
     /* Running man: the logo is two layers placed with percentages of the 1200x388 artwork, so they stay aligned at any size:
-       logo-base (scales + wordmark) and Nick's running man as a strip of 30 video frames (one full stride, 1.25s at 24fps),
-       cut from a Firefly video with Adobe's background removal and given a cream outline like the logo artwork.
+       logo-base (scales + wordmark) and Nick's running man as a strip of 24 video frames (one full stride, 1s at 24fps),
+       cut from NewRunningMan.mp4, with the connected paper background removed and a cream outline for contrast.
        The strip slides one frame at a time (steps), so the frames play like a flipbook.
        He runs a few strides on page load, keeps running while the logo is hovered or focused, and otherwise rests on
        the first frame (also what visitors who turn off motion see). */
     .logo-art { position: relative; display: block; width: 100%; }
     .logo-lockup .logo-man {
-        position: absolute; left: 41.96%; top: 9.536%; width: 14.508%; aspect-ratio: 124 / 160;
+        position: absolute; left: 38.684%; top: 9.536%; width: 21.06%; aspect-ratio: 180 / 160;
         display: block; overflow: hidden;
     }
     .logo-lockup .logo-man-run img {
-        display: block; width: 3000%; max-width: none; height: 100%;
-        animation: logo-man-run 1.25s steps(30) 0.9s 4 backwards;
+        display: block; width: 2400%; max-width: none; height: 100%;
+        animation: logo-man-run 1s steps(24) 0.9s 4 backwards;
         animation-play-state: paused;
     }
     .logo-lockup.is-run-visible .logo-man-run img { animation-play-state: running; }
