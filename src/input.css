@@ -466,6 +466,105 @@
     }
     .logo-lockup { --logo-w: 13.9rem; display: inline-flex; flex-direction: column; align-items: flex-start; width: var(--logo-w); margin-left: calc(var(--logo-w) * -0.0567); }
     .logo-lockup img { display: block; width: 100%; height: auto; }
+
+    /* Running man: the logo is two layers placed with percentages of the 1200x388 artwork, so they stay aligned at any size:
+       logo-base (scales + wordmark) and an SVG redraw of Nick's running man built from hinged pieces.
+       Every limb is drawn hanging straight down from its joint; only the joints rotate.
+       Angles: 0 = straight down, positive = swung backward (he runs to the right).
+       He runs a few strides on page load, keeps running while the logo is hovered or focused,
+       and otherwise holds a mid-stride pose (also what visitors who turn off motion see). */
+    .logo-art { position: relative; display: block; width: 100%; }
+    .logo-lockup .logo-man { position: absolute; left: 39.667%; top: 17.010%; width: 19.083%; height: auto; display: block; overflow: visible; }
+    .rm { --ink: #0c2a1e; --ink-back: #08201a; --line: #f4efe3; --skin: #f2c4a0; --gold: #eba93a; --cycle: 0.62s; }
+    .rm * { transform-box: view-box; }
+    .rm .lean  { transform-origin: 112px 110px; transform: rotate(14deg); }
+    .rm .body  { transform-origin: 112px 112px; }
+    .rm .thigh { transform-origin: 112px 110px; }
+    .rm .shin  { transform-origin: 112px 148px; }
+    .rm .foot  { transform-origin: 112px 186px; }
+    .rm .upper { transform-origin: 130px 64px; }
+    .rm .fore  { transform-origin: 130px 92px; }
+    .rm .case  { transform-origin: 130px 118px; }
+
+    /* Resting pose = the first frame of the run, so starting and stopping never jumps. */
+    .rm .leg-front .thigh { transform: rotate(-42deg); }  .rm .leg-front .shin { transform: rotate(18deg); }   .rm .leg-front .foot { transform: rotate(-6deg); }
+    .rm .leg-back .thigh  { transform: rotate(40deg); }   .rm .leg-back .shin  { transform: rotate(115deg); }  .rm .leg-back .foot  { transform: rotate(6deg); }
+    .rm .arm-back .upper  { transform: rotate(-10deg); }  .rm .arm-back .fore  { transform: rotate(-45deg); }  .rm .case { transform: rotate(45deg); }
+    .rm .arm-front .upper { transform: rotate(4deg); }    .rm .arm-front .fore { transform: rotate(-96deg); }
+
+    /* The far leg and near arm use their own keyframes, half a stride apart, so every part starts and stops in step. */
+    .rm .body             { animation: rm-bob          calc(var(--cycle) / 2) ease-in-out 0.9s 10 both; }
+    .rm .leg-front .thigh { animation: rm-thigh        var(--cycle) linear      0.9s 5 both; }
+    .rm .leg-front .shin  { animation: rm-shin         var(--cycle) linear      0.9s 5 both; }
+    .rm .leg-front .foot  { animation: rm-foot         var(--cycle) linear      0.9s 5 both; }
+    .rm .leg-back .thigh  { animation: rm-thigh-b      var(--cycle) linear      0.9s 5 both; }
+    .rm .leg-back .shin   { animation: rm-shin-b       var(--cycle) linear      0.9s 5 both; }
+    .rm .leg-back .foot   { animation: rm-foot-b       var(--cycle) linear      0.9s 5 both; }
+    .rm .arm-back .upper  { animation: rm-arm-back     var(--cycle) ease-in-out 0.9s 5 both; }
+    .rm .arm-back .fore   { animation: rm-fore-back    var(--cycle) ease-in-out 0.9s 5 both; }
+    .rm .case             { animation: rm-case         var(--cycle) ease-in-out 0.9s 5 both; }
+    .rm .arm-front .upper { animation: rm-arm-front-b  var(--cycle) ease-in-out 0.9s 5 both; }
+    .rm .arm-front .fore  { animation: rm-fore-front-b var(--cycle) ease-in-out 0.9s 5 both; }
+    .logo-lockup:hover .rm *,
+    .logo-lockup:focus-visible .rm * { animation-iteration-count: infinite; }
+
+    @keyframes rm-thigh {
+        0%    { transform: rotate(-42deg); }   /* front foot lands */
+        12.5% { transform: rotate(-20deg); }
+        25%   { transform: rotate(12deg); }    /* body passes over the foot */
+        37.5% { transform: rotate(44deg); }    /* toe-off, leg stretched far back */
+        50%   { transform: rotate(40deg); }
+        62.5% { transform: rotate(5deg); }     /* leg swings through */
+        75%   { transform: rotate(-52deg); }   /* knee drives up */
+        87.5% { transform: rotate(-60deg); }
+        100%  { transform: rotate(-42deg); }
+    }
+    @keyframes rm-thigh-b {
+        0% { transform: rotate(40deg); } 12.5% { transform: rotate(5deg); } 25% { transform: rotate(-52deg); } 37.5% { transform: rotate(-60deg); }
+        50% { transform: rotate(-42deg); } 62.5% { transform: rotate(-20deg); } 75% { transform: rotate(12deg); } 87.5% { transform: rotate(44deg); } 100% { transform: rotate(40deg); }
+    }
+    @keyframes rm-shin {
+        0%    { transform: rotate(18deg); }
+        12.5% { transform: rotate(34deg); }
+        25%   { transform: rotate(26deg); }
+        37.5% { transform: rotate(34deg); }
+        50%   { transform: rotate(115deg); }   /* heel kicks up behind */
+        62.5% { transform: rotate(128deg); }
+        75%   { transform: rotate(100deg); }
+        87.5% { transform: rotate(40deg); }    /* lower leg reaches forward */
+        100%  { transform: rotate(18deg); }
+    }
+    @keyframes rm-shin-b {
+        0% { transform: rotate(115deg); } 12.5% { transform: rotate(128deg); } 25% { transform: rotate(100deg); } 37.5% { transform: rotate(40deg); }
+        50% { transform: rotate(18deg); } 62.5% { transform: rotate(34deg); } 75% { transform: rotate(26deg); } 87.5% { transform: rotate(34deg); } 100% { transform: rotate(115deg); }
+    }
+    @keyframes rm-foot {
+        0%, 100% { transform: rotate(-6deg); }
+        25%   { transform: rotate(0deg); }
+        37.5% { transform: rotate(22deg); }    /* toes point as he pushes off */
+        62.5% { transform: rotate(-10deg); }
+        87.5% { transform: rotate(-14deg); }
+    }
+    @keyframes rm-foot-b {
+        0%, 100% { transform: rotate(6deg); } 12.5% { transform: rotate(-10deg); } 37.5% { transform: rotate(-14deg); }
+        50% { transform: rotate(-6deg); } 75% { transform: rotate(0deg); } 87.5% { transform: rotate(22deg); }
+    }
+    /* Lowest just after each landing, highest in the air after push-off (two strides per cycle). */
+    @keyframes rm-bob {
+        0%, 100% { transform: translateY(0); }
+        25%      { transform: translateY(3px); }
+        75%      { transform: translateY(-5px); }
+    }
+    /* Briefcase arm swings big and low (the case counter-rotates to hang straight down);
+       the papers arm stays up and swings less, like he's reading on the run. */
+    @keyframes rm-arm-back     { 0%, 100% { transform: rotate(-10deg); } 50% { transform: rotate(60deg); } }
+    @keyframes rm-fore-back    { 0%, 100% { transform: rotate(-45deg); } 50% { transform: rotate(-15deg); } }
+    @keyframes rm-case         { 0%, 100% { transform: rotate(45deg); }  50% { transform: rotate(-62deg); } }
+    @keyframes rm-arm-front-b  { 0%, 100% { transform: rotate(4deg); }   50% { transform: rotate(-58deg); } }
+    @keyframes rm-fore-front-b { 0%, 100% { transform: rotate(-96deg); } 50% { transform: rotate(-62deg); } }
+    @media (prefers-reduced-motion: reduce) {
+        .rm * { animation: none !important; }
+    }
     .logo-tagline,
     .shine-text {
         color: var(--gold-soft);
