@@ -227,10 +227,6 @@
     .diamond-list li::before { content: ""; position: absolute; left: 0.1rem; top: 0.6em; width: 5px; height: 5px; background: var(--gold-deep); transform: rotate(45deg); }
     .on-dark .diamond-list li::before { background: var(--gold); box-shadow: 0 0 6px rgba(239,168,51,.45); }
 
-    /* Stats */
-    .stat-num { font-variant-numeric: tabular-nums; }
-    @media (min-width: 768px) { .stat + .stat { border-left: 1px solid var(--hair-ink); } }
-
     /* How it works: architectural step cards, 24k gold intaglio medallion, and bullion Roman numerals */
     @keyframes step-rail-sweep {
         0% { background-position: -45% 0; opacity: 0; }
@@ -393,6 +389,28 @@
     }
     .review-filter:hover { color: var(--pine); }
     .review-filter.is-active { color: var(--pine); font-weight: 600; border-bottom-color: var(--gold); }
+
+    /* Reviews slideshow: one card per view on phones, two on tablets, three on desktop. Native scroll-snap, so swiping just works. */
+    .review-track {
+        display: flex; gap: 1.5rem; overflow-x: auto; scroll-snap-type: x mandatory; scroll-behavior: smooth;
+        scrollbar-width: none; padding-block: 0.5rem; margin-block: -0.5rem;
+    }
+    .review-track::-webkit-scrollbar { display: none; }
+    .review-track > .panel { flex: 0 0 100%; scroll-snap-align: start; }
+    @media (min-width: 768px) { .review-track > .panel { flex-basis: calc((100% - 1.5rem) / 2); } }
+    @media (min-width: 1024px) {
+        .review-track { gap: 2rem; }
+        .review-track > .panel { flex-basis: calc((100% - 4rem) / 3); }
+    }
+    @media (prefers-reduced-motion: reduce) { .review-track { scroll-behavior: auto; } }
+    .review-nav { display: flex; align-items: center; justify-content: center; gap: 1.25rem; margin-top: 2.5rem; }
+    .review-arrow {
+        width: 2.75rem; height: 2.75rem; display: inline-flex; align-items: center; justify-content: center;
+        border: 1px solid var(--pine); border-radius: 2px; color: var(--pine); transition: background-color .2s, color .2s, opacity .2s;
+    }
+    .review-arrow:hover:not(:disabled) { background: var(--pine); color: #f6e9cc; }
+    .review-arrow:disabled { opacity: .3; cursor: default; }
+    .review-count { min-width: 6.5rem; text-align: center; font-size: 0.8125rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 
     /* FAQ */
     .faq-item { border-top: 1px solid var(--hair-ink); }
