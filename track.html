@@ -336,13 +336,19 @@
                 accessNotes: $('a-access').value, reply: $('a-reply').value, files: files.map(NPS.fileMeta),
             });
             const up = r.uploads?.length ? await NPS.uploadAll(r.uploads, files) : { ok: [], failed: [] };
-            render(await trackCall({ action: 'respond-finish', fileIds: up.ok }));
+            const done = await trackCall({ action: 'respond-finish', fileIds: up.ok });
+            render(done);
             e.target.reset();
             actionDirty = false;
             const feedback = $('reply-feedback');
-            feedback.className = `result-box ${up.failed.length ? 'result-warn' : 'result-ok'} text-sm`;
+            const notChecked = (done.filesStillChecking || 0) + (done.filesMissing || 0);
+            feedback.className = `result-box ${up.failed.length || notChecked ? 'result-warn' : 'result-ok'} text-sm`;
             feedback.textContent = up.failed.length
                 ? `Your reply was sent, but ${up.failed.join(', ')} didn't upload. Please call Nick at (209) 922-6817.`
+                : done.filesMissing
+                ? `Your reply was sent, but ${done.filesMissing} file(s) didn't arrive. Please send them again or call Nick at (209) 922-6817.`
+                : done.filesStillChecking
+                ? `Your reply was sent. ${done.filesStillChecking} file(s) are still being checked and will appear on your request once they are; Nick has been told.`
                 : 'Your reply was sent to Nick. Your request is ready for his review; there’s nothing else you need to do right now.';
             window.scrollTo({ top: 0, behavior: 'smooth' });
         } catch (err) {

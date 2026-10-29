@@ -16,6 +16,7 @@ export function createFakeSupabase() {
         otp: new Map(),              // email -> code accepted by auth.verifyOtp
         users: new Map(),            // email -> user
         sessions: new Map(),         // access token -> email
+        pairs: new Map(),            // access token -> its refresh token (one Supabase session)
         refreshTokens: new Map(),    // refresh token -> email
         revoked: [],
     };
@@ -145,6 +146,7 @@ export function createFakeSupabase() {
                 const access = `access-${randomUUID()}`, refresh = `refresh-${randomUUID()}`;
                 state.sessions.set(access, email);
                 state.refreshTokens.set(refresh, email);
+                state.pairs.set(access, refresh);
                 return { data: { user, session: { access_token: access, refresh_token: refresh } }, error: null };
             },
             getUser: async (access) => {
@@ -156,10 +158,15 @@ export function createFakeSupabase() {
                 if (!email) return { data: {}, error: authError('refresh failed', 'refresh_token_not_found') };
                 state.refreshTokens.delete(refresh_token);
                 const access = `access-${randomUUID()}`, refresh = `refresh-${randomUUID()}`;
-                state.sessions.set(access, email); state.refreshTokens.set(refresh, email);
+                state.sessions.set(access, email); state.refreshTokens.set(refresh, email); state.pairs.set(access, refresh);
                 return { data: { user: state.users.get(email), session: { access_token: access, refresh_token: refresh } }, error: null };
             },
-            admin: { signOut: async (access) => { state.sessions.delete(access); state.revoked.push(access); return { data: null, error: null }; } },
+            // Like Supabase, signing a session out also revokes its refresh token.
+            admin: { signOut: async (access) => {
+                state.refreshTokens.delete(state.pairs.get(access)); state.pairs.delete(access);
+                state.sessions.delete(access); state.revoked.push(access);
+                return { data: null, error: null };
+            } },
         },
     };
 
@@ -167,7 +174,7 @@ export function createFakeSupabase() {
     client.__state = state;
     client.__reset = () => {
         state.tables = {};
-        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'rateHits', 'otp', 'users', 'sessions', 'refreshTokens']) state[k].clear();
+        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'rateHits', 'otp', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
         state.revoked = [];
     };
     client.__addUser = (email) => {

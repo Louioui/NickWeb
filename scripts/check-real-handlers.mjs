@@ -153,6 +153,7 @@ await check('F-02 valid email code + wrong PIN: refused, counted, and the new se
     expect(res.status === 401 && !res.headers.get('set-cookie'), `expected 401 without cookie, got ${res.status}`);
     expect(pinRow(CLIENT).failed_tries === 1, `failed_tries = ${pinRow(CLIENT).failed_tries}`);
     expect(db.__state.revoked.length === 1, 'the Supabase session created by the code was not revoked');
+    expect(db.__state.refreshTokens.size === 0, "the revoked session's refresh token still works");
 });
 await check('F-02 an expired lockout starts a fresh count instead of re-locking on one mistake', async () => {
     reset(); db.__addUser(CLIENT); db.__state.otp.set(CLIENT, '111111');
@@ -209,6 +210,35 @@ await check('F-04 a good file is still confirmed with its fingerprint', async ()
     reset(); const o = seedOrder(); const f = seedFile(o);
     const done = await core.confirmUploads(o.id, [f.id]);
     expect(done.files.length === 1 && done.stillChecking === 0 && fileRow(f.id).uploaded && /^[0-9a-f]{64}$/.test(fileRow(f.id).sha256 || ''), 'good file not confirmed');
+});
+await check('F-04 a file that never reached storage is counted as missing, not "still being checked"', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o);
+    db.__state.storage.delete(f.storage_path);
+    const r = await core.confirmUploads(o.id, [f.id]);
+    expect(r.missing === 1 && r.stillChecking === 0 && r.files.length === 0, JSON.stringify(r));
+});
+const adminCookie = () => {
+    const token = 'A'.repeat(43);
+    (tables().admin_sessions ||= []).push({ token_hash: core.sha256(token), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString() });
+    return `nps_admin=${token}`;
+};
+await check('F-04 a proof upload with an unchecked file does not mark the order served or email the client', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' });
+    const good = seedFile(o, { kind: 'proof' }); const slow = seedFile(o, { kind: 'proof' });
+    db.__state.failDownload.add(slow.storage_path);
+    const res = await adminPOST(post('/api/admin', { action: 'proof-finish', id: o.id, fileIds: [good.id, slow.id], markServed: true }, { cookie: adminCookie() }));
+    expect(res.status === 503, `expected 503, got ${res.status}`);
+    expect(o.status === 'attempting' && !o.legal_hold, `order changed: ${o.status}`);
+    expect(!emails.some(e => e.to.includes(CLIENT)), 'the client was emailed');
+    db.__state.failDownload.clear();
+    const retry = await adminPOST(post('/api/admin', { action: 'proof-finish', id: o.id, fileIds: [good.id, slow.id], markServed: true }, { cookie: adminCookie() }));
+    expect(retry.status === 200 && o.status === 'served' && emails.some(e => e.to.includes(CLIENT)), `retry failed (${retry.status})`);
+});
+await check('F-04 the tracking page is told when a reply file is still being checked', async () => {
+    reset(); const o = seedOrder({ status: 'received' }); const slow = seedFile(o, { kind: 'action_upload' });
+    db.__state.failDownload.add(slow.storage_path);
+    const v = await (await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [slow.id] }))).json();
+    expect(v.filesStillChecking === 1 && v.filesMissing === 0, JSON.stringify({ c: v.filesStillChecking, m: v.filesMissing }));
 });
 await check('F-04 the new-request email says when uploads are still being checked', async () => {
     reset(); const o = seedOrder(); const good = seedFile(o); const slow = seedFile(o);

@@ -495,8 +495,11 @@ async function proofUpload(body) {
 
 async function proofFinish(request, body) {
     const order = await getOrder(body.id);
-    const { files: uploaded, stillChecking } = await confirmUploads(order.id, body.fileIds);
-    if (!uploaded.length) throw new HttpError(stillChecking ? 503 : 400, stillChecking ? "The file was stored but couldn't be checked yet. Please try again in a minute." : 'The upload did not finish. Please try again.');
+    // All or nothing: the order is marked served and the client emailed only once every proof file is stored and checked.
+    // Files already checked stay checked, so trying again only re-checks the rest.
+    const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
+    if (stillChecking) throw new HttpError(503, `${stillChecking} file(s) were stored but couldn't be checked yet. Nothing was sent to the client. Please try again in a minute.`);
+    if (missing || !uploaded.length) throw new HttpError(400, 'The upload did not finish. Nothing was sent to the client. Please upload the proof again.');
     const detailText = uploaded.map(u => u.sha256 ? `${u.filename} (SHA-256: ${u.sha256.slice(0, 12)}…)` : u.filename).join(', ');
     await addEvent(order.id, 'proof', 'Proof of service uploaded', detailText);
     // Adding another proof to an order that is already served leaves its served time (frozen by legal hold) alone.
