@@ -1,6 +1,6 @@
-# Nick's Process Service — Enterprise Vulnerability Disclosure Policy (RFC 9116)
+# Nick's Process Services: how to report a security problem with this website (RFC 9116).
+# Please email a description and steps to reproduce. Don't access other people's data or disrupt the service.
 Contact: mailto:nicksprocessservices@outlook.com
+Expires: 2027-10-28T00:00:00.000Z
 Preferred-Languages: en
-Canonical: https://nicksprocessservices.dev/.well-known/security.txt
-Expires: 2027-12-31T23:59:59.000Z
-Policy: https://nicksprocessservices.dev/track.html#security-policy
+Canonical: https://www.nicksprocessservices.dev/.well-known/security.txt

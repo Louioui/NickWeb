@@ -140,22 +140,6 @@ const NPS = (() => {
         return { ok: actual === expected, actual, expected };
     }
 
-    // Item 14: 15-Minute Inactivity Auto-Lock & Memory Wipe
-    function setupIdleLock(onIdle, timeoutMs = 15 * 60 * 1000) {
-        let timer = null;
-        const reset = () => {
-            if (timer) clearTimeout(timer);
-            timer = setTimeout(() => {
-                try { onIdle(); } catch {}
-            }, timeoutMs);
-        };
-        for (const ev of ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll']) {
-            window.addEventListener(ev, reset, { passive: true });
-        }
-        reset();
-        return { reset, stop: () => timer && clearTimeout(timer) };
-    }
-
     const money = (cents) => '$' + ((cents || 0) / 100).toFixed(2);
     const fmtDate = (iso, withTime = true) => {
         if (!iso) return '';
@@ -166,85 +150,47 @@ const NPS = (() => {
     };
     const fmtSize = (bytes) => bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB';
 
-    // Item 7: Printable Court-Ready Cryptographic Chain-of-Custody Certificate
+    // Printable service record for Nick (court files, disputes). It states what the system really does, nothing more:
+    // SHA-256 fingerprints taken when each file was stored, and the timeline's hash-chain seal checked by the database.
     function printChainOfCustody(cert) {
-        const w = window.open('', '_blank', 'noopener,width=900,height=800');
-        if (!w) return;
+        // Not opened with 'noopener': that makes window.open return null, so nothing could be written to the new tab.
+        const w = window.open('', '_blank', 'width=900,height=800');
+        if (!w) { alert('Allow pop-ups for this site to print the record.'); return; }
+        w.opener = null;
+        const seal = cert.seal || {};
+        const cell = 'padding:8px;border:1px solid #cdd7d1;vertical-align:top';
         const filesHtml = (cert.files || []).map(f => `
-            <tr>
-                <td style="padding:8px;border:1px solid #cdd7d1;font-weight:600">${esc(f.name || f.filename)}</td>
-                <td style="padding:8px;border:1px solid #cdd7d1">${esc(f.kind)}</td>
-                <td style="padding:8px;border:1px solid #cdd7d1;font-family:monospace;font-size:11px;word-break:break-all">${esc(f.sha256 || 'Pending seal')}</td>
-            </tr>`).join('') || '<tr><td colspan="3" style="padding:8px;border:1px solid #cdd7d1;color:#566860">No documents attached</td></tr>';
+            <tr><td style="${cell};font-weight:600">${esc(f.name || f.filename)}</td><td style="${cell}">${esc(f.kind)}</td>
+                <td style="${cell};font-family:monospace;font-size:11px;word-break:break-all">${esc(f.sha256 || 'not recorded')}</td></tr>`).join('')
+            || `<tr><td colspan="3" style="${cell};color:#566860">No documents attached</td></tr>`;
         const eventsHtml = (cert.events || []).map(ev => `
-            <tr>
-                <td style="padding:8px;border:1px solid #cdd7d1;white-space:nowrap">${esc(fmtDate(ev.created_at))}</td>
-                <td style="padding:8px;border:1px solid #cdd7d1;font-weight:600">${esc(ev.title)}</td>
-                <td style="padding:8px;border:1px solid #cdd7d1;white-space:pre-line">${esc(ev.detail || '')}</td>
-            </tr>`).join('');
-        w.document.write(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Chain of Custody · ${esc(cert.code)}</title>
-            <style>body{font-family:Georgia,serif;color:#10221a;margin:32px;line-height:1.5}h1,h2{color:#0d422e;margin-bottom:6px}table{width:100%;border-collapse:collapse;margin-top:8px;margin-bottom:22px;font-family:sans-serif;font-size:12px}.meta{display:grid;grid-template-columns:1fr 1fr;gap:10px;background:#f4f6f0;padding:14px;border:1px solid #0d422e;font-family:sans-serif;font-size:12px;margin-bottom:20px}.seal{background:#e6eee9;border:1px solid #0d422e;padding:12px;font-family:monospace;font-size:11px;word-break:break-all;margin-bottom:20px}@media print{.no-print{display:none}}</style>
-        </head><body>
-            <div class="no-print" style="margin-bottom:16px;text-align:right"><button onclick="window.print()" style="padding:8px 16px;background:#0d422e;color:#fff;border:0;cursor:pointer;font-weight:600">Print / Save as PDF</button></div>
-            <h1>Cryptographic Chain-of-Custody &amp; Audit Certificate</h1>
-            <p style="margin-top:0;color:#566860;font-size:13px">Nick's Process Services · California Registered Process Server · Tamper-Evident Evidence Record</p>
-            <div class="meta">
-                <div><strong>Reference Code:</strong> ${esc(cert.code)}</div>
-                <div><strong>Status:</strong> ${esc(cert.statusLabel || cert.status)} ${cert.legalHold ? '(SEALED LEGAL HOLD)' : ''}</div>
-                <div><strong>Person to Serve:</strong> ${esc(cert.recipient)}</div>
-                <div><strong>Document Type:</strong> ${esc(cert.docType)}</div>
-                <div><strong>Service Address:</strong> ${esc(cert.address)}</div>
-                <div><strong>Certificate Generated:</strong> ${esc(fmtDate(new Date().toISOString()))}</div>
-            </div>
-            <div class="seal">
-                <strong>Cryptographic Order Audit Chain Seal (HMAC-SHA256):</strong><br>${esc(cert.integritySeal || 'Verified on server')}
-            </div>
-            <h2>1. Sealed Court Documents &amp; Proof of Service (SHA-256 Fingerprints)</h2>
-            <table><thead><tr style="background:#e6eee9"><th style="padding:8px;border:1px solid #cdd7d1;text-align:left">File Name</th><th style="padding:8px;border:1px solid #cdd7d1;text-align:left">Category</th><th style="padding:8px;border:1px solid #cdd7d1;text-align:left">SHA-256 Cryptographic Fingerprint</th></tr></thead><tbody>${filesHtml}</tbody></table>
-            <h2>2. Immutable Chronological Service &amp; Custody Log</h2>
-            <table><thead><tr style="background:#e6eee9"><th style="padding:8px;border:1px solid #cdd7d1;text-align:left">Timestamp</th><th style="padding:8px;border:1px solid #cdd7d1;text-align:left">Event</th><th style="padding:8px;border:1px solid #cdd7d1;text-align:left">Recorded Details &amp; Cryptographic Digest</th></tr></thead><tbody>${eventsHtml}</tbody></table>
-            <p style="font-size:11px;color:#566860;border-top:1px solid #cdd7d1;padding-top:10px">Attestation: Every file listed above was validated for magic-byte file structure and sealed with an immutable SHA-256 cryptographic digest at the time of upload. Critical chain-of-custody events are protected by append-only database triggers and chained into the Order Audit Chain Seal.</p>
-        </body></html>`);
-        w.document.close();
-    }
-
-    // Item 23: Printable Enterprise Vendor Security & Compliance Brief for Law-Firm IT Teams
-    function printSecurityBrief() {
-        const w = window.open('', '_blank', 'noopener,width=900,height=800');
-        if (!w) return;
-        w.document.write(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Enterprise Vendor Security &amp; Compliance Brief · Nick's Process Services</title>
-            <style>body{font-family:Georgia,serif;color:#10221a;margin:36px;line-height:1.55}h1{color:#0d422e;margin-bottom:4px}h2{color:#0d422e;font-size:17px;border-bottom:1px solid #cdd7d1;padding-bottom:4px;margin-top:22px}ul{font-family:sans-serif;font-size:13px;padding-left:20px}li{margin-bottom:6px}.badge{display:inline-block;background:#e6eee9;color:#0d422e;padding:4px 10px;font-family:sans-serif;font-size:11px;font-weight:700;border:1px solid #0d422e;margin-right:6px}@media print{.no-print{display:none}}</style>
-        </head><body>
-            <div class="no-print" style="margin-bottom:16px;text-align:right"><button onclick="window.print()" style="padding:8px 16px;background:#0d422e;color:#fff;border:0;cursor:pointer;font-weight:600">Print / Save Vendor Security Brief (PDF)</button></div>
-            <h1>Enterprise Vendor Security &amp; Legal Compliance Brief</h1>
-            <p style="margin-top:0;color:#566860;font-size:13px">Prepared for Law Firm IT, Managing Partners &amp; Corporate Vendor Risk Management · Nick's Process Services</p>
-            <div style="margin:14px 0"><span class="badge">2-Step Verification (2FA / TOTP)</span><span class="badge">SHA-256 Chain of Custody</span><span class="badge">Zero-Trust Ephemeral Storage</span><span class="badge">TLS 1.3 + HSTS Preload</span></div>
-            <h2>1. Two-Step Verification (2FA) &amp; Access Control</h2>
-            <ul>
-                <li><strong>Staff 2-Step Verification (Email OTP + RFC 6238 Authenticator TOTP):</strong> Administrative access supports hardware-grade RFC 6238 TOTP second-factor verification plus step-up re-authentication on destructive or legal-hold actions.</li>
-                <li><strong>Client Firm Security PIN &amp; Dual-Key Document Lock:</strong> Law firms can enroll a 6-digit Security PIN on their client account and enable 2-Step Document Lock on individual cases so forwarded tracking links cannot download court filings without 2nd-step verification.</li>
-                <li><strong>One-Click Private Tracking Link Rotation:</strong> Clients and staff can immediately revoke a compromised or forwarded tracking link and issue a fresh 256-bit cryptographic token.</li>
-                <li><strong>Automatic Challenge Burn:</strong> Verification challenges automatically burn after 5 failed guesses to defeat brute-force enumeration.</li>
-            </ul>
-            <h2>2. Anti-Liability Chain-of-Custody &amp; Tamper-Evident Evidence</h2>
-            <ul>
-                <li><strong>Live Browser SHA-256 Cryptographic Verification:</strong> Every court document and Proof of Service is sealed with a SHA-256 digest at upload and can be cryptographically verified directly in the client's browser using WebCrypto.</li>
-                <li><strong>HMAC-SHA256 Chained Audit Trail &amp; Append-Only Triggers:</strong> Service attempts, legal attestations, and Proofs of Service are protected by database-level append-only triggers and chained into an order-wide HMAC-SHA256 integrity seal.</li>
-                <li><strong>Completed-Order Legal Hold Lock:</strong> Once an order is marked <em>Served</em>, it enters a tamper-evident Legal Hold state that blocks accidental edits or deletions.</li>
-            </ul>
-            <h2>3. Zero-Breach Session Isolation &amp; Malware Screening</h2>
-            <ul>
-                <li><strong>HttpOnly, SameSite=Strict, Device-Bound Sessions:</strong> Session tokens are SHA-256 hashed at rest in PostgreSQL, bound to the caller's User-Agent fingerprint, and automatically lock + wipe browser memory after 15 minutes of inactivity.</li>
-                <li><strong>60-Second Ephemeral Signed Downloads &amp; Magic-Byte Screening:</strong> Court documents live in private object storage, undergo strict magic-byte and polyglot/macro rejection (<code>.pdf</code>, <code>.docx</code>, <code>.jpg</code>, <code>.png</code>, <code>.heic</code>, <code>.webp</code>), strip client-side JPEG EXIF/GPS metadata on upload, and use 60-second ephemeral download tokens.</li>
-                <li><strong>RFC 9116 Vulnerability Disclosure Policy:</strong> Published at <code>/.well-known/security.txt</code> (Contact: <code>nicksprocessservices@outlook.com</code>).</li>
-            </ul>
+            <tr><td style="${cell};white-space:nowrap">${esc(fmtDate(ev.created_at))}</td><td style="${cell};font-weight:600">${esc(ev.title)}</td>
+                <td style="${cell};white-space:pre-line">${esc(ev.detail || '')}</td><td style="${cell}">${ev.client_visible === false ? 'Internal' : 'Shown to client'}</td></tr>`).join('');
+        w.document.write(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Service record ${esc(cert.code)}</title>
+            <style>body{font-family:Georgia,serif;color:#10221a;margin:32px;line-height:1.5}h1,h2{color:#0d422e;margin-bottom:6px}h2{font-size:17px;margin-top:24px}
+            table{width:100%;border-collapse:collapse;margin-top:8px;font-family:sans-serif;font-size:12px}th{background:#e6eee9;text-align:left;padding:8px;border:1px solid #cdd7d1}
+            .meta div{margin:2px 0}.seal{margin:16px 0;padding:12px;border:1px solid #cdd7d1;font-family:sans-serif;font-size:12px;word-break:break-all}
+            @media print{.no-print{display:none}}</style></head><body>
+            <div class="no-print" style="text-align:right"><button onclick="window.print()" style="padding:8px 16px;background:#0d422e;color:#fff;border:0;cursor:pointer;font-weight:600">Print / Save as PDF</button></div>
+            <h1>Service record: ${esc(cert.code)}</h1>
+            <p style="margin-top:0;color:#566860;font-size:13px">Nick's Process Services · printed ${esc(fmtDate(new Date().toISOString()))}</p>
+            <div class="meta"><div><strong>Status:</strong> ${esc(cert.statusLabel)}${cert.legalHold ? ' (legal hold on)' : ''}</div>
+                <div><strong>Person to serve:</strong> ${esc(cert.recipient)}</div><div><strong>Document:</strong> ${esc(cert.docType)}</div>
+                <div><strong>Address:</strong> ${esc(cert.address)}</div></div>
+            <div class="seal"><strong>Timeline seal (SHA-256 hash chain, ${esc(String(seal.entries || 0))} entries):</strong> ${seal.verified ? 'verified: no entry has changed since it was written' : 'DOES NOT VERIFY: an entry was changed after it was written'}<br>${esc(seal.head || '')}</div>
+            <h2>Files and their SHA-256 fingerprints</h2>
+            <table><thead><tr><th>File</th><th>Type</th><th>SHA-256 (taken when stored)</th></tr></thead><tbody>${filesHtml}</tbody></table>
+            <h2>Timeline</h2>
+            <table><thead><tr><th>When</th><th>Entry</th><th>Details</th><th>Visibility</th></tr></thead><tbody>${eventsHtml}</tbody></table>
+            <p style="font-size:11px;color:#566860;margin-top:20px">How to check this record: each file's fingerprint can be recomputed from the file itself (for example with "shasum -a 256" on a Mac).
+            Each timeline entry is linked to the one before it by a SHA-256 hash written when the entry was created; the seal above is the newest link, and the same value was emailed to the client when proof was uploaded.</p>
         </body></html>`);
         w.document.close();
     }
 
     return {
         esc, post, get, onChange, fileMeta, checkFiles, uploadAll,
-        verifyFileSha256, setupIdleLock, printChainOfCustody, printSecurityBrief,
+        verifyFileSha256, printChainOfCustody,
         money, fmtDate, fmtSize,
     };
 })();

@@ -133,4 +133,14 @@ check('legal hold never trusts a request flag', !/body\.unlockLegalHold/.test(sr
 check('no plain SHA-256 PIN hashes left', !/sha256\(`\$\{[a-zA-Z.]+\}:\$\{(pin|code)\}`\)/.test(src.replace(/admin_codes[\s\S]{0,200}/g, '')) || /verifyPin/.test(src));
 check('authenticator lookups fail closed', !/getAdminTotp[\s\S]{0,300}catch \{ return null; \}/.test(src));
 
+// --- The shared browser script must actually run (a syntax check alone missed a deleted helper once) ---
+const npsSrc = await readFile(new URL('../assets/js/nps.js', import.meta.url), 'utf8');
+const NPS = new Function('window', 'document', 'navigator', 'location', 'BroadcastChannel', `${npsSrc}; return NPS;`)({}, {}, {}, {}, undefined);
+for (const fn of ['esc', 'post', 'get', 'fileMeta', 'checkFiles', 'uploadAll', 'verifyFileSha256', 'printChainOfCustody', 'money', 'fmtDate', 'fmtSize']) {
+    check(`assets/js/nps.js exports ${fn}`, typeof NPS[fn] === 'function');
+}
+check('browser helpers work', NPS.money(14000) === '$140.00' && NPS.esc('<b>') === '&lt;b&gt;');
+const pages = await Promise.all(['admin.html', 'track.html'].map(f => readFile(new URL(`../${f}`, import.meta.url), 'utf8')));
+check('no page ships unverifiable security claims', !/TLS 1\.3|Zero-Trust|court-certified|tamper-proof|HMAC-SHA256|device-bound/i.test(pages.join('') + npsSrc));
+
 console.log(`${passed} two-step, legal hold, document lock and seal checks passed`);
