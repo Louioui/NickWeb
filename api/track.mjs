@@ -7,19 +7,17 @@
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, cleanFileList,
-         prepareUploads, confirmUploads, addEvent, uuid, sha256, randomToken, timingSafeMatch, uaFingerprint, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
+         prepareUploads, confirmUploads, addEvent, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
 import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, sendEmail } from './_lib/orders.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
 
-function makeUnlockToken(request, order) {
-    const secret = process.env.SUPABASE_SERVICE_ROLE_KEY || 'local-dev-secret';
-    return sha256(`nps-track-unlock:${secret}:${order.id}:${order.track_token}:${uaFingerprint(request)}`);
-}
-
-function isOrderUnlocked(request, order, body) {
-    if (!order.doc_lock) return true;
-    const tok = typeof body?.unlockToken === 'string' ? body.unlockToken : '';
-    return tok.length === 64 && timingSafeMatch(tok, makeUnlockToken(request, order));
+// Unlocking a document-locked tracking page gives the browser a signed token that expires after 12 hours. It is tied
+// to this order and this link, so it stops working at once if the link is replaced, and it can't be reused elsewhere.
+const UNLOCK_HOURS = 12;
+const unlockSubject = (order) => `${order.id}|${order.track_token}`;
+const makeUnlockToken = (order) => signToken('track-unlock-v1', unlockSubject(order), UNLOCK_HOURS * 3600);
+function isOrderUnlocked(order, body) {
+    return !order.doc_lock || checkToken('track-unlock-v1', unlockSubject(order), body?.unlockToken);
 }
 
 export const POST = handle(async (request) => {
@@ -27,7 +25,7 @@ export const POST = handle(async (request) => {
     cleanTrackToken(body.t);
     await rateLimit(`track:${clientIp(request)}`, 120, 600);
     const order = await orderByToken(body.t);
-    const unlocked = isOrderUnlocked(request, order, body);
+    const unlocked = isOrderUnlocked(order, body);
 
     if (body.action === 'view') {
         return json(await clientView(order, { unlocked }));
@@ -43,7 +41,7 @@ export const POST = handle(async (request) => {
             expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
             created_at: new Date().toISOString(),
         });
-        if (error) throw new HttpError(503, '2-Step Document Unlock requires the latest database migration.');
+        if (error) throw error;
         await sendEmail({
             to: order.client_email,
             subject: `${order.code}: Your 2-step document unlock code is ${code}`,
@@ -64,12 +62,16 @@ export const POST = handle(async (request) => {
         if (!/^\d{6}$/.test(code)) throw new HttpError(400, 'Please enter a 6-digit verification code or Security PIN.');
         let verified = false;
         // 1. Check Firm Security PIN if configured for order.client_email
-        try {
-            const { data: sec } = await db().from('client_security_settings').select('pin_hash, locked_until').eq('email', order.client_email.toLowerCase()).maybeSingle();
-            if (sec?.pin_hash && (!sec.locked_until || sec.locked_until < new Date().toISOString())) {
-                if (timingSafeMatch(sec.pin_hash, sha256(`${order.client_email.toLowerCase()}:${code}`))) verified = true;
+        const clientEmail = order.client_email.toLowerCase();
+        const { data: sec, error: secErr } = await db().from('client_security_settings').select('pin_hash, failed_tries, locked_until').eq('email', clientEmail).maybeSingle();
+        if (secErr) throw secErr;
+        const pinLocked = sec?.locked_until && sec.locked_until > new Date().toISOString();
+        if (sec?.pin_hash && !pinLocked) {
+            if (verifyPin(code, sec.pin_hash)) {
+                verified = true;
+                if (sec.failed_tries) await db().from('client_security_settings').update({ failed_tries: 0, locked_until: null }).eq('email', clientEmail);
             }
-        } catch { /* non-fatal */ }
+        }
         // 2. Otherwise check one-time emailed unlock code
         if (!verified) {
             const { data: row } = await db().from('track_unlock_codes').select('*').eq('order_id', order.id).maybeSingle();
@@ -77,6 +79,12 @@ export const POST = handle(async (request) => {
                 throw new HttpError(401, 'That unlock code is invalid or expired. Request a new code.');
             }
             if (!timingSafeMatch(row.code_hash, sha256(`${order.id}:${code}`))) {
+                // A wrong entry also counts against the client's PIN lockout, so guessing the PIN here gains nothing.
+                if (sec?.pin_hash && !pinLocked) {
+                    const tries = (sec.failed_tries || 0) + 1;
+                    await db().from('client_security_settings').update({ failed_tries: tries,
+                        ...(tries >= 5 ? { locked_until: new Date(Date.now() + 15 * 60e3).toISOString() } : {}) }).eq('email', clientEmail);
+                }
                 const nextTries = (row.tries || 0) + 1;
                 if (nextTries >= 5) await db().from('track_unlock_codes').delete().eq('order_id', order.id);
                 else await db().from('track_unlock_codes').update({ tries: nextTries }).eq('order_id', order.id);
@@ -85,7 +93,7 @@ export const POST = handle(async (request) => {
             await db().from('track_unlock_codes').delete().eq('order_id', order.id);
             verified = true;
         }
-        const unlockToken = makeUnlockToken(request, order);
+        const unlockToken = makeUnlockToken(order);
         const view = await clientView(order, { unlocked: true });
         return json({ ok: true, unlockToken, ...view });
     }
@@ -97,10 +105,10 @@ export const POST = handle(async (request) => {
         }
         const nextLock = body.locked !== undefined ? !!body.locked : !order.doc_lock;
         const { error } = await db().from('orders').update({ doc_lock: nextLock }).eq('id', order.id);
-        if (error) throw new HttpError(503, '2-Step Document Lock requires the latest database migration.');
+        if (error) throw error;
         await addEvent(order.id, 'note', nextLock ? '2-Step Document Protection enabled' : '2-Step Document Protection unlocked', null, true);
         const updatedOrder = { ...order, doc_lock: nextLock };
-        const unlockToken = nextLock ? makeUnlockToken(request, updatedOrder) : null;
+        const unlockToken = nextLock ? makeUnlockToken(updatedOrder) : null;
         const view = await clientView(updatedOrder, { unlocked: true });
         return json({ ok: true, unlockToken, ...view });
     }
@@ -113,7 +121,15 @@ export const POST = handle(async (request) => {
         const newToken = randomToken(32);
         const { error } = await db().from('orders').update({ track_token: newToken }).eq('id', order.id);
         if (error) throw error;
-        await addEvent(order.id, 'note', 'Private tracking link rotated (previous link revoked)', null, true);
+        await addEvent(order.id, 'note', 'Private tracking link replaced', 'The previous link no longer works. A copy of the new link was emailed.', true);
+        // Email a copy too, so the client still has a working link if this tab is closed.
+        await sendEmail({
+            to: order.client_email, subject: `${order.code}: your new private tracking link`,
+            heading: 'Your tracking link was replaced',
+            lines: [`You replaced the tracking link for ${order.code}. The previous link no longer works. Use the button below from now on.`,
+                "If you didn't do this, call Nick at (209) 922-6817."],
+            button: { label: 'Open your tracking page', url: `${siteOrigin(request)}/track.html#t=${newToken}` },
+        });
         return json({ ok: true, token: newToken, trackUrl: `/track.html#t=${encodeURIComponent(newToken)}` });
     }
 
@@ -124,10 +140,8 @@ export const POST = handle(async (request) => {
         const fId = uuid(body.fileId, 'File');
         const url = await fileForOrder(order.id, fId);
         let fileSha256 = null;
-        try {
-            const { data: fRow } = await db().from('order_files').select('filename, sha256').eq('order_id', order.id).eq('id', fId).maybeSingle();
-            fileSha256 = fRow?.sha256 || null;
-        } catch { /* non-fatal */ }
+        const { data: fRow } = await db().from('order_files').select('sha256').eq('order_id', order.id).eq('id', fId).maybeSingle();
+        fileSha256 = fRow?.sha256 || null;
         return json({ url, sha256: fileSha256, expiresInSeconds: 60 });
     }
 
@@ -144,6 +158,8 @@ export const POST = handle(async (request) => {
     if (body.action === 'respond') {
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
         if (order.status !== 'action_required') throw new HttpError(409, 'Nothing is needed from you right now.');
+        // A locked page can't be used to change the service address: unlock with the emailed code or PIN first.
+        if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
         const changes = {};
         const address = text(body.address, { max: 200 });
         if (address) changes.address = address;
@@ -184,6 +200,7 @@ export const POST = handle(async (request) => {
     }
 
     if (body.action === 'respond-finish') {
+        if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Unlock it first.');
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
         if (order.status !== 'received') return json(await clientView(order));
         const uploaded = await confirmUploads(order.id, body.fileIds);

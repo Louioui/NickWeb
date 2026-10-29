@@ -1,13 +1,13 @@
 // Passwordless client accounts. No admin actions and no client-supplied ownership filters.
-import { db, handle, json, readJson, rateLimit, clientIp, siteOrigin, email, text, cleanOrderCode, randomToken, addEvent, sha256, timingSafeMatch, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
+import { db, handle, json, readJson, rateLimit, clientIp, siteOrigin, email, text, cleanOrderCode, randomToken, addEvent, sha256, hashPin, verifyPin, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
 import { clientAuth, clientCookie, savedClientSession, requireClient, verifiedClient, clientProfile } from './_lib/clients.mjs';
 import { STATUSES, TIERS, money, sendEmail } from './_lib/orders.mjs';
 
+// A client's PIN settings. Fails closed: if this lookup errors, sign-in stops instead of skipping the PIN.
 async function getClientSecurity(emailAddr) {
-    try {
-        const { data } = await db().from('client_security_settings').select('*').eq('email', emailAddr).maybeSingle();
-        return data || null;
-    } catch { return null; }
+    const { data, error } = await db().from('client_security_settings').select('pin_hash, failed_tries, locked_until').eq('email', emailAddr).maybeSingle();
+    if (error) throw new HttpError(503, 'Sign-in is temporarily unavailable. Please try again in a minute.');
+    return data || null;
 }
 
 export const POST = handle(async request => {
@@ -47,15 +47,15 @@ export const POST = handle(async request => {
                 if (!pin) {
                     return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
                 }
-                if (!/^\d{6}$/.test(pin) || !timingSafeMatch(sec.pin_hash, sha256(`${addr}:${pin}`))) {
+                if (!verifyPin(pin, sec.pin_hash)) {
                     const tries = (sec.failed_tries || 0) + 1;
                     const patch = { failed_tries: tries, updated_at: new Date().toISOString() };
                     if (tries >= 5) patch.locked_until = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-                    await db().from('client_security_settings').update(patch).eq('email', addr).catch(() => {});
+                    await db().from('client_security_settings').update(patch).eq('email', addr);
                     throw new HttpError(401, 'Invalid 6-digit Security PIN.');
                 }
                 if (sec.failed_tries > 0) {
-                    await db().from('client_security_settings').update({ failed_tries: 0, locked_until: null }).eq('email', addr).catch(() => {});
+                    await db().from('client_security_settings').update({ failed_tries: 0, locked_until: null }).eq('email', addr);
                 }
             }
 
@@ -99,12 +99,12 @@ export const POST = handle(async request => {
         if (!/^\d{6}$/.test(pin)) throw new HttpError(400, 'Please enter a 6-digit numeric Security PIN.');
         const { error } = await db().from('client_security_settings').upsert({
             email: clientEmail,
-            pin_hash: sha256(`${clientEmail}:${pin}`),
+            pin_hash: hashPin(pin),
             failed_tries: 0,
             locked_until: null,
             updated_at: new Date().toISOString(),
         });
-        if (error) throw new HttpError(503, 'Client Security PIN requires the latest database migration.');
+        if (error) throw error;
         return json({ ok: true, hasPin: true }, 200, headers);
     }
     if (action === 'disable-pin') {
@@ -112,7 +112,7 @@ export const POST = handle(async request => {
         const sec = await getClientSecurity(clientEmail);
         if (sec?.pin_hash) {
             const pin = String(body.pin || '').trim();
-            if (!timingSafeMatch(sec.pin_hash, sha256(`${clientEmail}:${pin}`))) {
+            if (!verifyPin(pin, sec.pin_hash)) {
                 throw new HttpError(403, 'Enter your current 6-digit Security PIN to disable it.');
             }
             await db().from('client_security_settings').update({ pin_hash: null, updated_at: new Date().toISOString() }).eq('email', clientEmail);
@@ -127,7 +127,14 @@ export const POST = handle(async request => {
         const newToken = randomToken(32);
         const { error } = await db().from('orders').update({ track_token: newToken }).eq('id', order.id);
         if (error) throw error;
-        await addEvent(order.id, 'note', 'Private tracking link rotated by client (previous link revoked)', null, true);
+        await addEvent(order.id, 'note', 'Private tracking link replaced', 'The previous link no longer works. A copy of the new link was emailed.', true);
+        await sendEmail({
+            to: order.client_email, subject: `${order.code}: your new private tracking link`,
+            heading: 'Your tracking link was replaced',
+            lines: [`You replaced the tracking link for ${order.code}. The previous link no longer works. Use the button below from now on.`,
+                "If you didn't do this, call Nick at (209) 922-6817."],
+            button: { label: 'Open your tracking page', url: `${siteOrigin(request)}/track.html#t=${newToken}` },
+        });
         return json({ ok: true, code: order.code, trackUrl: `/track.html#t=${encodeURIComponent(newToken)}` }, 200, headers);
     }
     if (action === 'toggle-doc-lock') {
@@ -137,7 +144,7 @@ export const POST = handle(async request => {
         if (oErr || !order) throw new HttpError(404, 'Order not found.');
         const locked = body.locked !== undefined ? !!body.locked : !order.doc_lock;
         const { error } = await db().from('orders').update({ doc_lock: locked }).eq('id', order.id);
-        if (error) throw new HttpError(503, '2-Step Document Lock requires the latest database migration.');
+        if (error) throw error;
         await addEvent(order.id, 'note', locked ? '2-Step Document Protection enabled by client' : '2-Step Document Protection unlocked by client', null, true);
         return json({ ok: true, code: order.code, docLock: locked }, 200, headers);
     }

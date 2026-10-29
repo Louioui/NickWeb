@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, computeChainSeal } from './core.mjs';
+import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD } from './core.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -55,6 +55,15 @@ export async function orderByToken(token) {
 
 const isSafePaymentUrl = (u) => typeof u === 'string' && (/^https:\/\/checkout\.stripe\.com\//i.test(u) || u.startsWith('/__mock-pay'));
 
+// The timeline's tamper-evident seal. Each entry was chained with SHA-256 by the database when it was written;
+// verify_order_chain recomputes the chain from the stored rows, so any later edit shows up as verified = false.
+export async function orderSeal(orderId) {
+    const { data, error } = await db().rpc('verify_order_chain', { p_order: orderId });
+    if (error) throw error;
+    const row = Array.isArray(data) ? data[0] : data;
+    return { verified: !!row?.ok, head: row?.head || null, entries: row?.entries || 0 };
+}
+
 // Masks street numbers and apartment/suite identifiers when 2-Step Case/Document Lock is active and unverified.
 export function maskAddress(order) {
     const street = String(order.address || '').replace(/^\s*\d+[A-Za-z0-9\-/]*/, '••••');
@@ -77,7 +86,7 @@ export async function clientView(order, { unlocked = true } = {}) {
     }
     const isLocked = !!order.doc_lock && !unlocked;
     const fullAddr = [order.address, order.unit].filter(Boolean).join(', ') + (order.city ? `, ${order.city}` : '') + ` ${order.zip}`;
-    const seal = computeChainSeal(order.code, order.created_at, events || [], files || []);
+    const seal = await orderSeal(order.id);
     return {
         code: order.code,
         status: order.status,
@@ -96,7 +105,7 @@ export async function clientView(order, { unlocked = true } = {}) {
         actionNote: order.status === 'action_required' ? order.action_note : null,
         docLock: !!order.doc_lock,
         unlocked: !isLocked,
-        legalHold: order.status === 'served' || !!order.legal_hold,
+        legalHold: !!order.legal_hold,
         integritySeal: seal,
         events: events || [],
         files: (files || []).map(f => ({

@@ -1,7 +1,7 @@
 // Shared server code for the /api functions: database client, HTTP helpers, tokens, rate limits.
 // Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
 import { createClient } from '@supabase/supabase-js';
-import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
 export const BUCKET = 'case-files';
@@ -109,10 +109,63 @@ export function timingSafeMatch(a, b) {
 export const randomToken = (bytes = 24) => randomBytes(bytes).toString('base64url');   // 24 bytes = 192 bits
 export const orderCode = () => 'NP-' + String(randomInt(100000, 1000000));
 
-// Device/Browser User-Agent fingerprint for session binding (prevents stolen cookies from working in a different browser/OS).
-export function uaFingerprint(request) {
-    const ua = (request?.headers?.get('user-agent') || 'unknown').trim().toLowerCase().slice(0, 300);
-    return sha256('nps-ua-v1:' + ua).slice(0, 24);
+// --- Server-side secrets ---
+// One server-only root secret (APP_SECRET, or the service-role key when APP_SECRET isn't set) is stretched into separate
+// keys per purpose with HKDF, so a key for one job can never be replayed for another. None of these keys is ever stored
+// in the database, so a copy of the database alone cannot decrypt authenticator secrets or forge tokens.
+const appKeys = new Map();
+export function appKey(purpose) {
+    if (!appKeys.has(purpose)) {
+        const root = process.env.APP_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || (IS_PROD ? '' : 'local-dev-only-secret');
+        if (!root) throw new HttpError(503, 'Online requests are temporarily unavailable. Please call or text Nick at (209) 922-6817.');
+        appKeys.set(purpose, Buffer.from(hkdfSync('sha256', root, 'nps-app-keys-v1', purpose, 32)));
+    }
+    return appKeys.get(purpose);
+}
+
+// AES-256-GCM, stored as "v1.<iv>.<tag>.<ciphertext>" (base64url). Tampered ciphertext fails to decrypt.
+export function encryptSecret(plain, purpose = 'totp-secret-v1') {
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', appKey(purpose), iv);
+    const ct = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
+    return ['v1', iv.toString('base64url'), cipher.getAuthTag().toString('base64url'), ct.toString('base64url')].join('.');
+}
+export function decryptSecret(stored, purpose = 'totp-secret-v1') {
+    const [v, iv, tag, ct] = String(stored || '').split('.');
+    if (v !== 'v1' || !iv || !tag || !ct) throw new HttpError(500, 'Stored secret is unreadable.');
+    const decipher = createDecipheriv('aes-256-gcm', appKey(purpose), Buffer.from(iv, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+    return Buffer.concat([decipher.update(Buffer.from(ct, 'base64url')), decipher.final()]).toString('utf8');
+}
+
+// Keyed hash for short codes (recovery codes). Unlike a plain SHA-256, it can't be brute-forced from a database copy.
+export const keyedHash = (purpose, value) => createHmac('sha256', appKey(purpose)).update(String(value)).digest('hex');
+
+// Short numeric PINs need a deliberately slow hash with a per-record salt: a million possibilities is nothing for SHA-256.
+const SCRYPT_N = 16384;
+export function hashPin(pin) {
+    const salt = randomBytes(16);
+    const hash = scryptSync(String(pin), salt, 32, { N: SCRYPT_N, r: 8, p: 1 });
+    return `scrypt$${SCRYPT_N}$${salt.toString('base64url')}$${hash.toString('base64url')}`;
+}
+export function verifyPin(pin, stored) {
+    const [scheme, n, salt, hash] = String(stored || '').split('$');
+    if (scheme !== 'scrypt' || !salt || !hash || !/^\d{6}$/.test(String(pin || ''))) return false;
+    const expected = Buffer.from(hash, 'base64url');
+    const actual = scryptSync(String(pin), Buffer.from(salt, 'base64url'), expected.length, { N: Number(n), r: 8, p: 1 });
+    return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+// Expiring signed token: "<expiry seconds>.<HMAC>" over a purpose and a subject. Nothing to store, nothing to look up.
+export function signToken(purpose, subject, ttlSeconds) {
+    const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+    return `${exp}.${createHmac('sha256', appKey(purpose)).update(`${subject}|${exp}`).digest('base64url')}`;
+}
+export function checkToken(purpose, subject, token) {
+    const m = /^(\d{10})\.([A-Za-z0-9_-]{43})$/.exec(String(token || ''));
+    if (!m || Number(m[1]) < Date.now() / 1000) return false;
+    const expected = createHmac('sha256', appKey(purpose)).update(`${subject}|${m[1]}`).digest('base64url');
+    return timingSafeMatch(expected, m[2]);
 }
 
 // --- RFC 6238 TOTP (Authenticator App 2-Step Verification) ---
@@ -161,27 +214,16 @@ export function totpCode(secret, timeMs = Date.now(), stepOffset = 0) {
         (hmac[offset + 3] & 0xff);
     return String(code % 1000000).padStart(6, '0');
 }
+// Returns the matched 30-second step (so the caller can mark it used, which blocks replay), or 0 for no match.
+// Accepts one step either side of now to allow for a phone clock that is slightly off.
 export function verifyTotp(secret, inputCode, timeMs = Date.now()) {
     const clean = String(inputCode || '').replace(/\s+/g, '');
-    if (!/^\d{6}$/.test(clean) || !secret) return false;
+    if (!/^\d{6}$/.test(clean) || !secret) return 0;
+    let matched = 0;
     for (const offset of [-1, 0, 1]) {
-        if (timingSafeMatch(totpCode(secret, timeMs, offset), clean)) return true;
+        if (timingSafeMatch(totpCode(secret, timeMs, offset), clean)) matched = Math.floor(timeMs / 30000) + offset;
     }
-    return false;
-}
-
-// Cryptographic Chain-of-Custody HMAC/SHA-256 hash chain across order events & sealed file digests.
-export function computeChainSeal(orderCodeStr, createdAt, events = [], files = []) {
-    let chain = sha256(`NPS-GENESIS-V1|${orderCodeStr || ''}|${createdAt || ''}`);
-    const sortedEvents = [...events].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
-    for (const ev of sortedEvents) {
-        chain = sha256(`${chain}|EV|${ev.kind || ''}|${ev.title || ''}|${ev.detail || ''}|${ev.created_at || ''}`);
-    }
-    const sortedFiles = [...files].sort((a, b) => String(a.id || a.filename || '').localeCompare(String(b.id || b.filename || '')));
-    for (const f of sortedFiles) {
-        chain = sha256(`${chain}|FILE|${f.filename || f.name || ''}|${f.sha256 || 'unhashed'}`);
-    }
-    return chain;
+    return matched;
 }
 
 // Throws 429 once a bucket passes `max` hits in its window (counted atomically in the database).

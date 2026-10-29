@@ -513,6 +513,8 @@ await step('High-concurrency stress test: 500+ parallel requests (SQLi floods, b
     await callMock('client', { action: 'send-code', intent: 'login', email: 'devteam@partnershipwithmedia-dev.com' });
     const cookieB = (await callMock('client', { action: 'verify-code', email: 'devteam@partnershipwithmedia-dev.com', code: '123456' })).headers.get('set-cookie').split(';')[0];
 
+    // Earlier steps burned Nick's pending codes on purpose (5 wrong guesses), so request a fresh one first, like the real flow.
+    await callMock('admin', { action: 'send-code', email: 'nicksprocessservices@outlook.com' });
     const adminCookie = (await callMock('admin', { action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '12345678' })).headers.get('set-cookie').split(';')[0];
 
     // Create 1 order for devteam@partnershipwithmedia-dev.com so both clients have distinct non-overlapping sets

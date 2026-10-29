@@ -1,6 +1,6 @@
 // Client identity comes only from Supabase Auth's verified user, never a form field or user_metadata.
 import { createClient } from '@supabase/supabase-js';
-import { SUPABASE_URL, HttpError, getCookie, email, uaFingerprint, timingSafeMatch } from './core.mjs';
+import { SUPABASE_URL, HttpError, getCookie, email } from './core.mjs';
 export const CLIENT_COOKIE = 'nps_client';
 export function clientAuth() {
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -9,7 +9,7 @@ export function clientAuth() {
 }
 export function clientCookie(request, session) {
     const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
-    const value = session ? encodeURIComponent(JSON.stringify({ access: session.access_token, refresh: session.refresh_token, ua: uaFingerprint(request) })) : '';
+    const value = session ? encodeURIComponent(JSON.stringify({ access: session.access_token, refresh: session.refresh_token })) : '';
     if (value.length > 3800) throw new HttpError(503, 'Sign-in could not be completed. Please use your tracking link.');
     return `${CLIENT_COOKIE}=${value}; Path=/api/client; HttpOnly; SameSite=Strict; Max-Age=${session ? 86400 * 7 : 0}${secure}`;
 }
@@ -20,7 +20,6 @@ export function savedClientSession(request) {
         if (typeof parsed.access !== 'string' || typeof parsed.refresh !== 'string') return null;
         if (!parsed.access || !parsed.refresh || parsed.access.length > 4096 || parsed.refresh.length > 1024) return null;
         if (/[\u0000-\u001F\u007F]/.test(parsed.access) || /[\u0000-\u001F\u007F]/.test(parsed.refresh)) return null;
-        if (typeof parsed.ua === 'string' && parsed.ua && !timingSafeMatch(parsed.ua, uaFingerprint(request))) return null;
         return { access: parsed.access, refresh: parsed.refresh };
     } catch { return null; }
 }

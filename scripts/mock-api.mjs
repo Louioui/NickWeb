@@ -3,7 +3,7 @@
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken } from '../api/_lib/orders.mjs';
-import { generateTotpSecret, totpCode, verifyTotp, uaFingerprint, computeChainSeal, timingSafeMatch } from '../api/_lib/core.mjs';
+import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
 export const MOCK_CLIENT_CODE = '123456';
@@ -133,8 +133,24 @@ function cleanUuid(v, label = 'Record') {
     return v.toLowerCase();
 }
 
+// Mirrors the database trigger (seal_order_event): each entry is chained to the previous one with SHA-256 when written.
+const chainPayload = (e) => JSON.stringify(['NPS-CHAIN-V1', e.order_id, e.seq, e.prev_hash || 'GENESIS', e.kind, e.title, e.detail || '', e.client_visible, e.created_at]);
 function addEvent(orderId, kind, title, detail = null, clientVisible = true, at = now()) {
-    events.push({ id: randomUUID(), order_id: orderId, created_at: at, kind, title, detail, client_visible: clientVisible });
+    const prior = events.filter(e => e.order_id === orderId).sort((a, b) => a.seq - b.seq).at(-1);
+    const e = { id: randomUUID(), order_id: orderId, created_at: at, kind, title, detail, client_visible: clientVisible,
+        seq: (prior?.seq || 0) + 1, prev_hash: prior?.chain_hash || null };
+    e.chain_hash = sha256Hex(chainPayload(e));
+    events.push(e);
+}
+// Mirrors verify_order_chain: recomputes the chain from the stored entries.
+function orderSeal(orderId) {
+    const list = events.filter(e => e.order_id === orderId).sort((a, b) => a.seq - b.seq);
+    let prev = null, ok = true;
+    list.forEach((e, i) => {
+        if (e.seq !== i + 1 || (e.prev_hash || null) !== prev || e.chain_hash !== sha256Hex(chainPayload(e))) ok = false;
+        prev = e.chain_hash;
+    });
+    return { verified: ok, head: prev, entries: list.length };
 }
 
 function orderByToken(t) {
@@ -155,7 +171,7 @@ function clientView(o, { unlocked = true } = {}) {
     const uploadedFiles = [...files.values()].filter(f => f.order_id === o.id && f.uploaded);
     const isLocked = !!o.doc_lock && !unlocked;
     const fullAddr = [o.address, o.unit].filter(Boolean).join(', ') + `, ${o.city} ${o.zip}`;
-    const seal = computeChainSeal(o.code, o.created_at, visibleEvents, uploadedFiles);
+    const seal = orderSeal(o.id);
     return {
         code: o.code, status: o.status, statusLabel: STATUSES[o.status]?.label, statusText: STATUSES[o.status]?.client,
         createdAt: o.created_at,
@@ -169,7 +185,7 @@ function clientView(o, { unlocked = true } = {}) {
         paidAt: o.paid_at, actionNote: o.status === 'action_required' ? o.action_note : null,
         docLock: !!o.doc_lock,
         unlocked: !isLocked,
-        legalHold: o.status === 'served' || !!o.legal_hold,
+        legalHold: !!o.legal_hold,
         integritySeal: seal,
         events: visibleEvents,
         files: uploadedFiles.map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, sha256: f.sha256 || null, at: f.created_at, locked: isLocked })),
@@ -179,10 +195,9 @@ function clientView(o, { unlocked = true } = {}) {
 function adminDetail(o) {
     const evs = events.filter(e => e.order_id === o.id).sort((a, b) => a.created_at.localeCompare(b.created_at));
     const fls = [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ data, ...f }) => f);
-    const seal = computeChainSeal(o.code, o.created_at, evs, fls);
-    const legalHold = o.status === 'served' || !!o.legal_hold;
+    const seal = orderSeal(o.id);
     return {
-        order: { ...o, legal_hold: legalHold, doc_lock: !!o.doc_lock, integrity_seal: seal, tier_name: TIERS[o.tier]?.name, addon_names: o.addons.map(k => ADDONS[k]?.name).filter(Boolean) },
+        order: { ...o, legal_hold: !!o.legal_hold, doc_lock: !!o.doc_lock, integrity_seal: seal, tier_name: TIERS[o.tier]?.name, addon_names: o.addons.map(k => ADDONS[k]?.name).filter(Boolean) },
         events: evs,
         files: fls,
         integritySeal: seal,
@@ -295,21 +310,23 @@ const DOC_TYPES = ['Summons & Complaint', 'Subpoena (Civil, Criminal, or Federal
     'Eviction Notice', 'Divorce Papers', 'Child Custody & Support Order', 'Restraining Order', 'Order to Show Cause',
     'Debt Collection Notice', 'Other Legal Document'];
 
-function makeMockUnlockToken(req, o) {
-    return sha256Hex(`nps-track-unlock:mock:${o.id}:${o.track_token}:${uaFingerprint(req)}`);
-}
-function isMockUnlocked(req, o, body) {
-    if (!o.doc_lock) return true;
-    const tok = typeof body?.unlockToken === 'string' ? body.unlockToken : '';
-    return tok.length === 64 && timingSafeMatch(tok, makeMockUnlockToken(req, o));
+// Same signed, 12-hour unlock token as api/track.mjs.
+const makeMockUnlockToken = (req, o) => signToken('track-unlock-v1', `${o.id}|${o.track_token}`, 12 * 3600);
+const isMockUnlocked = (req, o, body) => !o.doc_lock || checkToken('track-unlock-v1', `${o.id}|${o.track_token}`, body?.unlockToken);
+
+// Same rules as api/admin.mjs: a matched code consumes its 30-second step, so it can't be replayed.
+function useMockTotp(adminEmail, secret, code) {
+    const step = verifyTotp(secret, code);
+    const row = adminTotpSecrets.get(adminEmail);
+    if (!step || !row || step <= (row.last_used_step || 0)) return false;
+    row.last_used_step = step;
+    return true;
 }
 function requireMockStepUp(adminEmail, totpInput) {
     const row = adminTotpSecrets.get(adminEmail);
-    if (row?.enabled) {
-        if (!verifyTotp(row.secret, totpInput)) {
-            fail(403, 'Step-up 2FA required: please enter your 6-digit Authenticator App code.');
-        }
-    }
+    if (!row?.enabled) return false;
+    if (!useMockTotp(adminEmail, row.secret, totpInput)) fail(403, 'Enter the current 6-digit code from your authenticator app.');
+    return true;
 }
 
 const handlers = {
@@ -338,7 +355,7 @@ const handlers = {
                 if (!pin) {
                     return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
                 }
-                if (!/^\d{6}$/.test(pin) || !timingSafeMatch(sec.pin_hash, sha256Hex(`${addr}:${pin}`))) {
+                if (!verifyPin(pin, sec.pin_hash)) {
                     sec.failed_tries = (sec.failed_tries || 0) + 1;
                     if (sec.failed_tries >= 5) {
                         sec.locked_until = Date.now() + 15 * 60 * 1000;
@@ -361,16 +378,12 @@ const handlers = {
                 clients.set(addr, { name: pending.name, firm: pending.firm, email: addr });
             }
             clientCodes.delete(addr);
-            const value = `${token()}.${uaFingerprint(req)}`;
+            const value = token();
             clientSessions.set(value, addr);
             return json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
         }
         const value = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_client=([^;]+)/)?.[1];
-        if (value && value.includes('.')) {
-            const parts = value.split('.');
-            if (parts.length !== 2 || !timingSafeMatch(parts[1], uaFingerprint(req))) fail(401, 'Session device mismatch. Please sign in again.');
-        }
-        const verifiedEmail = value && /^[A-Za-z0-9_.-]{16,160}$/.test(value) ? clientSessions.get(value) : null;
+        const verifiedEmail = value && /^[A-Za-z0-9_-]{16,160}$/.test(value) ? clientSessions.get(value) : null;
         if (action === 'logout') { if (value) clientSessions.delete(value); return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' }); }
         if (action === 'logout-all') {
             if (verifiedEmail) {
@@ -388,13 +401,13 @@ const handlers = {
         if (action === 'set-pin') {
             const pin = String(body.pin || '').trim();
             if (!/^\d{6}$/.test(pin)) fail(400, 'Please enter a 6-digit numeric Security PIN.');
-            clientSecurity.set(verifiedEmail, { pin_hash: sha256Hex(`${verifiedEmail}:${pin}`), failed_tries: 0, locked_until: 0 });
+            clientSecurity.set(verifiedEmail, { pin_hash: hashPin(pin), failed_tries: 0, locked_until: 0 });
             return json({ ok: true, hasPin: true });
         }
         if (action === 'disable-pin') {
             if (sec?.pin_hash) {
                 const pin = String(body.pin || '').trim();
-                if (!timingSafeMatch(sec.pin_hash, sha256Hex(`${verifiedEmail}:${pin}`))) fail(403, 'Enter your current 6-digit Security PIN to disable it.');
+                if (!verifyPin(pin, sec.pin_hash)) fail(403, 'Enter your current 6-digit Security PIN to disable it.');
                 clientSecurity.delete(verifiedEmail);
             }
             return json({ ok: true, hasPin: false });
@@ -489,13 +502,17 @@ const handlers = {
             if (!/^\d{6}$/.test(code)) fail(400, 'Please enter a 6-digit verification code or Security PIN.');
             let verified = false;
             const sec = clientSecurity.get(o.client_email.toLowerCase());
-            if (sec?.pin_hash && (!sec.locked_until || sec.locked_until < Date.now())) {
-                if (timingSafeMatch(sec.pin_hash, sha256Hex(`${o.client_email.toLowerCase()}:${code}`))) verified = true;
-            }
+            const pinLocked = sec?.locked_until && sec.locked_until > Date.now();
+            if (sec?.pin_hash && !pinLocked && verifyPin(code, sec.pin_hash)) { verified = true; sec.failed_tries = 0; }
             if (!verified) {
                 const row = trackUnlockCodes.get(o.id);
                 if (!row || row.expires < Date.now() || row.tries >= 5) fail(401, 'That unlock code is invalid or expired. Request a new code.');
                 if (code !== row.code) {
+                    // Same as api/track.mjs: a wrong entry also counts against the client's PIN lockout.
+                    if (sec?.pin_hash && !pinLocked) {
+                        sec.failed_tries = (sec.failed_tries || 0) + 1;
+                        if (sec.failed_tries >= 5) sec.locked_until = Date.now() + 15 * 60e3;
+                    }
                     row.tries++;
                     if (row.tries >= 5) trackUnlockCodes.delete(o.id);
                     fail(401, 'That unlock code is invalid or expired.');
@@ -516,7 +533,8 @@ const handlers = {
         if (body.action === 'rotate-token') {
             if (o.doc_lock && !unlocked) fail(403, 'Verify your 2-Step code before rotating this private link.');
             o.track_token = randomBytes(32).toString('base64url');
-            addEvent(o.id, 'note', 'Private tracking link rotated (previous link revoked)', null, true);
+            addEvent(o.id, 'note', 'Private tracking link replaced', 'The previous link no longer works. A copy of the new link was emailed.', true);
+            email(o.client_email, `${o.code}: your new private tracking link`, `/track.html#t=${o.track_token}`);
             return json({ ok: true, token: o.track_token, trackUrl: `/track.html#t=${encodeURIComponent(o.track_token)}` });
         }
         if (body.action === 'download') {
@@ -535,6 +553,7 @@ const handlers = {
         }
         if (body.action === 'respond') {
             if (o.status !== 'action_required') fail(409, 'Nothing is needed from you right now.');
+            if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
             const changes = {};
             const address = cleanText(body.address, 200, false, 'Street address');
             if (address) changes.address = address;
@@ -566,6 +585,7 @@ const handlers = {
             return json({ ok: true, uploads });
         }
         if (body.action === 'respond-finish') {
+            if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Unlock it first.');
             if (o.status !== 'received') return json(clientView(o, { unlocked }));
             const up = confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
@@ -601,38 +621,39 @@ const handlers = {
             return json({ ok: true });
         }
         if (a === 'verify-code') {
+            // Same rules as api/admin.mjs: with an authenticator on, email code + (authenticator code or recovery code);
+            // without one, an email code, or a recovery code on its own.
             const addr = cleanEmail(body.email);
             if (!MOCK_ADMIN_EMAILS.includes(addr)) fail(401, 'That code is wrong or expired. Request a new one.');
             const raw = String(body.code || '').trim().toUpperCase();
             const digits = raw.replace(/\D/g, '');
-            const alnum = raw.replace(/[^A-Z0-9]/g, '');
+            const isEmailCode = digits.length === 8 && raw.replace(/[\s-]+/g, '') === digits;
+            const second = String(body.totp || '').trim().toUpperCase();
+            const secondRecovery = second.replace(/[^A-Z0-9]/g, '');
             const totpRow = adminTotpSecrets.get(addr);
-            const isEmailOtp = digits.length === 8 && raw.replace(/\s+/g, '') === digits;
-            if (totpRow?.enabled && isEmailOtp && !body.totp) {
-                return json({ ok: false, requiresTwoFactor: true, message: 'Enter your 6-digit Authenticator App code to complete 2-step sign-in.' }, 200);
+            if (totpRow?.enabled && isEmailCode && !second) {
+                return json({ ok: false, requiresTwoFactor: true, message: 'Enter the 6-digit code from your authenticator app, or one of your recovery codes.' });
             }
             const codes = adminRecoveryCodes.get(addr);
             let ok = false;
-            let usedRecovery = false;
-            if (isEmailOtp && !adminCodesBurned.has(addr)) {
-                if (totpRow?.enabled && !verifyTotp(totpRow.secret, body.totp)) {
-                    ok = false;
-                } else {
-                    ok = digits === MOCK_ADMIN_CODE;
-                }
-            }
-            if (!ok && alnum.length === 8 && codes && codes.has(alnum)) {
-                codes.delete(alnum);
+            let method = 'email';
+            if (isEmailCode && !adminCodesBurned.has(addr)) {
+                let secondOk = !totpRow?.enabled;
+                if (!secondOk && /^\d{6}$/.test(second.replace(/\s+/g, ''))) { secondOk = useMockTotp(addr, totpRow.secret, second); method = 'email+authenticator'; }
+                else if (!secondOk && secondRecovery.length === 8 && codes?.has(secondRecovery)) { codes.delete(secondRecovery); secondOk = true; method = 'email+recovery'; }
+                ok = secondOk && digits === MOCK_ADMIN_CODE;
+            } else if (!totpRow?.enabled && !isEmailCode && codes?.has(raw.replace(/[^A-Z0-9]/g, ''))) {
+                codes.delete(raw.replace(/[^A-Z0-9]/g, ''));
                 ok = true;
-                usedRecovery = true;
+                method = 'recovery';
             }
             if (!ok) {
                 auditAdmin(addr, 'login_failed');
                 const fails = (adminBurnFails.get(addr) || 0) + 1;
                 adminBurnFails.set(addr, fails);
                 if (fails >= 5) {
-                    adminCodesBurned.add(addr);
-                    auditAdmin(addr, 'challenge_burned_lockout', null, 'All pending login codes invalidated after 5 failed verification attempts');
+                    adminCodesBurned.add(addr);   // codes already sent stop working; a new send-code clears this
+                    auditAdmin(addr, 'codes_burned', null, 'Pending login codes discarded after 5 failed attempts');
                 }
                 fail(401, 'That code is wrong or expired. Request a new one.');
             }
@@ -643,20 +664,15 @@ const handlers = {
                 sessions.delete(oldest);
                 sessionEmails.delete(oldest);
             }
-            const t = `${token()}.${uaFingerprint(req)}`;
+            const t = token();
             sessions.add(t);
             sessionEmails.set(t, addr);
-            auditAdmin(addr, usedRecovery ? 'login_recovery_code' : 'login_success');
+            auditAdmin(addr, method.includes('recovery') ? 'login_recovery_code' : 'login_success', null, `Signed in with ${method}`);
+            email(addr, method.includes('recovery') ? 'Security alert: recovery code used to sign in' : 'Security alert: new sign-in to your dashboard');
             return json({ ok: true, totpEnabled: !!totpRow?.enabled }, 200, { 'set-cookie': `nps_admin=${t}; Path=/api/admin; HttpOnly; SameSite=Strict` });
         }
         const cookie = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_admin=([^;]+)/)?.[1];
-        if (!cookie || !/^[A-Za-z0-9_.-]{16,160}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
-        if (cookie.includes('.')) {
-            const parts = cookie.split('.');
-            if (parts.length !== 2 || !timingSafeMatch(parts[1], uaFingerprint(req))) {
-                fail(401, 'Session device mismatch. Please log in again.');
-            }
-        }
+        if (!cookie || !/^[A-Za-z0-9_-]{16,160}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
         const adminEmail = sessionEmails.get(cookie) || ADMIN_EMAIL;
         if (a === 'me') {
             const totpRow = adminTotpSecrets.get(adminEmail);
@@ -678,25 +694,30 @@ const handlers = {
             return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' });
         }
         if (a === 'totp-setup') {
+            // While one is on, changing it needs the current code, and the new secret waits as pending until confirmed.
+            const row = adminTotpSecrets.get(adminEmail);
+            if (row?.enabled) requireMockStepUp(adminEmail, body?.totp);
             const secret = generateTotpSecret(20);
-            adminTotpSecrets.set(adminEmail, { secret, enabled: false });
-            auditAdmin(adminEmail, 'totp_setup_initiated');
-            const otpauthUrl = `otpauth://totp/NicksProcessServices:${encodeURIComponent(adminEmail)}?secret=${secret}&issuer=NicksProcessServices&algorithm=SHA1&digits=6&period=30`;
-            return json({ ok: true, secret, otpauthUrl });
+            if (row?.enabled) row.pending = secret;
+            else adminTotpSecrets.set(adminEmail, { secret, enabled: false, last_used_step: row?.last_used_step || 0 });
+            auditAdmin(adminEmail, row?.enabled ? 'totp_change_started' : 'totp_setup_started');
+            const label = encodeURIComponent(`Nick's Process Services:${adminEmail}`);
+            return json({ ok: true, secret, otpauthUrl: `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent("Nick's Process Services")}&algorithm=SHA1&digits=6&period=30` });
         }
         if (a === 'totp-enable') {
             const row = adminTotpSecrets.get(adminEmail);
-            if (!row?.secret) fail(400, 'Start 2FA setup first.');
-            if (!verifyTotp(row.secret, body.totp)) fail(400, 'Invalid 6-digit Authenticator code.');
-            row.enabled = true;
+            const candidate = row?.pending || (!row?.enabled && row?.secret);
+            if (!candidate) fail(400, 'Start authenticator setup first.');
+            if (!useMockTotp(adminEmail, candidate, body.totp)) fail(400, "That code didn't match. Check that your phone's clock is set automatically, then try the newest code.");
+            Object.assign(row, { secret: candidate, pending: null, enabled: true });
             auditAdmin(adminEmail, 'totp_enabled');
             return json({ ok: true, totpEnabled: true });
         }
         if (a === 'totp-disable') {
             const row = adminTotpSecrets.get(adminEmail);
             if (!row?.enabled) return json({ ok: true, totpEnabled: false });
-            if (!verifyTotp(row.secret, body.totp)) fail(403, 'Enter your current 6-digit Authenticator code to disable 2FA.');
-            row.enabled = false;
+            if (!useMockTotp(adminEmail, row.secret, body.totp)) fail(403, 'Enter the current 6-digit code from your authenticator app to turn two-step sign-in off.');
+            Object.assign(row, { enabled: false, pending: null });
             auditAdmin(adminEmail, 'totp_disabled');
             return json({ ok: true, totpEnabled: false });
         }
@@ -737,42 +758,39 @@ const handlers = {
         if (a === 'get') return json(adminDetail(o));
         if (a === 'rotate-token') {
             o.track_token = randomBytes(32).toString('base64url');
-            addEvent(o.id, 'note', 'Private tracking link rotated (previous link revoked)', null, true);
+            addEvent(o.id, 'note', 'Private tracking link replaced', 'The previous link no longer works. The new link was emailed to the client.', true);
             auditAdmin(adminEmail, 'rotate_track_token', o.code);
+            email(o.client_email, `${o.code}: your new private tracking link`, `/track.html#t=${o.track_token}`);
             return json(adminDetail(o));
         }
         if (a === 'toggle-doc-lock') {
             o.doc_lock = body.locked !== undefined ? !!body.locked : !o.doc_lock;
-            addEvent(o.id, 'note', o.doc_lock ? '2-Step Document Protection enabled on tracking link' : '2-Step Document Protection unlocked', null, false);
+            addEvent(o.id, 'note', o.doc_lock ? 'Document lock turned on' : 'Document lock turned off',
+                o.doc_lock ? 'Viewing documents and full details on the tracking page now needs a code emailed to the client.' : null, true);
             auditAdmin(adminEmail, o.doc_lock ? 'doc_lock_enabled' : 'doc_lock_disabled', o.code);
             return json(adminDetail(o));
         }
         if (a === 'unlock-legal-hold') {
-            requireMockStepUp(adminEmail, body.totp);
-            const hold = body.hold !== undefined ? !!body.hold : false;
+            // Same as api/admin.mjs: unlocking needs a fresh authenticator code, or the typed reference without one.
+            const hold = !!body.hold;
+            if (!hold) {
+                const usedTotp = requireMockStepUp(adminEmail, body.totp);
+                if (!usedTotp && String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm unlocking legal hold.`);
+            }
             o.legal_hold = hold;
-            addEvent(o.id, 'note', hold ? 'Legal Hold lock applied' : 'Legal Hold unlocked by staff override', null, false);
-            auditAdmin(adminEmail, hold ? 'legal_hold_locked' : 'legal_hold_unlocked', o.code);
+            addEvent(o.id, 'note', hold ? 'Legal hold turned on' : 'Legal hold unlocked by Nick', null, false);
+            auditAdmin(adminEmail, hold ? 'legal_hold_on' : 'legal_hold_unlocked', o.code);
+            if (!hold) email(adminEmail, `Security alert: legal hold unlocked on ${o.code}`);
             return json(adminDetail(o));
         }
         if (a === 'update') {
             if (body.kind === 'status') {
                 if (!STATUSES[body.status] || body.status === 'action_required') fail(400, 'Choose a status.');
-                const isHeld = o.status === 'served' || !!o.legal_hold;
-                if (isHeld && body.status !== 'served' && body.status !== 'closed') {
-                    if (!body.unlockLegalHold) {
-                        fail(423, 'This completed order is locked under Legal Hold to preserve chain-of-custody. Unlock Legal Hold first to change its status.');
-                    }
-                    requireMockStepUp(adminEmail, body.totp);
-                    auditAdmin(adminEmail, 'legal_hold_override', o.code, `Status changed from ${o.status} to ${body.status}`);
+                if (o.legal_hold && !['served', 'closed'].includes(body.status)) {
+                    fail(423, 'This order is under legal hold, so its status can only move to Closed. Unlock legal hold first if it really needs to change.');
                 }
                 o.status = body.status;
-                if (body.status === 'served') {
-                    o.served_at = now();
-                    o.legal_hold = true;
-                } else if (body.unlockLegalHold) {
-                    o.legal_hold = false;
-                }
+                if (body.status === 'served') Object.assign(o, { served_at: now(), legal_hold: true });
                 addEvent(o.id, 'status', STATUSES[body.status].label, note, body.clientVisible !== false);
                 if (body.notify) email(o.client_email, `${o.code}: ${STATUSES[body.status].label}`, trackUrl);
             } else if (body.kind === 'attempt') {
@@ -813,9 +831,7 @@ const handlers = {
                 files: detFiles.map(({ filename, kind, size_bytes, sha256, created_at }) => ({ filename, kind, size_bytes, sha256: sha256 || null, created_at })) });
         }
         if (a === 'delete') {
-            if ((o.status === 'served' || o.legal_hold) && !body.unlockLegalHold) {
-                fail(423, 'This served order is protected by Legal Hold and cannot be deleted without unlocking Legal Hold first.');
-            }
+            if (o.legal_hold) fail(423, 'This order is under legal hold and cannot be deleted. Unlock legal hold first (that step is logged and emailed to you).');
             requireMockStepUp(adminEmail, body.totp);
             if (String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm.`);
             let deletedFiles = 0;
