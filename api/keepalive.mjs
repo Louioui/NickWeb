@@ -9,14 +9,15 @@ export const GET = handle(async (request) => {
     if (secret && !timingSafeMatch(authHeader, `Bearer ${secret}`)) throw new HttpError(401, 'Unauthorized.');
     if (!secret) await rateLimit('keepalive', 4, 3600);
     const now = new Date().toISOString();
+    const dayAgo = new Date(Date.now() - 864e5).toISOString();
     const { count, error } = await db().from('orders').select('id', { count: 'exact', head: true });
     if (error) throw error;
     await db().from('admin_codes').delete().lt('expires_at', now);
     await db().from('admin_sessions').delete().lt('expires_at', now);
+    await db().from('rate_limits').delete().lt('window_start', dayAgo);
 
     // Files still marked "not uploaded" a day later: if the file did reach storage (the browser lost its connection before
     // confirming), verify its magic bytes, keep it and show it; if it never arrived or is disguised, remove it.
-    const dayAgo = new Date(Date.now() - 864e5).toISOString();
     const { data: stale } = await db().from('order_files').select('id, order_id, storage_path, filename').eq('uploaded', false).lt('created_at', dayAgo).limit(100);
     let recovered = 0;
     const missing = [];

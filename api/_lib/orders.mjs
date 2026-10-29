@@ -100,16 +100,26 @@ export async function fileForOrder(orderId, fileId) {
     return signedDownload(data.storage_path, data.filename);
 }
 
+export function canMarkPaid(order, amountCents, sessionId) {
+    if (!order || order.paid_at) return false;
+    if (typeof sessionId !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(sessionId)) return false;
+    if (order.stripe_session_id && order.stripe_session_id !== sessionId) return false;
+    const paidCents = Number(amountCents);
+    if (!Number.isSafeInteger(paidCents) || paidCents <= 0) return false;
+    if (order.amount_due_cents != null && paidCents < order.amount_due_cents) return false;
+    return true;
+}
+
 export async function markPaid(orderId, amountCents, sessionId) {
     uuid(orderId, 'Order');
-    const { data: order, error } = await db().from('orders').select('id, status, paid_at').eq('id', orderId).maybeSingle();
+    const { data: order, error } = await db().from('orders').select('id, status, paid_at, stripe_session_id, amount_due_cents').eq('id', orderId).maybeSingle();
     if (error) throw error;
-    if (!order || order.paid_at) return false;           // already handled (webhook and redirect can both arrive)
+    if (!canMarkPaid(order, amountCents, sessionId)) return false;
     const { error: uErr } = await db().from('orders').update({
         status: 'paid', paid_at: new Date().toISOString(), stripe_session_id: sessionId,
     }).eq('id', orderId).is('paid_at', null);
     if (uErr) throw uErr;
-    await addEvent(orderId, 'payment', `Payment received: ${money(amountCents)}`);
+    await addEvent(orderId, 'payment', `Payment received: ${money(Number(amountCents))}`);
     return true;
 }
 

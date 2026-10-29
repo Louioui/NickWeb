@@ -169,6 +169,7 @@ export function cleanDate(value, { label = 'Deadline' } = {}) {
 // --- Files ---
 export const MAX_FILE_BYTES = 25 * 1024 * 1024;
 export const MAX_FILES = 10;
+export const MAX_ORDER_FILES = 25;
 const ALLOWED_TYPES = new Set([
     // No old-style .doc: it can carry macro viruses. .docx can't.
     'application/pdf',
@@ -198,6 +199,12 @@ export function cleanFileList(files) {
 
 // Creates file rows plus one-time upload links; the browser then uploads straight to private storage.
 export async function prepareUploads(orderId, kind, files) {
+    if (!files.length) return [];
+    const { count, error: cErr } = await db().from('order_files').select('id', { count: 'exact', head: true }).eq('order_id', orderId);
+    if (cErr) throw cErr;
+    if ((count || 0) + files.length > MAX_ORDER_FILES) {
+        throw new HttpError(400, `Each request can have at most ${MAX_ORDER_FILES} files total.`);
+    }
     const folder = { client_document: 'client', proof: 'proof', action_upload: 'action' }[kind];
     const out = [];
     for (const f of files) {
@@ -215,9 +222,10 @@ export async function prepareUploads(orderId, kind, files) {
 }
 
 // Verifies that actual uploaded file bytes match the expected binary signature (magic bytes) of the file extension
-// and rejects polyglot files that embed HTML/script tags or executable PDF actions inside the header.
+// and rejects polyglot files that embed HTML/script tags, executable PDF actions, or macro-enabled/disguised ZIPs.
 const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
 const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
+const DOCX_MACRO_OR_EXEC_RE = /(?:vbaProject\.bin|vbaData\.xml|activeX\/activeX|\.(?:exe|dll|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|msi|com|hta|jar|sh)(?:[\x00-\x20"'<>\/\\]|$))/i;
 
 export function verifyFileMagic(bytes, filename) {
     if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > MAX_FILE_BYTES) return false;
@@ -233,8 +241,18 @@ export function verifyFileMagic(bytes, filename) {
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {
-        // PK\x03\x04 (ZIP container used by OpenXML .docx)
-        return bytes[0] === 0x50 && bytes[1] === 0x4B && bytes[2] === 0x03 && bytes[3] === 0x04;
+        // PK\x03\x04 (ZIP container used by OpenXML .docx) + OpenXML structure + no VBA macros or executables
+        if (bytes[0] !== 0x50 || bytes[1] !== 0x4B || bytes[2] !== 0x03 || bytes[3] !== 0x04) return false;
+        const scanLen = Math.min(bytes.length, 65536);
+        let zipScan = head;
+        for (let i = headLen; i < scanLen; i++) zipScan += String.fromCharCode(bytes[i]);
+        if (bytes.length > scanLen) {
+            const tailStart = Math.max(scanLen, bytes.length - 65536);
+            for (let i = tailStart; i < bytes.length; i++) zipScan += String.fromCharCode(bytes[i]);
+        }
+        if (!zipScan.includes('[Content_Types].xml') && !zipScan.includes('word/')) return false;
+        if (DOCX_MACRO_OR_EXEC_RE.test(zipScan)) return false;
+        return true;
     }
     if (ext === 'jpg' || ext === 'jpeg') {
         // JPEG SOI + marker: FF D8 FF

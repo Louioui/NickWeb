@@ -6,7 +6,7 @@
 //   POST { t, action: 'respond', ...fields, files }-> answers "Action required"; returns upload links
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, cleanFileList,
-         prepareUploads, confirmUploads, addEvent, uuid, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
+         prepareUploads, confirmUploads, addEvent, uuid, sha256, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
 import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, sendEmail } from './_lib/orders.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
 
@@ -26,6 +26,7 @@ export const POST = handle(async (request) => {
 
     if (body.action === 'confirm-payment') {
         if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) throw new HttpError(400, 'Invalid payment session.');
+        await rateLimit(`track-pay:${sha256(body.t)}`, 10, 900);
         const session = await stripeClient().checkout.sessions.retrieve(body.session);
         if (session.metadata?.order_id === order.id && session.payment_status === 'paid') {
             await markPaid(order.id, session.amount_total, session.id);
@@ -34,6 +35,7 @@ export const POST = handle(async (request) => {
     }
 
     if (body.action === 'respond') {
+        await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
         if (order.status !== 'action_required') throw new HttpError(409, 'Nothing is needed from you right now.');
         const changes = {};
         const address = text(body.address, { max: 200 });
@@ -68,6 +70,7 @@ export const POST = handle(async (request) => {
     }
 
     if (body.action === 'respond-finish') {
+        await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
         if (order.status !== 'received') return json(await clientView(order));
         const uploaded = await confirmUploads(order.id, body.fileIds);
         if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} file${uploaded.length === 1 ? '' : 's'} added by you`);

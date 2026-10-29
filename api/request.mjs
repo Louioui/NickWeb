@@ -2,7 +2,7 @@
 //   { step: 'create', ...form, files: [{name, size, type}] } -> creates the order and returns upload links
 //   { step: 'finish', t, fileIds }                           -> confirms uploads and sends the emails
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, email, phone as cleanPhone, cleanDate,
-         cleanFileList, prepareUploads, confirmUploads, addEvent, randomToken, orderCode, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
+         cleanFileList, prepareUploads, confirmUploads, addEvent, randomToken, orderCode, sha256, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
 import { TIERS, ADDONS, estimate, money, orderByToken, cleanTrackToken, sendEmail } from './_lib/orders.mjs';
 
 const DOC_TYPES = ['Summons & Complaint', 'Subpoena (Civil, Criminal, or Federal)', 'Writ of Garnishment', 'Small Claims Documents',
@@ -50,6 +50,8 @@ export const POST = handle(async (request) => {
         addons,
         estimated_total_cents: cents,
     };
+
+    await rateLimit(`request-email:${sha256(row.client_email)}`, 5, 3600);
 
     let order = null;
     for (let attempt = 0; attempt < 4 && !order; attempt++) {      // retry on the rare duplicate NP- code

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handleMockApi, handleMockRoute } from './mock-api.mjs';
 import { email, phone, text, longText, cleanDate, cleanOrderCode, cleanFileList, uuid, uuidList, getCookie, readJson, verifyFileMagic, timingSafeMatch } from '../api/_lib/core.mjs';
-import { cleanTrackToken, estimate, clean as scrubEmailText } from '../api/_lib/orders.mjs';
+import { cleanTrackToken, estimate, canMarkPaid, clean as scrubEmailText } from '../api/_lib/orders.mjs';
 import { savedClientSession, verifiedClient, clientCookie } from '../api/_lib/clients.mjs';
 import { checkoutParams } from '../api/_lib/stripe.mjs';
 import { POST as prodAdminPOST } from '../api/admin.mjs';
@@ -452,6 +452,13 @@ await step('Static audit: zero raw SQL interpolations in api/, RLS + anon/authen
     }
     const clientSrc = await readFile(path.join(root, 'api/client.mjs'), 'utf8');
     assert.ok(clientSrc.includes('siteOrigin(request)'), 'api/client.mjs must pin magic-link origin via siteOrigin(request)');
+    assert.ok(clientSrc.includes('client-verify-email:'), 'api/client.mjs must enforce per-email OTP verify rate limit');
+    const requestSrc = await readFile(path.join(root, 'api/request.mjs'), 'utf8');
+    assert.ok(requestSrc.includes('request-email:'), 'api/request.mjs must enforce per-email order creation rate limit');
+    const trackSrc = await readFile(path.join(root, 'api/track.mjs'), 'utf8');
+    assert.ok(trackSrc.includes('track-write:') && trackSrc.includes('track-pay:'), 'api/track.mjs must enforce per-token write & payment rate limits');
+    const keepaliveSrc = await readFile(path.join(root, 'api/keepalive.mjs'), 'utf8');
+    assert.ok(keepaliveSrc.includes("from('rate_limits').delete().lt('window_start'"), 'api/keepalive.mjs must prune expired rate_limits rows');
     const lookupSrc = await readFile(path.join(root, 'api/lookup.mjs'), 'utf8');
     assert.ok(lookupSrc.includes('lookup-email:'), 'api/lookup.mjs must enforce per-email rate limit');
     const adminSrc = await readFile(path.join(root, 'api/admin.mjs'), 'utf8');
@@ -461,9 +468,11 @@ await step('Static audit: zero raw SQL interpolations in api/, RLS + anon/authen
     }
     const adminHtmlSrc = await readFile(path.join(root, 'admin.html'), 'utf8');
     assert.ok(adminHtmlSrc.includes('scrubClientState') && adminHtmlSrc.includes('CLEAR_AUTH_CACHE'), 'admin.html must scrub client state and SW cache on sign-out');
+    const clientJsSrc = await readFile(path.join(root, 'assets/js/client-account.js'), 'utf8');
+    assert.ok(clientJsSrc.includes('scrubClientState') && clientJsSrc.includes('CLEAR_AUTH_CACHE'), 'client-account.js must scrub client state and SW cache on sign-out');
     const swSrc = await readFile(path.join(root, 'sw.js'), 'utf8');
     assert.ok(swSrc.includes('CLEAR_AUTH_CACHE'), 'sw.js must handle CLEAR_AUTH_CACHE');
-    totalAssertions += 7;
+    totalAssertions += 12;
 
     // Verify vercel.json security headers
     const vercelConfig = JSON.parse(await readFile(path.join(root, 'vercel.json'), 'utf8'));
@@ -566,7 +575,7 @@ await step('High-concurrency stress test: 500+ parallel requests (SQLi floods, b
 await step('Magic-byte file inspection rejects disguised malware/HTML uploads and Admin session cap evicts oldest sessions beyond 5', async () => {
     // 11a. Unit checks on verifyFileMagic
     const validPdf = Buffer.from('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n');
-    const validDocx = Buffer.from([0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00]);
+    const validDocx = Buffer.concat([Buffer.from([0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00]), Buffer.from('[Content_Types].xmlPK\x03\x04word/document.xml')]);
     const validJpg = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46]);
     const validPng = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]);
     const validWebp = Buffer.from('RIFF\x24\x00\x00\x00WEBPVP8 ');
@@ -662,9 +671,15 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     assert.equal(verifyFileMagic(polyglotJpgScript, 'comment-xss.jpg'), false, 'JPEG+script polyglot must be rejected');
     assert.equal(verifyFileMagic(polyglotPngOnload, 'chunk-xss.png'), false, 'PNG+onload polyglot must be rejected');
     assert.equal(verifyFileMagic(polyglotWebpJs, 'riff-xss.webp'), false, 'WEBP+javascript: polyglot must be rejected');
-    totalAssertions += 6;
+    const genericZipAsDocx = Buffer.concat([Buffer.from([0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00]), Buffer.from('notes.txt')]);
+    const macroDocmAsDocx = Buffer.concat([Buffer.from([0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00]), Buffer.from('[Content_Types].xmlPK\x03\x04word/vbaProject.bin')]);
+    const zipWithExeAsDocx = Buffer.concat([Buffer.from([0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00]), Buffer.from('[Content_Types].xmlPK\x03\x04word/dropper.exe')]);
+    assert.equal(verifyFileMagic(genericZipAsDocx, 'archive.docx'), false, 'Generic .zip without OpenXML structure renamed to .docx must be rejected');
+    assert.equal(verifyFileMagic(macroDocmAsDocx, 'macro-infected.docx'), false, 'Macro-enabled .docm (vbaProject.bin) renamed to .docx must be rejected');
+    assert.equal(verifyFileMagic(zipWithExeAsDocx, 'embedded-exe.docx'), false, '.docx containing embedded .exe entry must be rejected');
+    totalAssertions += 9;
 
-    // 11e. Stripe Checkout 24-hour hard expiry & 1-minute idempotency key verification
+    // 11e. Stripe Checkout 24-hour hard expiry, 1-minute idempotency key, & strict canMarkPaid session/amount verification
     const fixedNow = 1730000000000;
     const sampleOrd = { id: '4c190c16-ccb0-40c6-9c81-da1842658d52', code: 'NP-649025', client_email: 'paralegal@example.com', track_token: 'AbCdEfGhIjKlMnOpQrStUvWxYz012345' };
     const cp1 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow);
@@ -673,7 +688,15 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     assert.equal(cp1.params.expires_at, Math.floor(fixedNow / 1000) + 86340);
     assert.equal(cp1.options.idempotencyKey, cp2.options.idempotencyKey, 'Double-click within same minute must produce identical Stripe idempotencyKey');
     assert.notEqual(cp1.options.idempotencyKey, cpNextMin.options.idempotencyKey, 'Retry in next minute gets a fresh idempotencyKey');
-    totalAssertions += 3;
+
+    const unpaidOrder = { id: sampleOrd.id, status: 'awaiting_payment', paid_at: null, stripe_session_id: 'cs_live_active123456', amount_due_cents: 12500 };
+    assert.equal(canMarkPaid(unpaidOrder, 12500, 'cs_live_active123456'), true, 'Exact active session & amount must be accepted');
+    assert.equal(canMarkPaid(unpaidOrder, 12500, 'cs_live_old_superseded'), false, 'Superseded/mismatched Stripe session ID must be rejected');
+    assert.equal(canMarkPaid(unpaidOrder, 5000, 'cs_live_active123456'), false, 'Underpaid amount (< amount_due_cents) must be rejected');
+    assert.equal(canMarkPaid(unpaidOrder, 0, 'cs_live_active123456'), false, 'Zero amount must be rejected');
+    assert.equal(canMarkPaid(unpaidOrder, 12500, 'bad_session'), false, 'Malformed session ID must be rejected');
+    assert.equal(canMarkPaid({ ...unpaidOrder, paid_at: '2026-10-29T00:00:00Z' }, 12500, 'cs_live_active123456'), false, 'Already-paid order must be rejected');
+    totalAssertions += 9;
 
     // 11f. Tamper-evident admin audit log records failed login, successful login, recovery-code generation, export, and delete
     const activeAdminCookie = adminCookies[5];
@@ -706,6 +729,39 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     const delEntry = meAudit.auditLogs.find(l => l.action === 'delete_order');
     assert.equal(delEntry.target_code, tempOrder.code, 'Audit log must preserve deleted order code even after order is deleted');
     totalAssertions++;
+
+    // 11g. Lifetime 25-file cap per order prevents storage flooding across multiple upload rounds
+    const capOrderRes = await (await callMock('request', {
+        clientName: 'File Cap Tester',
+        clientEmail: 'filecap@example.com',
+        clientPhone: '(209) 555-0188',
+        recipientName: 'Cap Recipient',
+        docType: 'Summons & Complaint',
+        address: '200 Cap St',
+        city: 'Stockton',
+        zip: '95202',
+        tier: 'standard',
+        addons: [],
+        acceptTerms: true,
+        files: Array.from({ length: 10 }, (_, i) => ({ name: `batch1-${i}.pdf`, size: 1024, type: 'application/pdf' })),
+    })).json();
+    const capList = await (await callMock('admin', { action: 'list' }, activeAdminCookie)).json();
+    const capOrder = capList.orders.find(o => o.code === capOrderRes.code);
+    // Round 2: 10 more files via proof-upload (total = 20 <= 25 -> 200 OK)
+    const round2 = await callMock('admin', {
+        action: 'proof-upload',
+        id: capOrder.id,
+        files: Array.from({ length: 10 }, (_, i) => ({ name: `batch2-${i}.pdf`, size: 1024, type: 'application/pdf' })),
+    }, activeAdminCookie);
+    assert.equal(round2.status, 200);
+    // Round 3: 6 more files (total = 26 > 25 -> 400 rejected!)
+    const round3 = await callMock('admin', {
+        action: 'proof-upload',
+        id: capOrder.id,
+        files: Array.from({ length: 6 }, (_, i) => ({ name: `batch3-${i}.pdf`, size: 1024, type: 'application/pdf' })),
+    }, activeAdminCookie);
+    assert.equal(round3.status, 400, 'Exceeding 25 lifetime files on a single order must be rejected with 400');
+    totalAssertions += 2;
 });
 
 console.log(`${passed} security & stress test suites passed (${totalAssertions} individual security assertions verified)`);

@@ -28,6 +28,7 @@ export const POST = handle(async request => {
             const addr = email(body.email);
             const code = String(body.code || '').trim();
             if (!/^\d{6,8}$/.test(code)) throw new HttpError(400, 'Enter the verification code from your email.');
+            await rateLimit(`client-verify-email:${sha256(addr)}`, 5, 900);
             const { data, error } = await auth.auth.verifyOtp({ email: addr, token: code, type: 'email' });
             if (error || !data.session) throw new HttpError(401, 'That code is invalid or expired. Please request a new email.');
             verifiedClient(data.user);

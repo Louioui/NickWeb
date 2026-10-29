@@ -164,8 +164,10 @@ function adminDetail(o) {
 }
 
 function prepareUploads(orderId, kind, list) {
-    if (!Array.isArray(list)) return [];
+    if (!Array.isArray(list) || !list.length) return [];
     if (list.length > 10) fail(400, 'Please attach at most 10 files.');
+    const existingCount = [...files.values()].filter(f => f.order_id === orderId).length;
+    if (existingCount + list.length > 25) fail(400, 'Each request can have at most 25 files total.');
     return list.map(f => {
         if (!f || typeof f !== 'object') fail(400, 'Invalid file entry.');
         const name = cleanText(f.name, 180, true, 'File name');
@@ -183,6 +185,7 @@ function prepareUploads(orderId, kind, list) {
 }
 const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
 const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
+const DOCX_MACRO_OR_EXEC_RE = /(?:vbaProject\.bin|vbaData\.xml|activeX\/activeX|\.(?:exe|dll|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|msi|com|hta|jar|sh)(?:[\x00-\x20"'<>\/\\]|$))/i;
 function verifyFileMagic(bytes, filename) {
     if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > 25 * 1024 * 1024) return false;
     const ext = typeof filename === 'string' && filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
@@ -195,7 +198,17 @@ function verifyFileMagic(bytes, filename) {
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {
-        return bytes[0] === 0x50 && bytes[1] === 0x4B && bytes[2] === 0x03 && bytes[3] === 0x04;
+        if (bytes[0] !== 0x50 || bytes[1] !== 0x4B || bytes[2] !== 0x03 || bytes[3] !== 0x04) return false;
+        const scanLen = Math.min(bytes.length, 65536);
+        let zipScan = head;
+        for (let i = headLen; i < scanLen; i++) zipScan += String.fromCharCode(bytes[i]);
+        if (bytes.length > scanLen) {
+            const tailStart = Math.max(scanLen, bytes.length - 65536);
+            for (let i = tailStart; i < bytes.length; i++) zipScan += String.fromCharCode(bytes[i]);
+        }
+        if (!zipScan.includes('[Content_Types].xml') && !zipScan.includes('word/')) return false;
+        if (DOCX_MACRO_OR_EXEC_RE.test(zipScan)) return false;
+        return true;
     }
     if (ext === 'jpg' || ext === 'jpeg') {
         return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
@@ -231,10 +244,16 @@ function confirmUploads(orderId, ids) {
     return out;
 }
 
-function markPaid(o, sessionId) {
-    if (o.paid_at) return;
+function markPaid(o, sessionId, amountCents = o?.amount_due_cents) {
+    if (!o || o.paid_at) return false;
+    if (typeof sessionId !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(sessionId)) return false;
+    if (o.stripe_session_id && o.stripe_session_id !== sessionId) return false;
+    const paidCents = Number(amountCents);
+    if (!Number.isSafeInteger(paidCents) || paidCents <= 0) return false;
+    if (o.amount_due_cents != null && paidCents < o.amount_due_cents) return false;
     Object.assign(o, { status: 'paid', paid_at: now(), stripe_session_id: sessionId });
-    addEvent(o.id, 'payment', `Payment received: ${money(o.amount_due_cents)}`);
+    addEvent(o.id, 'payment', `Payment received: ${money(paidCents)}`);
+    return true;
 }
 
 // --- Handlers, keyed by the api/<name>.mjs they stand in for ---

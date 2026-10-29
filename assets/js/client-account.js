@@ -15,8 +15,14 @@
         for (const name of ['signin', 'signup']) { $('mode-' + name).classList.toggle('is-active', mode === name); $('mode-' + name).setAttribute('aria-pressed', String(mode === name)); }
         $('account-email-form').classList.remove('hidden'); $('account-code-form').classList.add('hidden'); showError('');
     }
+    function scrubClientState() {
+        try { sessionStorage.clear(); } catch {}
+        try { navigator.serviceWorker?.controller?.postMessage({ type: 'CLEAR_AUTH_CACHE' }); } catch {}
+    }
     function showAuth() {
-        signedIn = false; orders = []; $('client-orders').replaceChildren(); $('client-identity').textContent = '';
+        signedIn = false; orders = []; pendingEmail = ''; cooldownUntil = 0;
+        $('client-orders').replaceChildren(); $('client-identity').textContent = '';
+        $('account-code').value = ''; $('client-search').value = '';
         $('account-loading').classList.add('hidden'); $('client-workspace').classList.add('hidden'); $('account-auth').classList.remove('hidden'); setMode(mode);
     }
     $('mode-signin').onclick = () => { if (!sending) setMode('signin'); };
@@ -68,7 +74,7 @@
             $('client-feedback').classList.add('hidden'); renderOrders();
             $('client-sync').textContent = `Updated ${new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
         } catch (err) {
-            if (err.status === 401) { showAuth(); return; }
+            if (err.status === 401) { scrubClientState(); showAuth(); return; }
             if (!signedIn) { showAuth(); showError(err.message); }
             else { $('client-feedback').textContent = err.message + ' Your last update is still shown. Refresh to try again.'; $('client-feedback').classList.remove('hidden'); }
         } finally { $('client-refresh').disabled = false; }
@@ -76,7 +82,7 @@
     $('client-refresh').onclick = load;
     $('client-logout').onclick = async () => {
         $('client-logout').disabled = true;
-        try { await post('logout'); showAuth(); }
+        try { await post('logout'); scrubClientState(); showAuth(); }
         catch (err) { $('client-feedback').textContent = 'Sign-out did not finish. Please try again.'; $('client-feedback').classList.remove('hidden'); }
         finally { $('client-logout').disabled = false; }
     };
