@@ -47,6 +47,11 @@
             <form id="code-form" class="hidden space-y-4">
                 <p class="text-sm text-muted">If that address is allowed, an 8-digit code is on its way (expires in 10 minutes). You may also enter an unused <strong>XXXX-XXXX</strong> backup recovery code.</p>
                 <div><label for="login-code" class="field-label">Login or Recovery Code</label><input id="login-code" required inputmode="text" autocomplete="one-time-code" maxlength="9" spellcheck="false" class="field text-center text-2xl tracking-[0.25em] uppercase"></div>
+                <div id="totp-wrap" class="hidden space-y-2 pt-2 rule-t">
+                    <label for="login-totp" class="field-label"><i class="fa-solid fa-shield-halved text-bronze mr-1"></i> Step 2: 6-Digit Authenticator App Code</label>
+                    <input id="login-totp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="000000" class="field text-center text-2xl tracking-[0.25em]">
+                    <p class="text-xs text-muted">Open your Authenticator app (Google Authenticator, Apple Passwords, 1Password, or Authy) and enter the 6-digit code.</p>
+                </div>
                 <button type="submit" class="btn btn-pine w-full">Log In</button>
                 <button type="button" onclick="showEmailStep()" class="text-xs text-primary underline underline-offset-2">Use a different email or send a new code</button>
             </form>
@@ -101,6 +106,31 @@
                     <strong>iPhone / iPad (Safari):</strong> Tap <strong>Share</strong> <i class="fa-solid fa-arrow-up-from-bracket mx-0.5" aria-hidden="true"></i> then <strong>Add to Home Screen</strong>.<br>
                     <strong>Android / Desktop Chrome:</strong> Use the browser menu or address-bar install icon to install <strong>Nick's Admin</strong>.
                 </p>
+            </section>
+
+            <!-- 1.5 Two-Step Authenticator (RFC 6238 TOTP) -->
+            <section class="pb-5 rule-b space-y-3">
+                <div class="flex items-center justify-between gap-2">
+                    <h3 class="font-serif text-lg text-primary"><i class="fa-solid fa-shield-halved text-bronze mr-1.5" aria-hidden="true"></i> Two-Step Verification (2FA App)</h3>
+                    <span id="totp-status-badge" class="status-pill status-muted">Off</span>
+                </div>
+                <p class="text-xs text-muted leading-relaxed">Require a second 6-digit code from your Authenticator app (Google Authenticator, Apple Passwords, 1Password, Authy) when signing in and before high-risk actions (deleting orders, unlocking Legal Hold, or rotating recovery codes).</p>
+                <div class="flex flex-wrap gap-2">
+                    <button id="totp-setup-btn" type="button" onclick="startTotpSetup()" class="btn btn-pine btn-sm"><i class="fa-solid fa-qrcode" aria-hidden="true"></i> Set Up Authenticator 2FA</button>
+                    <button id="totp-disable-btn" type="button" onclick="disableTotp()" class="hidden btn btn-sm border-[#9c2a26] text-[#7a1f1c] hover:bg-[#fbeceb]">Disable 2FA</button>
+                </div>
+                <div id="totp-setup-box" class="hidden result-box result-warn space-y-3">
+                    <p class="text-xs font-semibold">1. Add this setup key to your Authenticator app:</p>
+                    <div id="totp-secret-display" class="p-2 bg-white border border-[color:var(--hair-ink)] font-mono text-xs font-bold text-primary select-all break-all text-center"></div>
+                    <p class="text-xs"><a id="totp-uri-link" href="#" class="text-primary font-semibold underline">Open in Authenticator App on this device</a></p>
+                    <div>
+                        <label for="totp-verify-input" class="field-label">2. Enter the 6-digit code from your app to activate:</label>
+                        <div class="flex gap-2">
+                            <input id="totp-verify-input" inputmode="numeric" maxlength="6" placeholder="000000" class="field text-center font-mono tracking-widest">
+                            <button type="button" onclick="confirmTotpEnable()" class="btn btn-pine btn-sm shrink-0">Activate 2FA</button>
+                        </div>
+                    </div>
+                </div>
             </section>
 
             <!-- 2. Backup Recovery Codes -->

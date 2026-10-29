@@ -1,7 +1,7 @@
 // Shared server code for the /api functions: database client, HTTP helpers, tokens, rate limits.
 // Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
 import { createClient } from '@supabase/supabase-js';
-import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
 export const BUCKET = 'case-files';
@@ -108,6 +108,81 @@ export function timingSafeMatch(a, b) {
 }
 export const randomToken = (bytes = 24) => randomBytes(bytes).toString('base64url');   // 24 bytes = 192 bits
 export const orderCode = () => 'NP-' + String(randomInt(100000, 1000000));
+
+// Device/Browser User-Agent fingerprint for session binding (prevents stolen cookies from working in a different browser/OS).
+export function uaFingerprint(request) {
+    const ua = (request?.headers?.get('user-agent') || 'unknown').trim().toLowerCase().slice(0, 300);
+    return sha256('nps-ua-v1:' + ua).slice(0, 24);
+}
+
+// --- RFC 6238 TOTP (Authenticator App 2-Step Verification) ---
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+export function generateTotpSecret(bytes = 20) {
+    const buf = randomBytes(bytes);
+    let bits = 0, val = 0, out = '';
+    for (const byte of buf) {
+        val = (val << 8) | byte;
+        bits += 8;
+        while (bits >= 5) {
+            out += BASE32_ALPHABET[(val >>> (bits - 5)) & 31];
+            bits -= 5;
+        }
+    }
+    if (bits > 0) out += BASE32_ALPHABET[(val << (5 - bits)) & 31];
+    return out;
+}
+function decodeBase32(secret) {
+    const clean = String(secret || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+    let bits = 0, val = 0;
+    const out = [];
+    for (let i = 0; i < clean.length; i++) {
+        const idx = BASE32_ALPHABET.indexOf(clean[i]);
+        if (idx < 0) continue;
+        val = (val << 5) | idx;
+        bits += 5;
+        if (bits >= 8) {
+            out.push((val >>> (bits - 8)) & 0xFF);
+            bits -= 8;
+        }
+    }
+    return Buffer.from(out);
+}
+export function totpCode(secret, timeMs = Date.now(), stepOffset = 0) {
+    const key = decodeBase32(secret);
+    if (!key.length) return '';
+    const counter = Math.floor(timeMs / 30000) + stepOffset;
+    const buf = Buffer.alloc(8);
+    buf.writeBigUInt64BE(BigInt(counter));
+    const hmac = createHmac('sha1', key).update(buf).digest();
+    const offset = hmac[hmac.length - 1] & 0x0f;
+    const code = ((hmac[offset] & 0x7f) << 24) |
+        ((hmac[offset + 1] & 0xff) << 16) |
+        ((hmac[offset + 2] & 0xff) << 8) |
+        (hmac[offset + 3] & 0xff);
+    return String(code % 1000000).padStart(6, '0');
+}
+export function verifyTotp(secret, inputCode, timeMs = Date.now()) {
+    const clean = String(inputCode || '').replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(clean) || !secret) return false;
+    for (const offset of [-1, 0, 1]) {
+        if (timingSafeMatch(totpCode(secret, timeMs, offset), clean)) return true;
+    }
+    return false;
+}
+
+// Cryptographic Chain-of-Custody HMAC/SHA-256 hash chain across order events & sealed file digests.
+export function computeChainSeal(orderCodeStr, createdAt, events = [], files = []) {
+    let chain = sha256(`NPS-GENESIS-V1|${orderCodeStr || ''}|${createdAt || ''}`);
+    const sortedEvents = [...events].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+    for (const ev of sortedEvents) {
+        chain = sha256(`${chain}|EV|${ev.kind || ''}|${ev.title || ''}|${ev.detail || ''}|${ev.created_at || ''}`);
+    }
+    const sortedFiles = [...files].sort((a, b) => String(a.id || a.filename || '').localeCompare(String(b.id || b.filename || '')));
+    for (const f of sortedFiles) {
+        chain = sha256(`${chain}|FILE|${f.filename || f.name || ''}|${f.sha256 || 'unhashed'}`);
+    }
+    return chain;
+}
 
 // Throws 429 once a bucket passes `max` hits in its window (counted atomically in the database).
 export async function rateLimit(bucket, max, windowSeconds) {
@@ -255,13 +330,20 @@ export function verifyFileMagic(bytes, filename) {
         return true;
     }
     if (ext === 'jpg' || ext === 'jpeg') {
-        // JPEG SOI + marker: FF D8 FF
+        // JPEG SOI + marker: FF D8 FF, plus tail polyglot check
+        if (bytes.length > 4096) {
+            let tail = '';
+            for (let i = Math.max(0, bytes.length - 4096); i < bytes.length; i++) tail += String.fromCharCode(bytes[i]);
+            if (POLYGLOT_SCRIPT_RE.test(tail)) return false;
+        }
         return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
     }
     if (ext === 'png') {
-        // 89 50 4E 47 0D 0A 1A 0A
-        return bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
-            bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A;
+        // 89 50 4E 47 0D 0A 1A 0A (and IHDR chunk header at bytes 12..15 when >= 16 bytes)
+        if (bytes.length < 8 || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4E || bytes[3] !== 0x47 ||
+            bytes[4] !== 0x0D || bytes[5] !== 0x0A || bytes[6] !== 0x1A || bytes[7] !== 0x0A) return false;
+        if (bytes.length >= 16 && (bytes[12] !== 0x49 || bytes[13] !== 0x48 || bytes[14] !== 0x44 || bytes[15] !== 0x52)) return false;
+        return true;
     }
     if (ext === 'webp') {
         // RIFF....WEBP
@@ -313,7 +395,8 @@ export async function confirmUploads(orderId, fileIds) {
 }
 
 export async function signedDownload(path, filename) {
-    const { data, error } = await db().storage.from(BUCKET).createSignedUrl(path, 300, { download: filename });
+    // 60-second ephemeral download token so leaked signed URLs expire almost immediately.
+    const { data, error } = await db().storage.from(BUCKET).createSignedUrl(path, 60, { download: filename });
     if (error) throw error;
     return data.signedUrl;
 }

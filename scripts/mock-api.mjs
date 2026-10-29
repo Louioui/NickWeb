@@ -3,9 +3,11 @@
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken } from '../api/_lib/orders.mjs';
+import { generateTotpSecret, totpCode, verifyTotp, uaFingerprint, computeChainSeal, timingSafeMatch } from '../api/_lib/core.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
 export const MOCK_CLIENT_CODE = '123456';
+export { totpCode };
 const ADMIN_EMAIL = 'nicksprocessservices@outlook.com';
 const DEVTEAM_EMAIL = 'devteam@partnershipwithmedia-dev.com';
 const MOCK_ADMIN_EMAILS = [ADMIN_EMAIL, DEVTEAM_EMAIL];
@@ -17,9 +19,14 @@ const files = new Map();       // id -> { id, order_id, kind, filename, size_byt
 const clients = new Map();
 const clientSessions = new Map();
 const clientCodes = new Map();
+const clientSecurity = new Map(); // email -> { pin_hash, failed_tries, locked_until }
+const trackUnlockCodes = new Map(); // order_id -> { code, tries, expires }
 const sessions = new Set();
 const sessionEmails = new Map();
 const adminRecoveryCodes = new Map();
+const adminTotpSecrets = new Map(); // email -> { secret, enabled }
+const adminBurnFails = new Map();   // email -> count
+const adminCodesBurned = new Set(); // email if active code was burned
 const adminAuditLogs = [];
 function auditAdmin(emailAddr, action, targetCode = null, detailText = null) {
     adminAuditLogs.unshift({ email: emailAddr, action, target_code: targetCode, detail: detailText, created_at: now() });
@@ -137,28 +144,48 @@ function orderByToken(t) {
     return o;
 }
 
-function clientView(o) {
+function maskMockAddress(o) {
+    const street = String(o.address || '').replace(/^\s*\d+[A-Za-z0-9\-/]*/, '••••');
+    return street + (o.city ? `, ${o.city}` : '') + (o.zip ? ` ${o.zip}` : '');
+}
+
+function clientView(o, { unlocked = true } = {}) {
+    const visibleEvents = events.filter(e => e.order_id === o.id && e.client_visible).sort((a, b) => a.created_at.localeCompare(b.created_at))
+        .map(({ created_at, kind, title, detail }) => ({ created_at, kind, title, detail }));
+    const uploadedFiles = [...files.values()].filter(f => f.order_id === o.id && f.uploaded);
+    const isLocked = !!o.doc_lock && !unlocked;
+    const fullAddr = [o.address, o.unit].filter(Boolean).join(', ') + `, ${o.city} ${o.zip}`;
+    const seal = computeChainSeal(o.code, o.created_at, visibleEvents, uploadedFiles);
     return {
         code: o.code, status: o.status, statusLabel: STATUSES[o.status]?.label, statusText: STATUSES[o.status]?.client,
-        createdAt: o.created_at, recipient: o.recipient_name, docType: o.doc_type,
-        address: [o.address, o.unit].filter(Boolean).join(', ') + `, ${o.city} ${o.zip}`,
+        createdAt: o.created_at,
+        recipient: isLocked ? String(o.recipient_name || '').replace(/^(\S+)\s+.*$/, '$1 ••••') : o.recipient_name,
+        docType: o.doc_type,
+        address: isLocked ? maskMockAddress(o) : fullAddr,
         tier: TIERS[o.tier]?.name, addons: o.addons.map(k => ADDONS[k]?.name).filter(Boolean),
         estimate: money(o.estimated_total_cents),
         amountDue: o.amount_due_cents != null ? money(o.amount_due_cents) : null,
         payUrl: o.status === 'awaiting_payment' ? o.payment_url : null,
         paidAt: o.paid_at, actionNote: o.status === 'action_required' ? o.action_note : null,
-        events: events.filter(e => e.order_id === o.id && e.client_visible).sort((a, b) => a.created_at.localeCompare(b.created_at))
-            .map(({ created_at, kind, title, detail }) => ({ created_at, kind, title, detail })),
-        files: [...files.values()].filter(f => f.order_id === o.id && f.uploaded)
-            .map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, sha256: f.sha256 || null, at: f.created_at })),
+        docLock: !!o.doc_lock,
+        unlocked: !isLocked,
+        legalHold: o.status === 'served' || !!o.legal_hold,
+        integritySeal: seal,
+        events: visibleEvents,
+        files: uploadedFiles.map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, sha256: f.sha256 || null, at: f.created_at, locked: isLocked })),
     };
 }
 
 function adminDetail(o) {
+    const evs = events.filter(e => e.order_id === o.id).sort((a, b) => a.created_at.localeCompare(b.created_at));
+    const fls = [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ data, ...f }) => f);
+    const seal = computeChainSeal(o.code, o.created_at, evs, fls);
+    const legalHold = o.status === 'served' || !!o.legal_hold;
     return {
-        order: { ...o, tier_name: TIERS[o.tier]?.name, addon_names: o.addons.map(k => ADDONS[k]?.name).filter(Boolean) },
-        events: events.filter(e => e.order_id === o.id).sort((a, b) => a.created_at.localeCompare(b.created_at)),
-        files: [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ data, ...f }) => f),
+        order: { ...o, legal_hold: legalHold, doc_lock: !!o.doc_lock, integrity_seal: seal, tier_name: TIERS[o.tier]?.name, addon_names: o.addons.map(k => ADDONS[k]?.name).filter(Boolean) },
+        events: evs,
+        files: fls,
+        integritySeal: seal,
         statuses: STATUSES,
     };
 }
@@ -211,11 +238,18 @@ function verifyFileMagic(bytes, filename) {
         return true;
     }
     if (ext === 'jpg' || ext === 'jpeg') {
+        if (bytes.length > 4096) {
+            let tail = '';
+            for (let i = Math.max(0, bytes.length - 4096); i < bytes.length; i++) tail += String.fromCharCode(bytes[i]);
+            if (POLYGLOT_SCRIPT_RE.test(tail)) return false;
+        }
         return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
     }
     if (ext === 'png') {
-        return bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
-            bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A;
+        if (bytes.length < 8 || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4E || bytes[3] !== 0x47 ||
+            bytes[4] !== 0x0D || bytes[5] !== 0x0A || bytes[6] !== 0x1A || bytes[7] !== 0x0A) return false;
+        if (bytes.length >= 16 && (bytes[12] !== 0x49 || bytes[13] !== 0x48 || bytes[14] !== 0x44 || bytes[15] !== 0x52)) return false;
+        return true;
     }
     if (ext === 'webp') {
         return bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
@@ -261,6 +295,23 @@ const DOC_TYPES = ['Summons & Complaint', 'Subpoena (Civil, Criminal, or Federal
     'Eviction Notice', 'Divorce Papers', 'Child Custody & Support Order', 'Restraining Order', 'Order to Show Cause',
     'Debt Collection Notice', 'Other Legal Document'];
 
+function makeMockUnlockToken(req, o) {
+    return sha256Hex(`nps-track-unlock:mock:${o.id}:${o.track_token}:${uaFingerprint(req)}`);
+}
+function isMockUnlocked(req, o, body) {
+    if (!o.doc_lock) return true;
+    const tok = typeof body?.unlockToken === 'string' ? body.unlockToken : '';
+    return tok.length === 64 && timingSafeMatch(tok, makeMockUnlockToken(req, o));
+}
+function requireMockStepUp(adminEmail, totpInput) {
+    const row = adminTotpSecrets.get(adminEmail);
+    if (row?.enabled) {
+        if (!verifyTotp(row.secret, totpInput)) {
+            fail(403, 'Step-up 2FA required: please enter your 6-digit Authenticator App code.');
+        }
+    }
+}
+
 const handlers = {
     async client(req, body) {
         const action = body.action;
@@ -276,10 +327,33 @@ const handlers = {
             const addr = cleanEmail(body.email);
             const code = String(body.code || '').trim();
             if (!/^\d{6,8}$/.test(code)) fail(400, 'Enter the verification code from your email.');
+            const sec = clientSecurity.get(addr);
+            if (sec?.locked_until && sec.locked_until > Date.now()) {
+                fail(429, 'Account temporarily locked after repeated failed 2FA attempts. Please wait 15 minutes.');
+            }
             const pending = clientCodes.get(addr);
             if (!pending || pending.expires < Date.now() || pending.attempts >= 5) fail(401, 'That code is invalid or expired. Request another email.');
+            if (sec?.pin_hash) {
+                const pin = String(body.pin || '').trim();
+                if (!pin) {
+                    return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
+                }
+                if (!/^\d{6}$/.test(pin) || !timingSafeMatch(sec.pin_hash, sha256Hex(`${addr}:${pin}`))) {
+                    sec.failed_tries = (sec.failed_tries || 0) + 1;
+                    if (sec.failed_tries >= 5) {
+                        sec.locked_until = Date.now() + 15 * 60 * 1000;
+                        clientCodes.delete(addr);
+                    }
+                    fail(401, 'Invalid 6-digit Security PIN.');
+                }
+                sec.failed_tries = 0;
+                sec.locked_until = 0;
+            }
             pending.attempts++;
-            if (code !== '123456') fail(401, 'That code is invalid or expired. Request another email.');
+            if (code !== '123456') {
+                if (pending.attempts >= 5) clientCodes.delete(addr);
+                fail(401, 'That code is invalid or expired. Request another email.');
+            }
             if (!clients.has(addr)) {
                 if (pending.intent !== 'signup') fail(401, 'That code is invalid or expired. Create an account first.');
                 clients.set(addr, { name: pending.name, firm: pending.firm, email: addr });
@@ -287,19 +361,75 @@ const handlers = {
                 clients.set(addr, { name: pending.name, firm: pending.firm, email: addr });
             }
             clientCodes.delete(addr);
-            const value = token(); clientSessions.set(value, addr);
+            const value = `${token()}.${uaFingerprint(req)}`;
+            clientSessions.set(value, addr);
             return json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
         }
         const value = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_client=([^;]+)/)?.[1];
-        const verifiedEmail = value && /^[A-Za-z0-9_-]{16,128}$/.test(value) ? clientSessions.get(value) : null;
+        if (value && value.includes('.')) {
+            const parts = value.split('.');
+            if (parts.length !== 2 || !timingSafeMatch(parts[1], uaFingerprint(req))) fail(401, 'Session device mismatch. Please sign in again.');
+        }
+        const verifiedEmail = value && /^[A-Za-z0-9_.-]{16,160}$/.test(value) ? clientSessions.get(value) : null;
         if (action === 'logout') { if (value) clientSessions.delete(value); return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' }); }
+        if (action === 'logout-all') {
+            if (verifiedEmail) {
+                for (const [k, em] of [...clientSessions.entries()]) {
+                    if (em === verifiedEmail) clientSessions.delete(k);
+                }
+            }
+            return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' });
+        }
         if (!verifiedEmail || !clients.has(verifiedEmail)) fail(401, 'Please sign in to see your requests.');
-        const profile = clients.get(verifiedEmail);
+        const baseProfile = clients.get(verifiedEmail);
+        const sec = clientSecurity.get(verifiedEmail);
+        const profile = { ...baseProfile, hasPin: !!sec?.pin_hash };
         if (action === 'me') return json({ profile });
+        if (action === 'set-pin') {
+            const pin = String(body.pin || '').trim();
+            if (!/^\d{6}$/.test(pin)) fail(400, 'Please enter a 6-digit numeric Security PIN.');
+            clientSecurity.set(verifiedEmail, { pin_hash: sha256Hex(`${verifiedEmail}:${pin}`), failed_tries: 0, locked_until: 0 });
+            return json({ ok: true, hasPin: true });
+        }
+        if (action === 'disable-pin') {
+            if (sec?.pin_hash) {
+                const pin = String(body.pin || '').trim();
+                if (!timingSafeMatch(sec.pin_hash, sha256Hex(`${verifiedEmail}:${pin}`))) fail(403, 'Enter your current 6-digit Security PIN to disable it.');
+                clientSecurity.delete(verifiedEmail);
+            }
+            return json({ ok: true, hasPin: false });
+        }
+        if (action === 'rotate-token') {
+            const code = (cleanText(body.code, 20, true, 'Reference number') || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
+            const o = [...orders.values()].find(ord => ord.client_email.toLowerCase() === verifiedEmail && ord.code === code);
+            if (!o) fail(404, 'Order not found.');
+            o.track_token = randomBytes(32).toString('base64url');
+            addEvent(o.id, 'note', 'Private tracking link rotated by client (previous link revoked)', null, true);
+            return json({ ok: true, code: o.code, trackUrl: `/track.html#t=${encodeURIComponent(o.track_token)}` });
+        }
+        if (action === 'toggle-doc-lock') {
+            const code = (cleanText(body.code, 20, true, 'Reference number') || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
+            const o = [...orders.values()].find(ord => ord.client_email.toLowerCase() === verifiedEmail && ord.code === code);
+            if (!o) fail(404, 'Order not found.');
+            o.doc_lock = body.locked !== undefined ? !!body.locked : !o.doc_lock;
+            addEvent(o.id, 'note', o.doc_lock ? '2-Step Document Protection enabled by client' : '2-Step Document Protection unlocked by client', null, true);
+            return json({ ok: true, code: o.code, docLock: o.doc_lock });
+        }
+        if (action === 'request-purge') {
+            const code = (cleanText(body.code, 20, true, 'Reference number') || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
+            const o = [...orders.values()].find(ord => ord.client_email.toLowerCase() === verifiedEmail && ord.code === code);
+            if (!o) fail(404, 'Order not found.');
+            if (!['served', 'closed', 'cancelled'].includes(o.status)) {
+                fail(400, 'Confidential retention purge can only be requested on completed or closed orders.');
+            }
+            addEvent(o.id, 'note', 'Client requested confidential document purge / retention seal', `Requested by verified account ${verifiedEmail}`, true);
+            return json({ ok: true, code: o.code });
+        }
         if (action === 'list') {
             const list = [...orders.values()].filter(o => o.client_email.toLowerCase() === verifiedEmail).sort((a,b) => b.created_at.localeCompare(a.created_at)).slice(0,100);
             return json({ profile, orders: list.map(o => ({ code: o.code, status: o.status, label: STATUSES[o.status].label, recipient: o.recipient_name, document: o.doc_type,
-                service: TIERS[o.tier]?.name, created: o.created_at, amount: money(o.amount_due_cents ?? o.estimated_total_cents), paid: !!o.paid_at, trackUrl: `/track.html#t=${o.track_token}` })) });
+                service: TIERS[o.tier]?.name, created: o.created_at, amount: money(o.amount_due_cents ?? o.estimated_total_cents), paid: !!o.paid_at,
+                docLock: !!o.doc_lock, legalHold: o.status === 'served' || !!o.legal_hold, trackUrl: `/track.html#t=${o.track_token}` })) });
         }
         fail(400, 'Unknown action.');
     },
@@ -340,22 +470,68 @@ const handlers = {
             tier: body.tier, addons: keys, estimated_total_cents: cents,
         });
         addEvent(o.id, 'created', 'Request received', `${TIERS[o.tier].name} · estimate ${money(cents)}`);
+        const submissionDigest = sha256Hex(`${o.code}|${clientEmail}|${recipientName}|${docType}|${address}|${unit || ''}|${city}|${zip}|${body.tier}|${deadline || 'none'}|TOS-ACCEPTED`).slice(0, 32);
+        addEvent(o.id, 'attestation', 'Client legal attestation & Terms sealed', `Terms & Best-Efforts Service scope accepted · Deadline: ${deadline || 'Standard'} · Submission SHA-256: ${submissionDigest}`, true);
         return json({ ok: true, code: o.code, token: o.track_token, trackUrl: `/track.html#t=${o.track_token}`, uploads: prepareUploads(o.id, 'client_document', body.files) });
     },
 
     async track(req, body, url) {
         const o = orderByToken(body.t);
-        if (body.action === 'view') return json(clientView(o));
+        const unlocked = isMockUnlocked(req, o, body);
+        if (body.action === 'view') return json(clientView(o, { unlocked }));
+        if (body.action === 'send-unlock-code') {
+            trackUnlockCodes.set(o.id, { code: MOCK_CLIENT_CODE, tries: 0, expires: Date.now() + 600000 });
+            const maskedEmail = o.client_email.replace(/^(..).*(@.*)$/, '$1•••$2');
+            return json({ ok: true, maskedEmail });
+        }
+        if (body.action === 'verify-unlock-code') {
+            const code = String(body.code || '').trim();
+            if (!/^\d{6}$/.test(code)) fail(400, 'Please enter a 6-digit verification code or Security PIN.');
+            let verified = false;
+            const sec = clientSecurity.get(o.client_email.toLowerCase());
+            if (sec?.pin_hash && (!sec.locked_until || sec.locked_until < Date.now())) {
+                if (timingSafeMatch(sec.pin_hash, sha256Hex(`${o.client_email.toLowerCase()}:${code}`))) verified = true;
+            }
+            if (!verified) {
+                const row = trackUnlockCodes.get(o.id);
+                if (!row || row.expires < Date.now() || row.tries >= 5) fail(401, 'That unlock code is invalid or expired. Request a new code.');
+                if (code !== row.code) {
+                    row.tries++;
+                    if (row.tries >= 5) trackUnlockCodes.delete(o.id);
+                    fail(401, 'That unlock code is invalid or expired.');
+                }
+                trackUnlockCodes.delete(o.id);
+                verified = true;
+            }
+            const unlockToken = makeMockUnlockToken(req, o);
+            return json({ ok: true, unlockToken, ...clientView(o, { unlocked: true }) });
+        }
+        if (body.action === 'toggle-doc-lock') {
+            if (o.doc_lock && !unlocked) fail(403, 'Unlock 2-Step Protection first before changing lock settings.');
+            o.doc_lock = body.locked !== undefined ? !!body.locked : !o.doc_lock;
+            addEvent(o.id, 'note', o.doc_lock ? '2-Step Document Protection enabled' : '2-Step Document Protection unlocked', null, true);
+            const unlockToken = o.doc_lock ? makeMockUnlockToken(req, o) : null;
+            return json({ ok: true, unlockToken, ...clientView(o, { unlocked: true }) });
+        }
+        if (body.action === 'rotate-token') {
+            if (o.doc_lock && !unlocked) fail(403, 'Verify your 2-Step code before rotating this private link.');
+            o.track_token = randomBytes(32).toString('base64url');
+            addEvent(o.id, 'note', 'Private tracking link rotated (previous link revoked)', null, true);
+            return json({ ok: true, token: o.track_token, trackUrl: `/track.html#t=${encodeURIComponent(o.track_token)}` });
+        }
         if (body.action === 'download') {
+            if (o.doc_lock && !unlocked) {
+                fail(403, '2-Step Document Protection is active. Verify your email code or Security PIN to download case documents.');
+            }
             const fid = cleanUuid(body.fileId, 'File');
             const f = files.get(fid);
             if (!f || f.order_id !== o.id || !f.uploaded) fail(404, 'File not found.');
-            return json({ url: `/__mock-file/${f.id}` });
+            return json({ url: `/__mock-file/${f.id}`, sha256: f.sha256 || null, expiresInSeconds: 60 });
         }
         if (body.action === 'confirm-payment') {
             if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) fail(400, 'Invalid payment session.');
             if (body.session === o.stripe_session_id && o.status === 'awaiting_payment') markPaid(o, body.session);
-            return json(clientView(o));
+            return json(clientView(o, { unlocked }));
         }
         if (body.action === 'respond') {
             if (o.status !== 'action_required') fail(409, 'Nothing is needed from you right now.');
@@ -378,13 +554,19 @@ const handlers = {
             if (!Object.keys(changes).length && !reply && !fileList.length) fail(400, 'Please add the missing information, a reply, or a file.');
             const uploads = prepareUploads(o.id, 'action_upload', fileList);
             Object.assign(o, changes, { status: 'received', action_note: null, updated_at: now() });
-            const summary = [changes.address || changes.unit || changes.city || changes.zip ? 'Updated the service address' : null,
-                changes.access_notes ? `Access notes: ${changes.access_notes}` : null, reply].filter(Boolean).join(' · ');
+            const attemptCount = events.filter(e => e.order_id === o.id && e.kind === 'attempt').length;
+            const amendDigest = sha256Hex(`${o.code}|${changes.address || ''}|${changes.unit || ''}|${changes.city || ''}|${changes.zip || ''}|${changes.access_notes || ''}|${reply || ''}`).slice(0, 16);
+            const summary = [
+                changes.address || changes.unit || changes.city || changes.zip ? 'Updated the service address' : null,
+                changes.access_notes ? `Access notes: ${changes.access_notes}` : null,
+                reply,
+                `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
+            ].filter(Boolean).join(' · ');
             addEvent(o.id, 'action_response', 'You sent the requested information', summary || null);
             return json({ ok: true, uploads });
         }
         if (body.action === 'respond-finish') {
-            if (o.status !== 'received') return json(clientView(o));
+            if (o.status !== 'received') return json(clientView(o, { unlocked }));
             const up = confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
             const orderEvents = events.filter(e => e.order_id === o.id);
@@ -394,7 +576,7 @@ const handlers = {
                 addEvent(o.id, 'note', 'Reply emailed', null, false);
                 email(ADMIN_EMAIL, `${o.code}: client sent the information you asked for`, `/admin.html#${o.id}`);
             }
-            return json(clientView(o));
+            return json(clientView(o, { unlocked }));
         }
         fail(400, 'Unknown action.');
     },
@@ -411,7 +593,11 @@ const handlers = {
         const a = body.action;
         if (a === 'send-code') {
             const addr = cleanEmail(body.email);
-            if (MOCK_ADMIN_EMAILS.includes(addr)) console.log(`[mock] dashboard login code for ${addr}: ${MOCK_ADMIN_CODE}`);
+            if (MOCK_ADMIN_EMAILS.includes(addr)) {
+                adminCodesBurned.delete(addr);
+                adminBurnFails.set(addr, 0);
+                console.log(`[mock] dashboard login code for ${addr}: ${MOCK_ADMIN_CODE}`);
+            }
             return json({ ok: true });
         }
         if (a === 'verify-code') {
@@ -420,9 +606,21 @@ const handlers = {
             const raw = String(body.code || '').trim().toUpperCase();
             const digits = raw.replace(/\D/g, '');
             const alnum = raw.replace(/[^A-Z0-9]/g, '');
+            const totpRow = adminTotpSecrets.get(addr);
+            const isEmailOtp = digits.length === 8 && raw.replace(/\s+/g, '') === digits;
+            if (totpRow?.enabled && isEmailOtp && !body.totp) {
+                return json({ ok: false, requiresTwoFactor: true, message: 'Enter your 6-digit Authenticator App code to complete 2-step sign-in.' }, 200);
+            }
             const codes = adminRecoveryCodes.get(addr);
-            let ok = digits === MOCK_ADMIN_CODE && raw.replace(/\s+/g, '') === digits;
+            let ok = false;
             let usedRecovery = false;
+            if (isEmailOtp && !adminCodesBurned.has(addr)) {
+                if (totpRow?.enabled && !verifyTotp(totpRow.secret, body.totp)) {
+                    ok = false;
+                } else {
+                    ok = digits === MOCK_ADMIN_CODE;
+                }
+            }
             if (!ok && alnum.length === 8 && codes && codes.has(alnum)) {
                 codes.delete(alnum);
                 ok = true;
@@ -430,26 +628,40 @@ const handlers = {
             }
             if (!ok) {
                 auditAdmin(addr, 'login_failed');
+                const fails = (adminBurnFails.get(addr) || 0) + 1;
+                adminBurnFails.set(addr, fails);
+                if (fails >= 5) {
+                    adminCodesBurned.add(addr);
+                    auditAdmin(addr, 'challenge_burned_lockout', null, 'All pending login codes invalidated after 5 failed verification attempts');
+                }
                 fail(401, 'That code is wrong or expired. Request a new one.');
             }
+            adminBurnFails.set(addr, 0);
             const existingForAdmin = [...sessionEmails.entries()].filter(([, em]) => em === addr).map(([tok]) => tok);
             while (existingForAdmin.length >= 5) {
                 const oldest = existingForAdmin.shift();
                 sessions.delete(oldest);
                 sessionEmails.delete(oldest);
             }
-            const t = token();
+            const t = `${token()}.${uaFingerprint(req)}`;
             sessions.add(t);
             sessionEmails.set(t, addr);
             auditAdmin(addr, usedRecovery ? 'login_recovery_code' : 'login_success');
-            return json({ ok: true }, 200, { 'set-cookie': `nps_admin=${t}; Path=/api/admin; HttpOnly; SameSite=Strict` });
+            return json({ ok: true, totpEnabled: !!totpRow?.enabled }, 200, { 'set-cookie': `nps_admin=${t}; Path=/api/admin; HttpOnly; SameSite=Strict` });
         }
         const cookie = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_admin=([^;]+)/)?.[1];
-        if (!cookie || !/^[A-Za-z0-9_-]{16,128}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
+        if (!cookie || !/^[A-Za-z0-9_.-]{16,160}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
+        if (cookie.includes('.')) {
+            const parts = cookie.split('.');
+            if (parts.length !== 2 || !timingSafeMatch(parts[1], uaFingerprint(req))) {
+                fail(401, 'Session device mismatch. Please log in again.');
+            }
+        }
         const adminEmail = sessionEmails.get(cookie) || ADMIN_EMAIL;
         if (a === 'me') {
+            const totpRow = adminTotpSecrets.get(adminEmail);
             const auditLogs = adminAuditLogs.filter(l => l.email === adminEmail).slice(0, 10).map(({ action, target_code, detail, created_at }) => ({ action, target_code, detail, created_at }));
-            return json({ email: adminEmail, recoveryRemaining: adminRecoveryCodes.get(adminEmail)?.size || 0, auditLogs });
+            return json({ email: adminEmail, recoveryRemaining: adminRecoveryCodes.get(adminEmail)?.size || 0, totpEnabled: !!totpRow?.enabled, auditLogs });
         }
         if (a === 'logout') {
             sessions.delete(cookie);
@@ -465,7 +677,31 @@ const handlers = {
             auditAdmin(adminEmail, 'logout_all');
             return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' });
         }
+        if (a === 'totp-setup') {
+            const secret = generateTotpSecret(20);
+            adminTotpSecrets.set(adminEmail, { secret, enabled: false });
+            auditAdmin(adminEmail, 'totp_setup_initiated');
+            const otpauthUrl = `otpauth://totp/NicksProcessServices:${encodeURIComponent(adminEmail)}?secret=${secret}&issuer=NicksProcessServices&algorithm=SHA1&digits=6&period=30`;
+            return json({ ok: true, secret, otpauthUrl });
+        }
+        if (a === 'totp-enable') {
+            const row = adminTotpSecrets.get(adminEmail);
+            if (!row?.secret) fail(400, 'Start 2FA setup first.');
+            if (!verifyTotp(row.secret, body.totp)) fail(400, 'Invalid 6-digit Authenticator code.');
+            row.enabled = true;
+            auditAdmin(adminEmail, 'totp_enabled');
+            return json({ ok: true, totpEnabled: true });
+        }
+        if (a === 'totp-disable') {
+            const row = adminTotpSecrets.get(adminEmail);
+            if (!row?.enabled) return json({ ok: true, totpEnabled: false });
+            if (!verifyTotp(row.secret, body.totp)) fail(403, 'Enter your current 6-digit Authenticator code to disable 2FA.');
+            row.enabled = false;
+            auditAdmin(adminEmail, 'totp_disabled');
+            return json({ ok: true, totpEnabled: false });
+        }
         if (a === 'generate-recovery-codes') {
+            requireMockStepUp(adminEmail, body?.totp);
             const set = new Set();
             const out = [];
             for (let i = 0; i < 8; i++) {
@@ -492,18 +728,51 @@ const handlers = {
             if (!f?.uploaded) fail(404, 'File not found.');
             return json({ url: `/__mock-file/${f.id}` });
         }
-        if (!['get', 'update', 'payment-link', 'export', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
+        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'export', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
         const oid = cleanUuid(body.id, 'Order');
         const o = orders.get(oid);
         if (!o) fail(404, 'Order not found.');
         const trackUrl = `/track.html#t=${o.track_token}`;
         const note = cleanLongText(body.note, 2000, 'Note');
         if (a === 'get') return json(adminDetail(o));
+        if (a === 'rotate-token') {
+            o.track_token = randomBytes(32).toString('base64url');
+            addEvent(o.id, 'note', 'Private tracking link rotated (previous link revoked)', null, true);
+            auditAdmin(adminEmail, 'rotate_track_token', o.code);
+            return json(adminDetail(o));
+        }
+        if (a === 'toggle-doc-lock') {
+            o.doc_lock = body.locked !== undefined ? !!body.locked : !o.doc_lock;
+            addEvent(o.id, 'note', o.doc_lock ? '2-Step Document Protection enabled on tracking link' : '2-Step Document Protection unlocked', null, false);
+            auditAdmin(adminEmail, o.doc_lock ? 'doc_lock_enabled' : 'doc_lock_disabled', o.code);
+            return json(adminDetail(o));
+        }
+        if (a === 'unlock-legal-hold') {
+            requireMockStepUp(adminEmail, body.totp);
+            const hold = body.hold !== undefined ? !!body.hold : false;
+            o.legal_hold = hold;
+            addEvent(o.id, 'note', hold ? 'Legal Hold lock applied' : 'Legal Hold unlocked by staff override', null, false);
+            auditAdmin(adminEmail, hold ? 'legal_hold_locked' : 'legal_hold_unlocked', o.code);
+            return json(adminDetail(o));
+        }
         if (a === 'update') {
             if (body.kind === 'status') {
                 if (!STATUSES[body.status] || body.status === 'action_required') fail(400, 'Choose a status.');
+                const isHeld = o.status === 'served' || !!o.legal_hold;
+                if (isHeld && body.status !== 'served' && body.status !== 'closed') {
+                    if (!body.unlockLegalHold) {
+                        fail(423, 'This completed order is locked under Legal Hold to preserve chain-of-custody. Unlock Legal Hold first to change its status.');
+                    }
+                    requireMockStepUp(adminEmail, body.totp);
+                    auditAdmin(adminEmail, 'legal_hold_override', o.code, `Status changed from ${o.status} to ${body.status}`);
+                }
                 o.status = body.status;
-                if (body.status === 'served') o.served_at = now();
+                if (body.status === 'served') {
+                    o.served_at = now();
+                    o.legal_hold = true;
+                } else if (body.unlockLegalHold) {
+                    o.legal_hold = false;
+                }
                 addEvent(o.id, 'status', STATUSES[body.status].label, note, body.clientVisible !== false);
                 if (body.notify) email(o.client_email, `${o.code}: ${STATUSES[body.status].label}`, trackUrl);
             } else if (body.kind === 'attempt') {
@@ -537,12 +806,17 @@ const handlers = {
         }
         if (a === 'export') {
             auditAdmin(adminEmail, 'export_order', o.code);
-            const { track_token, payment_url, stripe_session_id, ...fields } = o;
-            return json({ exported_at: now(), request: { ...fields, tier: TIERS[o.tier]?.name },
-                timeline: events.filter(e => e.order_id === o.id).map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible })),
-                files: [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ filename, kind, size_bytes, sha256, created_at }) => ({ filename, kind, size_bytes, sha256: sha256 || null, created_at })) });
+            const { order: detOrder, events: detEvents, files: detFiles, integritySeal } = adminDetail(o);
+            const { track_token, payment_url, stripe_session_id, ...fields } = detOrder;
+            return json({ exported_at: now(), integrity_seal: integritySeal, request: { ...fields, tier: TIERS[o.tier]?.name },
+                timeline: detEvents.map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible })),
+                files: detFiles.map(({ filename, kind, size_bytes, sha256, created_at }) => ({ filename, kind, size_bytes, sha256: sha256 || null, created_at })) });
         }
         if (a === 'delete') {
+            if ((o.status === 'served' || o.legal_hold) && !body.unlockLegalHold) {
+                fail(423, 'This served order is protected by Legal Hold and cannot be deleted without unlocking Legal Hold first.');
+            }
+            requireMockStepUp(adminEmail, body.totp);
             if (String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm.`);
             let deletedFiles = 0;
             for (const [fid, f] of files) if (f.order_id === o.id) { files.delete(fid); deletedFiles++; }
@@ -560,7 +834,7 @@ const handlers = {
             if (!up.length) fail(400, 'The upload did not finish. Please try again.');
             const detailText = up.map(f => f.sha256 ? `${f.filename} (SHA-256: ${f.sha256.slice(0, 12)}…)` : f.filename).join(', ');
             addEvent(o.id, 'proof', 'Proof of service uploaded', detailText);
-            if (body.markServed) { Object.assign(o, { status: 'served', served_at: now() }); addEvent(o.id, 'status', STATUSES.served.label); }
+            if (body.markServed) { Object.assign(o, { status: 'served', served_at: now(), legal_hold: true }); addEvent(o.id, 'status', STATUSES.served.label); }
             email(o.client_email, `${o.code}: your proof of service is ready`, trackUrl);
             return json(adminDetail(o));
         }

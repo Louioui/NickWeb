@@ -2,8 +2,8 @@
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
          sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
-         HttpError, ADMIN_EMAILS, IS_PROD, BUCKET } from './_lib/core.mjs';
-import { STATUSES, TIERS, ADDONS, money, sendEmail, markPaid } from './_lib/orders.mjs';
+         HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, uaFingerprint, computeChainSeal, timingSafeMatch } from './_lib/core.mjs';
+import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
 
 const COOKIE = 'nps_admin';
@@ -19,10 +19,16 @@ export const POST = handle(async (request) => {
     if (a === 'me') return me(admin);
     if (a === 'logout') return logout(request, admin);
     if (a === 'logout-all') return logoutAll(request, admin);
-    if (a === 'generate-recovery-codes') return generateRecoveryCodes(request, admin);
+    if (a === 'generate-recovery-codes') return generateRecoveryCodes(request, body, admin);
+    if (a === 'totp-setup') return totpSetup(request, admin);
+    if (a === 'totp-enable') return totpEnable(request, body, admin);
+    if (a === 'totp-disable') return totpDisable(request, body, admin);
     if (a === 'list') return list();
     if (a === 'get') return json(await detail(body.id));
-    if (a === 'update') return update(request, body);
+    if (a === 'update') return update(request, body, admin);
+    if (a === 'rotate-token') return rotateToken(request, body, admin);
+    if (a === 'toggle-doc-lock') return toggleDocLock(request, body, admin);
+    if (a === 'unlock-legal-hold') return unlockLegalHold(request, body, admin);
     if (a === 'payment-link') return paymentLink(request, body, admin);
     if (a === 'proof-upload') return proofUpload(body);
     if (a === 'proof-finish') return proofFinish(request, body);
@@ -68,6 +74,22 @@ async function sendCode(request, body) {
     return json({ ok: true });   // same answer for any email, so the allowed address isn't revealed
 }
 
+async function getAdminTotp(emailAddr) {
+    try {
+        const { data } = await db().from('admin_totp_secrets').select('secret, enabled').eq('email', emailAddr).maybeSingle();
+        return data || null;
+    } catch { return null; }
+}
+
+async function requireStepUpIfEnabled(admin, totpInput) {
+    const totpRow = await getAdminTotp(admin);
+    if (totpRow?.enabled) {
+        if (!verifyTotp(totpRow.secret, totpInput)) {
+            throw new HttpError(403, 'Step-up 2FA required: please enter your 6-digit Authenticator App code.');
+        }
+    }
+}
+
 async function verifyCode(request, body) {
     await rateLimit(`admin-verify:${clientIp(request)}`, 10, 900);
     const addr = email(body.email);
@@ -75,20 +97,45 @@ async function verifyCode(request, body) {
     const raw = String(body.code || '').trim().toUpperCase();
     const digits = raw.replace(/\D/g, '');
     const alnum = raw.replace(/[^A-Z0-9]/g, '');
+
+    const totpRow = ADMIN_EMAILS.includes(addr) ? await getAdminTotp(addr) : null;
+    const isEmailOtpFormat = digits.length === 8 && raw.replace(/\s+/g, '') === digits;
+    if (totpRow?.enabled && isEmailOtpFormat && !body.totp) {
+        return json({ ok: false, requiresTwoFactor: true, message: 'Enter your 6-digit Authenticator App code to complete 2-step sign-in.' }, 200);
+    }
+
     let ok = false;
     let usedRecovery = false;
-    if (digits.length === 8 && raw.replace(/\s+/g, '') === digits) {
-        // Checked and counted in one locked database step (use_admin_code), so parallel guesses can't get past 5 tries per code.
-        const { data, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${digits}`) });
-        if (error) throw error;
-        ok = !!data;
+    if (isEmailOtpFormat) {
+        if (totpRow?.enabled && !verifyTotp(totpRow.secret, body.totp)) {
+            ok = false;
+        } else {
+            // Checked and counted in one locked database step (use_admin_code), so parallel guesses can't get past 5 tries per code.
+            const { data, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${digits}`) });
+            if (error) throw error;
+            ok = !!data;
+        }
     }
     if (!ok && alnum.length === 8 && ADMIN_EMAILS.includes(addr)) {
         const { data, error } = await db().rpc('use_admin_recovery_code', { p_email: addr, p_hash: sha256(`${addr}:${alnum}`) });
         if (!error && data) { ok = true; usedRecovery = true; }
     }
     if (!ok) {
-        if (ADMIN_EMAILS.includes(addr)) await auditAdmin(request, addr, 'login_failed');
+        if (ADMIN_EMAILS.includes(addr)) {
+            await auditAdmin(request, addr, 'login_failed');
+            // Automatic 2FA Challenge Burn & Brute-Force Lockout Shield: burn all active codes after 5 failed attempts
+            try {
+                const { data: fails } = await db().rpc('hit_rate_limit', { p_bucket: `admin-burn:${sha256(addr)}`, p_window_seconds: 900 });
+                if (fails >= 5) {
+                    await db().from('admin_codes').delete().eq('email', addr);
+                    await auditAdmin(request, addr, 'challenge_burned_lockout', null, 'All pending login codes invalidated after 5 failed verification attempts');
+                    await sendSecurityAlert(addr, 'Repeated failed login attempts blocked', [
+                        '5 failed verification attempts were detected on your staff dashboard.',
+                        'All pending email login codes have been automatically burned to prevent brute-force guessing.',
+                    ]);
+                }
+            } catch { /* non-fatal */ }
+        }
         throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
     }
     const nowIso = new Date().toISOString();
@@ -99,16 +146,29 @@ async function verifyCode(request, body) {
         const staleHashes = activeSessions.slice(4).map(s => s.token_hash);
         await db().from('admin_sessions').delete().in('token_hash', staleHashes);
     }
-    const token = randomToken(32);
-    await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
+    const rawToken = randomToken(32);
+    const uaHash = uaFingerprint(request);
+    const boundCookie = `${rawToken}.${uaHash}`;
+    await db().from('admin_sessions').insert({ token_hash: sha256(boundCookie), email: addr, expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
     await auditAdmin(request, addr, usedRecovery ? 'login_recovery_code' : 'login_success');
+    if (usedRecovery) {
+        await sendSecurityAlert(addr, 'Emergency recovery code used to sign in', [
+            'An emergency 1-time backup recovery code was just used to access your staff dashboard.',
+        ]);
+    }
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';   // HTTPS-only everywhere but local testing
-    return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=${token}; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}` });
+    return json({ ok: true, totpEnabled: !!totpRow?.enabled }, 200, { 'set-cookie': `${COOKIE}=${boundCookie}; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}` });
 }
 
 async function requireAdmin(request) {
     const token = getCookie(request, COOKIE);
-    if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(token)) throw new HttpError(401, 'Please log in.');
+    if (typeof token !== 'string' || !/^[A-Za-z0-9_.-]{16,160}$/.test(token)) throw new HttpError(401, 'Please log in.');
+    if (token.includes('.')) {
+        const parts = token.split('.');
+        if (parts.length !== 2 || !timingSafeMatch(parts[1], uaFingerprint(request))) {
+            throw new HttpError(401, 'Session device mismatch. Please log in again.');
+        }
+    }
     const { data } = await db().from('admin_sessions').select('email, expires_at').eq('token_hash', sha256(token)).maybeSingle();
     if (!data || data.expires_at < new Date().toISOString() || !ADMIN_EMAILS.includes(data.email)) throw new HttpError(401, 'Please log in.');
     return data.email;
@@ -117,6 +177,7 @@ async function requireAdmin(request) {
 async function me(admin) {
     let recoveryRemaining = 0;
     let auditLogs = [];
+    const totpRow = await getAdminTotp(admin);
     try {
         const { count, error } = await db().from('admin_recovery_codes').select('id', { count: 'exact', head: true }).eq('email', admin).eq('used', false);
         if (!error && typeof count === 'number') recoveryRemaining = count;
@@ -125,12 +186,12 @@ async function me(admin) {
         const { data } = await db().from('admin_audit_logs').select('action, target_code, detail, created_at').eq('email', admin).order('created_at', { ascending: false }).limit(10);
         if (Array.isArray(data)) auditLogs = data;
     } catch { /* table may not be migrated yet */ }
-    return json({ email: admin, recoveryRemaining, auditLogs });
+    return json({ email: admin, recoveryRemaining, totpEnabled: !!totpRow?.enabled, auditLogs });
 }
 
 async function logout(request, admin) {
     const token = getCookie(request, COOKIE);
-    if (typeof token === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(token)) await db().from('admin_sessions').delete().eq('token_hash', sha256(token));
+    if (typeof token === 'string' && /^[A-Za-z0-9_.-]{16,160}$/.test(token)) await db().from('admin_sessions').delete().eq('token_hash', sha256(token));
     await auditAdmin(request, admin, 'logout');
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';
     return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=0` });
@@ -144,8 +205,9 @@ async function logoutAll(request, admin) {
 }
 
 const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-async function generateRecoveryCodes(request, admin) {
+async function generateRecoveryCodes(request, body, admin) {
     await rateLimit(`admin-recovery-gen:${sha256(admin)}`, 3, 3600);
+    await requireStepUpIfEnabled(admin, body?.totp);
     const codes = [];
     const rows = [];
     for (let i = 0; i < 8; i++) {
@@ -159,6 +221,49 @@ async function generateRecoveryCodes(request, admin) {
     if (error) throw new HttpError(503, 'Backup recovery codes require the latest database migration.');
     await auditAdmin(request, admin, 'generate_recovery_codes');
     return json({ codes, remaining: codes.length });
+}
+
+async function totpSetup(request, admin) {
+    await rateLimit(`admin-totp:${sha256(admin)}`, 6, 900);
+    const secret = generateTotpSecret(20);
+    const { error } = await db().from('admin_totp_secrets').upsert({
+        email: admin,
+        secret,
+        enabled: false,
+        updated_at: new Date().toISOString(),
+    });
+    if (error) throw new HttpError(503, 'Authenticator 2FA requires the latest database migration.');
+    await auditAdmin(request, admin, 'totp_setup_initiated');
+    const otpauthUrl = `otpauth://totp/NicksProcessServices:${encodeURIComponent(admin)}?secret=${secret}&issuer=NicksProcessServices&algorithm=SHA1&digits=6&period=30`;
+    return json({ ok: true, secret, otpauthUrl });
+}
+
+async function totpEnable(request, body, admin) {
+    await rateLimit(`admin-totp:${sha256(admin)}`, 10, 900);
+    const row = await getAdminTotp(admin);
+    if (!row?.secret) throw new HttpError(400, 'Start 2FA setup first.');
+    if (!verifyTotp(row.secret, body.totp)) throw new HttpError(400, 'Invalid 6-digit Authenticator code. Check your device clock and try again.');
+    const { error } = await db().from('admin_totp_secrets').update({ enabled: true, updated_at: new Date().toISOString() }).eq('email', admin);
+    if (error) throw error;
+    await auditAdmin(request, admin, 'totp_enabled');
+    await sendSecurityAlert(admin, 'Two-Step Verification (TOTP) Enabled', [
+        'Authenticator App Two-Step Verification (RFC 6238 TOTP) is now active on your staff dashboard.',
+    ]);
+    return json({ ok: true, totpEnabled: true });
+}
+
+async function totpDisable(request, body, admin) {
+    await rateLimit(`admin-totp:${sha256(admin)}`, 10, 900);
+    const row = await getAdminTotp(admin);
+    if (!row?.enabled) return json({ ok: true, totpEnabled: false });
+    if (!verifyTotp(row.secret, body.totp)) throw new HttpError(403, 'Enter your current 6-digit Authenticator code to disable 2FA.');
+    const { error } = await db().from('admin_totp_secrets').update({ enabled: false, updated_at: new Date().toISOString() }).eq('email', admin);
+    if (error) throw error;
+    await auditAdmin(request, admin, 'totp_disabled');
+    await sendSecurityAlert(admin, 'Two-Step Verification (TOTP) Disabled', [
+        'Authenticator App Two-Step Verification was disabled on your staff dashboard.',
+    ]);
+    return json({ ok: true, totpEnabled: false });
 }
 
 // --- Jobs ---
@@ -204,14 +309,27 @@ async function detail(id) {
         const fallback = await db().from('order_files').select('id, kind, filename, size_bytes, created_at, uploaded').eq('order_id', id).order('created_at');
         files = fallback.data;
     }
+    const uploadedFiles = (files || []).filter(f => f.uploaded);
+    const integritySeal = computeChainSeal(order.code, order.created_at, events || [], uploadedFiles);
+    const legalHold = order.status === 'served' || !!order.legal_hold;
     return {
-        order: { ...order, tier_name: TIERS[order.tier]?.name, addon_names: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean) },
-        events, files: (files || []).filter(f => f.uploaded), statuses: STATUSES,
+        order: {
+            ...order,
+            legal_hold: legalHold,
+            doc_lock: !!order.doc_lock,
+            integrity_seal: integritySeal,
+            tier_name: TIERS[order.tier]?.name,
+            addon_names: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
+        },
+        events,
+        files: uploadedFiles,
+        integritySeal,
+        statuses: STATUSES,
     };
 }
 
 // One endpoint for Nick's job actions: change status, log an attempt, add a note, or ask the client for info.
-async function update(request, body) {
+async function update(request, body, admin) {
     const order = await getOrder(body.id);
     const kind = body.kind;
     const note = longText(body.note, { max: 2000, label: 'Note' });
@@ -219,9 +337,27 @@ async function update(request, body) {
 
     if (kind === 'status') {
         if (!STATUSES[body.status] || body.status === 'action_required') throw new HttpError(400, 'Choose a status.');
+        // Completed-Order Legal Hold Lock: prevent rolling back a 'served' order unless explicitly unlocked.
+        const isHeld = order.status === 'served' || !!order.legal_hold;
+        if (isHeld && body.status !== 'served' && body.status !== 'closed') {
+            if (!body.unlockLegalHold) {
+                throw new HttpError(423, 'This completed order is locked under Legal Hold to preserve chain-of-custody. Unlock Legal Hold first to change its status.');
+            }
+            await requireStepUpIfEnabled(admin, body.totp);
+            await auditAdmin(request, admin, 'legal_hold_override', order.code, `Status changed from ${order.status} to ${body.status}`);
+        }
         const patch = { status: body.status };
-        if (body.status === 'served') patch.served_at = new Date().toISOString();
-        await db().from('orders').update(patch).eq('id', order.id);
+        if (body.status === 'served') {
+            patch.served_at = new Date().toISOString();
+            patch.legal_hold = true;
+        } else if (body.unlockLegalHold) {
+            patch.legal_hold = false;
+        }
+        const { error: uErr } = await db().from('orders').update(patch).eq('id', order.id);
+        if (uErr && ('legal_hold' in patch)) {
+            delete patch.legal_hold;
+            await db().from('orders').update(patch).eq('id', order.id);
+        }
         await addEvent(order.id, 'status', STATUSES[body.status].label, note, body.clientVisible !== false);
         if (body.notify) await sendEmail({
             to: order.client_email, subject: `${order.code}: ${STATUSES[body.status].label}`,
@@ -249,6 +385,43 @@ async function update(request, body) {
         });
     } else {
         throw new HttpError(400, 'Unknown update.');
+    }
+    return json(await detail(order.id));
+}
+
+async function rotateToken(request, body, admin) {
+    await rateLimit(`admin-rotate:${sha256(admin)}`, 20, 900);
+    const order = await getOrder(body.id);
+    const newToken = randomToken(32);
+    const { error } = await db().from('orders').update({ track_token: newToken }).eq('id', order.id);
+    if (error) throw error;
+    await addEvent(order.id, 'note', 'Private tracking link rotated (previous link revoked)', null, true);
+    await auditAdmin(request, admin, 'rotate_track_token', order.code);
+    return json(await detail(order.id));
+}
+
+async function toggleDocLock(request, body, admin) {
+    const order = await getOrder(body.id);
+    const locked = body.locked !== undefined ? !!body.locked : !order.doc_lock;
+    const { error } = await db().from('orders').update({ doc_lock: locked }).eq('id', order.id);
+    if (error) throw new HttpError(503, '2-Step Document Lock requires the latest database migration.');
+    await addEvent(order.id, 'note', locked ? '2-Step Document Protection enabled on tracking link' : '2-Step Document Protection unlocked', null, false);
+    await auditAdmin(request, admin, locked ? 'doc_lock_enabled' : 'doc_lock_disabled', order.code);
+    return json(await detail(order.id));
+}
+
+async function unlockLegalHold(request, body, admin) {
+    await requireStepUpIfEnabled(admin, body.totp);
+    const order = await getOrder(body.id);
+    const hold = body.hold !== undefined ? !!body.hold : false;
+    const { error } = await db().from('orders').update({ legal_hold: hold }).eq('id', order.id);
+    if (error) { /* column may not be migrated yet; audit still recorded */ }
+    await addEvent(order.id, 'note', hold ? 'Legal Hold lock applied' : 'Legal Hold unlocked by staff override', null, false);
+    await auditAdmin(request, admin, hold ? 'legal_hold_locked' : 'legal_hold_unlocked', order.code);
+    if (!hold) {
+        await sendSecurityAlert(admin, `Legal Hold unlocked on ${order.code}`, [
+            `Completed order ${order.code} (${order.recipient_name}) had its Legal Hold lock overridden on the staff dashboard.`,
+        ]);
     }
     return json(await detail(order.id));
 }
@@ -298,7 +471,9 @@ async function proofFinish(request, body) {
     const detailText = uploaded.map(u => u.sha256 ? `${u.filename} (SHA-256: ${u.sha256.slice(0, 12)}…)` : u.filename).join(', ');
     await addEvent(order.id, 'proof', 'Proof of service uploaded', detailText);
     if (body.markServed) {
-        await db().from('orders').update({ status: 'served', served_at: new Date().toISOString() }).eq('id', order.id);
+        const servedAt = new Date().toISOString();
+        const { error: uErr } = await db().from('orders').update({ status: 'served', served_at: servedAt, legal_hold: true }).eq('id', order.id);
+        if (uErr) await db().from('orders').update({ status: 'served', served_at: servedAt }).eq('id', order.id);
         await addEvent(order.id, 'status', STATUSES.served.label);
     }
     await sendEmail({
@@ -321,11 +496,12 @@ async function fileUrl(body) {
 // Nick finds their requests by searching their email in the dashboard, then exports or deletes each one.
 async function exportOrder(request, body, admin) {
     await rateLimit(`admin-export:${sha256(admin)}`, 15, 900);
-    const { order, events, files } = await detail(body.id);
+    const { order, events, files, integritySeal } = await detail(body.id);
     await auditAdmin(request, admin, 'export_order', order.code);
     const { track_token, payment_url, stripe_session_id, tier_name, addon_names, ...fields } = order;   // keys, not personal data
     return json({
         exported_at: new Date().toISOString(),
+        integrity_seal: integritySeal,
         note: "All information Nick's Process Services holds for this request. Uploaded documents are listed; Nick sends copies on request.",
         request: { ...fields, tier: tier_name, addons: addon_names },
         timeline: events.map(({ created_at, title, detail: d, client_visible }) => ({ created_at, title, detail: d, shown_to_client: client_visible })),
@@ -337,6 +513,10 @@ async function exportOrder(request, body, admin) {
 async function deleteOrder(request, body, admin) {
     await rateLimit(`admin-delete:${sha256(admin)}`, 5, 900);
     const order = await getOrder(body.id);
+    if ((order.status === 'served' || order.legal_hold) && !body.unlockLegalHold) {
+        throw new HttpError(423, 'This served order is protected by Legal Hold and cannot be deleted without unlocking Legal Hold first.');
+    }
+    await requireStepUpIfEnabled(admin, body.totp);
     if (String(body.confirm || '').trim().toUpperCase() !== order.code) throw new HttpError(400, `Type ${order.code} to confirm.`);
     const { data: fileRows, error } = await db().from('order_files').select('storage_path').eq('order_id', order.id);
     if (error) throw error;

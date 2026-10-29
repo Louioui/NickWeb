@@ -62,6 +62,16 @@ export const POST = handle(async (request) => {
     }
     if (!order) throw new HttpError(500, 'Could not create your request. Please try again.');
     await addEvent(order.id, 'created', 'Request received', `${TIERS[row.tier].name} · estimate ${money(cents)}`);
+    const submissionDigest = sha256(
+        `${order.code}|${row.client_email}|${row.recipient_name}|${row.doc_type}|${row.address}|${row.unit || ''}|${row.city}|${row.zip}|${row.tier}|${row.deadline || 'none'}|TOS-ACCEPTED`
+    ).slice(0, 32);
+    await addEvent(
+        order.id,
+        'attestation',
+        'Client legal attestation & Terms sealed',
+        `Terms & Best-Efforts Service scope accepted · Deadline: ${row.deadline || 'Standard'} · Submission SHA-256: ${submissionDigest}`,
+        true
+    );
 
     const uploads = await prepareUploads(order.id, 'client_document', files);
     return json({ ok: true, code: order.code, token: order.track_token, trackUrl: `/track.html#t=${order.track_token}`, uploads });
@@ -92,6 +102,7 @@ async function finish(request, body) {
                 `Reference: ${order.code}`,
                 `Person to be served: ${order.recipient_name}`,
                 `Service: ${TIERS[order.tier]?.name}${addonNames.length ? ' + ' + addonNames.join(', ') : ''} (estimate ${money(order.estimated_total_cents)})`,
+                `Statutory / Requested Deadline: ${order.deadline || 'Standard scheduling'} · Scope: Best-efforts diligent service based on client-supplied address & party records.`,
                 'Nick will review your documents and contact you to confirm details, the final price and timing. You can follow every step from your private tracking page. Keep this link to yourself.',
             ],
             button: { label: 'Track your request', url: trackUrl },

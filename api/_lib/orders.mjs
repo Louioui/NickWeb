@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD } from './core.mjs';
+import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, computeChainSeal } from './core.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -55,8 +55,14 @@ export async function orderByToken(token) {
 
 const isSafePaymentUrl = (u) => typeof u === 'string' && (/^https:\/\/checkout\.stripe\.com\//i.test(u) || u.startsWith('/__mock-pay'));
 
+// Masks street numbers and apartment/suite identifiers when 2-Step Case/Document Lock is active and unverified.
+export function maskAddress(order) {
+    const street = String(order.address || '').replace(/^\s*\d+[A-Za-z0-9\-/]*/, '••••');
+    return street + (order.city ? `, ${order.city}` : '') + (order.zip ? ` ${order.zip}` : '');
+}
+
 // The client's view of an order: no internal notes, only client-visible events and files.
-export async function clientView(order) {
+export async function clientView(order, { unlocked = true } = {}) {
     const [{ data: events }, fileRes] = await Promise.all([
         db().from('order_events').select('created_at, kind, title, detail').eq('order_id', order.id)
             .eq('client_visible', true).order('created_at', { ascending: true }),
@@ -69,15 +75,18 @@ export async function clientView(order) {
             .eq('uploaded', true).order('created_at', { ascending: true });
         files = fallback.data;
     }
+    const isLocked = !!order.doc_lock && !unlocked;
+    const fullAddr = [order.address, order.unit].filter(Boolean).join(', ') + (order.city ? `, ${order.city}` : '') + ` ${order.zip}`;
+    const seal = computeChainSeal(order.code, order.created_at, events || [], files || []);
     return {
         code: order.code,
         status: order.status,
         statusLabel: STATUSES[order.status]?.label,
         statusText: STATUSES[order.status]?.client,
         createdAt: order.created_at,
-        recipient: order.recipient_name,
+        recipient: isLocked ? String(order.recipient_name || '').replace(/^(\S+)\s+.*$/, '$1 ••••') : order.recipient_name,
         docType: order.doc_type,
-        address: [order.address, order.unit].filter(Boolean).join(', ') + (order.city ? `, ${order.city}` : '') + ` ${order.zip}`,
+        address: isLocked ? maskAddress(order) : fullAddr,
         tier: TIERS[order.tier]?.name || order.tier,
         addons: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
         estimate: money(order.estimated_total_cents),
@@ -85,8 +94,20 @@ export async function clientView(order) {
         payUrl: order.status === 'awaiting_payment' && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
         paidAt: order.paid_at,
         actionNote: order.status === 'action_required' ? order.action_note : null,
+        docLock: !!order.doc_lock,
+        unlocked: !isLocked,
+        legalHold: order.status === 'served' || !!order.legal_hold,
+        integritySeal: seal,
         events: events || [],
-        files: (files || []).map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, sha256: f.sha256 || null, at: f.created_at })),
+        files: (files || []).map(f => ({
+            id: f.id,
+            kind: f.kind,
+            name: f.filename,
+            size: f.size_bytes,
+            sha256: f.sha256 || null,
+            at: f.created_at,
+            locked: isLocked,
+        })),
     };
 }
 
@@ -155,6 +176,23 @@ export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, 
         body: JSON.stringify({ from: FROM, to: [to], reply_to: REPLY_TO, subject, html, text: textBody }),
     });
     if (!res.ok) console.error('Resend error', res.status, await res.text());
+}
+
+export async function sendSecurityAlert(to, eventTitle, detailLines = []) {
+    try {
+        await sendEmail({
+            to,
+            subject: `Security alert: ${eventTitle} — Nick's Process Services`,
+            heading: `Security Notice: ${eventTitle}`,
+            lines: [
+                ...detailLines,
+                `Timestamp (UTC): ${new Date().toISOString()}`,
+                'If you performed this action, no further steps are needed. If you do not recognize this activity, rotate your emergency recovery codes and sign out all active sessions immediately.',
+            ],
+        });
+    } catch (err) {
+        console.error('Security alert email error:', err);
+    }
 }
 
 const escHtml = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

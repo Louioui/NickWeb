@@ -5,23 +5,130 @@
 //   POST { t, action: 'confirm-payment', session } -> checks Stripe after the client returns from paying
 //   POST { t, action: 'respond', ...fields, files }-> answers "Action required"; returns upload links
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
+import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, cleanFileList,
-         prepareUploads, confirmUploads, addEvent, uuid, sha256, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
+         prepareUploads, confirmUploads, addEvent, uuid, sha256, randomToken, timingSafeMatch, uaFingerprint, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
 import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, sendEmail } from './_lib/orders.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
+
+function makeUnlockToken(request, order) {
+    const secret = process.env.SUPABASE_SERVICE_ROLE_KEY || 'local-dev-secret';
+    return sha256(`nps-track-unlock:${secret}:${order.id}:${order.track_token}:${uaFingerprint(request)}`);
+}
+
+function isOrderUnlocked(request, order, body) {
+    if (!order.doc_lock) return true;
+    const tok = typeof body?.unlockToken === 'string' ? body.unlockToken : '';
+    return tok.length === 64 && timingSafeMatch(tok, makeUnlockToken(request, order));
+}
 
 export const POST = handle(async (request) => {
     const body = await readJson(request);
     cleanTrackToken(body.t);
     await rateLimit(`track:${clientIp(request)}`, 120, 600);
     const order = await orderByToken(body.t);
+    const unlocked = isOrderUnlocked(request, order, body);
 
     if (body.action === 'view') {
-        return json(await clientView(order));
+        return json(await clientView(order, { unlocked }));
+    }
+
+    if (body.action === 'send-unlock-code') {
+        await rateLimit(`track-unlock-send:${sha256(body.t)}`, 4, 900);
+        const code = String(randomInt(100000, 1000000));
+        const { error } = await db().from('track_unlock_codes').upsert({
+            order_id: order.id,
+            code_hash: sha256(`${order.id}:${code}`),
+            tries: 0,
+            expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+            created_at: new Date().toISOString(),
+        });
+        if (error) throw new HttpError(503, '2-Step Document Unlock requires the latest database migration.');
+        await sendEmail({
+            to: order.client_email,
+            subject: `${order.code}: Your 2-step document unlock code is ${code}`,
+            heading: `Your document unlock code is ${code}`,
+            lines: [
+                `Enter this 6-digit code on the tracking page for ${order.code} to unlock full case details and download court documents.`,
+                'This code expires in 10 minutes. You can also unlock anytime using your 6-digit Firm Security PIN.',
+            ],
+        });
+        if (!IS_PROD && !process.env.RESEND_API_KEY) console.log(`[dev] track unlock code for ${order.code}: ${code}`);
+        const maskedEmail = order.client_email.replace(/^(..).*(@.*)$/, '$1•••$2');
+        return json({ ok: true, maskedEmail });
+    }
+
+    if (body.action === 'verify-unlock-code') {
+        await rateLimit(`track-unlock-verify:${sha256(body.t)}`, 8, 900);
+        const code = String(body.code || '').trim();
+        if (!/^\d{6}$/.test(code)) throw new HttpError(400, 'Please enter a 6-digit verification code or Security PIN.');
+        let verified = false;
+        // 1. Check Firm Security PIN if configured for order.client_email
+        try {
+            const { data: sec } = await db().from('client_security_settings').select('pin_hash, locked_until').eq('email', order.client_email.toLowerCase()).maybeSingle();
+            if (sec?.pin_hash && (!sec.locked_until || sec.locked_until < new Date().toISOString())) {
+                if (timingSafeMatch(sec.pin_hash, sha256(`${order.client_email.toLowerCase()}:${code}`))) verified = true;
+            }
+        } catch { /* non-fatal */ }
+        // 2. Otherwise check one-time emailed unlock code
+        if (!verified) {
+            const { data: row } = await db().from('track_unlock_codes').select('*').eq('order_id', order.id).maybeSingle();
+            if (!row || row.expires_at < new Date().toISOString() || row.tries >= 5) {
+                throw new HttpError(401, 'That unlock code is invalid or expired. Request a new code.');
+            }
+            if (!timingSafeMatch(row.code_hash, sha256(`${order.id}:${code}`))) {
+                const nextTries = (row.tries || 0) + 1;
+                if (nextTries >= 5) await db().from('track_unlock_codes').delete().eq('order_id', order.id);
+                else await db().from('track_unlock_codes').update({ tries: nextTries }).eq('order_id', order.id);
+                throw new HttpError(401, 'That unlock code is invalid or expired.');
+            }
+            await db().from('track_unlock_codes').delete().eq('order_id', order.id);
+            verified = true;
+        }
+        const unlockToken = makeUnlockToken(request, order);
+        const view = await clientView(order, { unlocked: true });
+        return json({ ok: true, unlockToken, ...view });
+    }
+
+    if (body.action === 'toggle-doc-lock') {
+        await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
+        if (order.doc_lock && !unlocked) {
+            throw new HttpError(403, 'Unlock 2-Step Protection first before changing lock settings.');
+        }
+        const nextLock = body.locked !== undefined ? !!body.locked : !order.doc_lock;
+        const { error } = await db().from('orders').update({ doc_lock: nextLock }).eq('id', order.id);
+        if (error) throw new HttpError(503, '2-Step Document Lock requires the latest database migration.');
+        await addEvent(order.id, 'note', nextLock ? '2-Step Document Protection enabled' : '2-Step Document Protection unlocked', null, true);
+        const updatedOrder = { ...order, doc_lock: nextLock };
+        const unlockToken = nextLock ? makeUnlockToken(request, updatedOrder) : null;
+        const view = await clientView(updatedOrder, { unlocked: true });
+        return json({ ok: true, unlockToken, ...view });
+    }
+
+    if (body.action === 'rotate-token') {
+        await rateLimit(`track-write:${sha256(body.t)}`, 5, 900);
+        if (order.doc_lock && !unlocked) {
+            throw new HttpError(403, 'Verify your 2-Step code before rotating this private link.');
+        }
+        const newToken = randomToken(32);
+        const { error } = await db().from('orders').update({ track_token: newToken }).eq('id', order.id);
+        if (error) throw error;
+        await addEvent(order.id, 'note', 'Private tracking link rotated (previous link revoked)', null, true);
+        return json({ ok: true, token: newToken, trackUrl: `/track.html#t=${encodeURIComponent(newToken)}` });
     }
 
     if (body.action === 'download') {
-        return json({ url: await fileForOrder(order.id, uuid(body.fileId, 'File')) });
+        if (order.doc_lock && !unlocked) {
+            throw new HttpError(403, '2-Step Document Protection is active. Verify your email code or Security PIN to download case documents.');
+        }
+        const fId = uuid(body.fileId, 'File');
+        const url = await fileForOrder(order.id, fId);
+        let fileSha256 = null;
+        try {
+            const { data: fRow } = await db().from('order_files').select('filename, sha256').eq('order_id', order.id).eq('id', fId).maybeSingle();
+            fileSha256 = fRow?.sha256 || null;
+        } catch { /* non-fatal */ }
+        return json({ url, sha256: fileSha256, expiresInSeconds: 60 });
     }
 
     if (body.action === 'confirm-payment') {
@@ -59,10 +166,17 @@ export const POST = handle(async (request) => {
         changes.action_note = null;
         const { error } = await db().from('orders').update(changes).eq('id', order.id);
         if (error) throw error;
+        let attemptCount = 0;
+        try {
+            const { count } = await db().from('order_events').select('id', { count: 'exact', head: true }).eq('order_id', order.id).eq('kind', 'attempt');
+            if (typeof count === 'number') attemptCount = count;
+        } catch { /* non-fatal */ }
+        const amendDigest = sha256(`${order.code}|${changes.address || ''}|${changes.unit || ''}|${changes.city || ''}|${changes.zip || ''}|${changes.access_notes || ''}|${reply || ''}`).slice(0, 16);
         const summary = [
             changes.address || changes.unit || changes.city || changes.zip ? 'Updated the service address' : null,
             changes.access_notes ? `Access notes: ${changes.access_notes}` : null,
             reply,
+            `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
         ].filter(Boolean).join(' · ');
         await addEvent(order.id, 'action_response', 'You sent the requested information', summary || null);
         const uploads = await prepareUploads(order.id, 'action_upload', files);
