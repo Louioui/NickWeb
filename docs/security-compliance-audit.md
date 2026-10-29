@@ -41,8 +41,10 @@ not Netlify, with Supabase for the database and files, Stripe for one-time card 
 **You need to do this in the Vercel dashboard (account settings; I didn't change these)**
 1. **Settings → Billing → Spend Management:** set a monthly limit and turn on *Pause production deployment* when it's
    reached. This is the "circuit breaker" that guarantees no surprise bill.
-2. **Project → Firewall:** add a rate-limit rule for `/api/*` (for example 60 requests a minute per IP, then block for
-   10 minutes). If the site is ever flooded, turn on **Attack Challenge Mode** on the same page.
+2. ~~Project → Firewall rate-limit rule~~ **Done 2026-10-29:** "Rate limit /api/ requests" (path starts with `/api/`,
+   60 requests per 60 seconds per IP, fixed window; over the limit, deny for 15 minutes). Vercel charges $0.50 per
+   million requests it lets through; blocked requests are free. If the site is ever flooded, turn on
+   **Attack Challenge Mode** on the same page.
 3. Optional: add a bot check to the request form (Cloudflare Turnstile or Vercel BotID). That stops automated
    submissions that per-IP limits can't.
 
