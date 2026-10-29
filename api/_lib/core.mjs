@@ -429,9 +429,10 @@ export function verifyFileMagic(bytes, filename) {
 // instead of throwing, so each one is checked: nothing is ever accepted without being inspected.
 export async function inspectStoredFile(path, filename) {
     try {
+        // exists() answers a missing object (HTTP 400/404) with { data: false, error }; other failures throw.
         const { data: exists, error: xErr } = await db().storage.from(BUCKET).exists(path);
-        if (xErr) return { state: 'unknown' };
-        if (!exists) return { state: 'missing' };
+        if (exists === false) return { state: 'missing' };
+        if (xErr || exists !== true) return { state: 'unknown' };
         const { data: blob, error: dErr } = await db().storage.from(BUCKET).download(path);
         if (dErr || !blob) return { state: 'unknown' };
         const buf = Buffer.from(await blob.arrayBuffer());

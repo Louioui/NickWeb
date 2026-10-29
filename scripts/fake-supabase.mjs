@@ -107,7 +107,11 @@ export function createFakeSupabase() {
     };
 
     const bucket = {
-        exists: async (p) => state.failExists.has(p) ? { data: null, error: { message: 'storage unavailable' } } : { data: state.storage.has(p), error: null },
+        // Like storage-js: a missing object is { data: false, error } (HTTP 404); an outage is an error without data.
+        exists: async (p) => {
+            if (state.failExists.has(p)) return { data: null, error: { message: 'storage unavailable' } };
+            return state.storage.has(p) ? { data: true, error: null } : { data: false, error: { message: 'Object not found', status: 404 } };
+        },
         download: async (p) => {
             if (state.failDownload.has(p) || !state.storage.has(p)) return { data: null, error: { message: 'download failed' } };
             return { data: new Blob([state.storage.get(p)]), error: null };
