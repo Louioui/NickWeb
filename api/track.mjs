@@ -145,7 +145,7 @@ export const POST = handle(async (request) => {
         const session = await stripeClient().checkout.sessions.retrieve(body.session);
         if (session.metadata?.order_id === order.id && session.payment_status === 'paid' &&
             !(await markPaid(order.id, session.amount_total, session.id))) {
-            await flagUnappliedPayment(order.id, session.amount_total, session.id);
+            await flagUnappliedPayment(order.id, session.amount_total, session.id).catch(err => console.error(err.message));
         }
         return json(await clientView(await orderByToken(body.t), { unlocked }));
     }

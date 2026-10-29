@@ -15,6 +15,7 @@ export function createFakeSupabase() {
         otp: new Map(),              // email -> code accepted by auth.verifyOtp
         users: new Map(),            // email -> user
         sessions: new Map(),         // access token -> email
+        refreshTokens: new Map(),    // refresh token -> email
         revoked: [],
     };
     const rows = (t) => (state.tables[t] ||= []);
@@ -139,7 +140,14 @@ export function createFakeSupabase() {
                 const email = state.sessions.get(access);
                 return email ? { data: { user: state.users.get(email) }, error: null } : { data: { user: null }, error: authError('invalid JWT', 'bad_jwt') };
             },
-            refreshSession: async () => ({ data: {}, error: authError('refresh failed', 'refresh_token_not_found') }),
+            refreshSession: async ({ refresh_token }) => {
+                const email = state.refreshTokens.get(refresh_token);
+                if (!email) return { data: {}, error: authError('refresh failed', 'refresh_token_not_found') };
+                state.refreshTokens.delete(refresh_token);
+                const access = `access-${randomUUID()}`, refresh = `refresh-${randomUUID()}`;
+                state.sessions.set(access, email); state.refreshTokens.set(refresh, email);
+                return { data: { user: state.users.get(email), session: { access_token: access, refresh_token: refresh } }, error: null };
+            },
             admin: { signOut: async (access) => { state.sessions.delete(access); state.revoked.push(access); return { data: null, error: null }; } },
         },
     };
@@ -148,7 +156,7 @@ export function createFakeSupabase() {
     client.__state = state;
     client.__reset = () => {
         state.tables = {};
-        for (const k of ['storage', 'failDownload', 'failExists', 'rateHits', 'otp', 'users', 'sessions']) state[k].clear();
+        for (const k of ['storage', 'failDownload', 'failExists', 'rateHits', 'otp', 'users', 'sessions', 'refreshTokens']) state[k].clear();
         state.revoked = [];
     };
     client.__addUser = (email) => {
@@ -157,5 +165,6 @@ export function createFakeSupabase() {
         return user;
     };
     client.__sessionFor = (email) => { const access = `access-${randomUUID()}`; state.sessions.set(access, email); return access; };
+    client.__refreshFor = (email) => { const refresh = `refresh-${randomUUID()}`; state.refreshTokens.set(refresh, email); return refresh; };
     return client;
 }

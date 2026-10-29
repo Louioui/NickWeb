@@ -163,7 +163,9 @@ export async function markPaid(orderId, amountCents, sessionId) {
 
 // A paid Stripe session that markPaid would not apply: an older link Nick replaced, less than the amount due, or a
 // second payment. The client was charged, so Nick gets a private timeline entry and an email, once per session, to
-// check Stripe and refund or record it. Nothing is applied automatically.
+// check Stripe and refund or record it. Nothing is applied automatically. The emails go out first and the timeline
+// entry (which marks the session as handled) is written only if at least one was accepted; otherwise this throws, so the
+// Stripe webhook answers with an error and Stripe delivers the event again later.
 export async function flagUnappliedPayment(orderId, amountCents, sessionId) {
     uuid(orderId, 'Order');
     if (typeof sessionId !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(sessionId)) return false;
@@ -177,14 +179,15 @@ export async function flagUnappliedPayment(orderId, amountCents, sessionId) {
     const reason = order.paid_at ? 'the order was already paid'
         : order.stripe_session_id && order.stripe_session_id !== sessionId ? 'it was paid on a payment link that had been replaced'
         : 'it is less than the amount due';
-    await addEvent(orderId, 'payment', 'Payment needs review', `Stripe payment ${sessionId} for ${paid} was not applied because ${reason}. Check it in Stripe, then refund it or record it.`, false);
     console.error(`Unapplied Stripe payment on ${order.code}: ${sessionId} (${paid}), ${reason}`);
-    await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
+    const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
         to, subject: `${order.code}: a payment needs your review`,
         heading: 'A payment needs your review',
         lines: [`A card payment of ${paid} on ${order.code} was not applied to the order because ${reason}.`,
             'Open Stripe to check it, then refund it or record it. The order timeline has the details.'],
-    })));
+    }).catch(() => false)));
+    if (!sent.some(Boolean)) throw new Error(`Payment review alert for ${order.code} could not be emailed`);
+    await addEvent(orderId, 'payment', 'Payment needs review', `Stripe payment ${sessionId} for ${paid} was not applied because ${reason}. Check it in Stripe, then refund it or record it.`, false);
     return true;
 }
 
@@ -200,6 +203,7 @@ const REPLY_TO = 'nicksprocessservices@outlook.com';
 const LINKISH = /\b(?:https?:\/\/|www\.)\S+|(?<![@\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:[a-z]{2,}|xn--[a-z0-9-]+)(?![a-z0-9-])(?:[:\/]\S*)?/gi;
 export const clean = (s, max = 600) => String(s ?? '').replace(LINKISH, '[link removed]').slice(0, max);
 
+// Returns whether the email was handed to Resend (callers that must know, like payment alerts, check it).
 export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, lines: rawLines, button }) {
     const subject = clean(rawSubject, 160);
     const heading = clean(rawHeading, 160);
@@ -212,7 +216,7 @@ export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, 
         // Locally the email is printed so the flow can be tested. In production it would put login codes and client details in the logs.
         if (IS_PROD) console.error(`Email not sent (RESEND_API_KEY is not set): "${subject.replace(/\d{6}/g, '######')}"`);
         else console.log(`\n[email not sent: no RESEND_API_KEY]\nTo: ${to}\nSubject: ${subject}\n${textBody}\n`);
-        return;
+        return !IS_PROD;
     }
     const res = await fetch('https://api.resend.com/emails', {
         method: 'POST',
@@ -220,6 +224,7 @@ export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, 
         body: JSON.stringify({ from: FROM, to: [to], reply_to: REPLY_TO, subject, html, text: textBody }),
     });
     if (!res.ok) console.error('Resend error', res.status, await res.text());
+    return res.ok;
 }
 
 export async function sendSecurityAlert(to, eventTitle, detailLines = []) {

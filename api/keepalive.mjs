@@ -2,6 +2,8 @@
 // from pausing after 7 quiet days, and clears out expired login codes and sessions.
 import { db, handle, json, HttpError, BUCKET, addEvent, rateLimit, timingSafeMatch, inspectStoredFile } from './_lib/core.mjs';
 
+const BATCH = 100;
+
 export const GET = handle(async (request) => {
     // With CRON_SECRET set (recommended), only Vercel Cron can run this. Without it, anyone could, so it is throttled.
     const secret = process.env.CRON_SECRET;
@@ -19,12 +21,18 @@ export const GET = handle(async (request) => {
     // Files still marked "not uploaded" a day later: if the file did reach storage (the browser lost its connection before
     // confirming), verify its magic bytes, keep it and show it; if it never arrived or is disguised, remove it. If storage
     // can't be reached, leave the row alone and try again tomorrow, so a stored upload is never lost or accepted unchecked.
-    const { data: stale, error: sErr } = await db().from('order_files').select('id, order_id, storage_path, filename').eq('uploaded', false).lt('created_at', dayAgo).limit(100);
+    // Each run checks at most 100 files, starting at a different place in the queue every day, so files that keep failing
+    // can't take the whole batch day after day: every pending upload is reached within ceil(pending / 100) days.
+    const { data: stale, error: sErr } = await db().from('order_files').select('id, order_id, storage_path, filename')
+        .eq('uploaded', false).lt('created_at', dayAgo).order('created_at', { ascending: true }).limit(BATCH * 10);
     if (sErr) throw sErr;
+    const queue = stale || [];
+    const start = queue.length > BATCH ? (Math.floor(Date.now() / 864e5) * BATCH) % queue.length : 0;
+    const batch = [...queue.slice(start), ...queue.slice(0, start)].slice(0, BATCH);
     let recovered = 0;
     let retryLater = 0;
     const missing = [];
-    for (const f of stale || []) {
+    for (const f of batch) {
         const check = await inspectStoredFile(f.storage_path, f.filename);
         if (check.state === 'unknown') { retryLater++; continue; }
         if (check.state !== 'ok') {

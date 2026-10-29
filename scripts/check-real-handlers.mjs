@@ -24,8 +24,12 @@ delete process.env.ADMIN_EMAILS;
 delete process.env.VERCEL_ENV;
 
 const emails = [];
+let resendUp = true;   // set to false to make Resend reject every email
 globalThis.fetch = async (url, init) => {
-    if (String(url).includes('resend.com')) emails.push(JSON.parse(init.body));
+    if (String(url).includes('resend.com')) {
+        if (!resendUp) return new Response('{"message":"unavailable"}', { status: 503 });
+        emails.push(JSON.parse(init.body));
+    }
     return new Response('{}', { status: 200 });
 };
 
@@ -36,6 +40,7 @@ const { POST: trackPOST } = await import('../api/track.mjs');
 const { POST: adminPOST } = await import('../api/admin.mjs');
 const { POST: webhookPOST } = await import('../api/stripe-webhook.mjs');
 const { GET: keepaliveGET } = await import('../api/keepalive.mjs');
+const clients = await import('../api/_lib/clients.mjs');
 
 let passed = 0;
 const failures = [];
@@ -55,7 +60,7 @@ const post = (path, body, headers = {}) => new Request(`https://site.test${path}
     method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
 });
 const tables = () => db.__state.tables;
-const reset = () => { db.__reset(); stripeSessions.clear(); emails.length = 0; };
+const reset = () => { db.__reset(); stripeSessions.clear(); emails.length = 0; resendUp = true; };
 const ADMIN = 'nicksprocessservices@outlook.com';
 const CLIENT = 'client@example.com';
 const PIN = '246810';
@@ -103,6 +108,21 @@ await check('F-01 the cookie issued after sign-in (code + PIN) works for later r
     const cookie = login.headers.get('set-cookie').split(';')[0];
     const res = await clientPOST(post('/api/client', { action: 'list' }, { cookie }));
     expect(res.status === 200, `signed-in session refused (${res.status})`);
+});
+
+const cookieFor = (session, userId) => clients.clientCookie(new Request('https://site.test/api/client'), session, userId).split(';')[0];
+await check('F-01 a signed cookie for one client is refused with another client\'s tokens', async () => {
+    reset(); const a = db.__addUser(CLIENT); db.__addUser('other@example.com');
+    const cookie = cookieFor({ access_token: db.__sessionFor('other@example.com'), refresh_token: 'r' }, a.id);
+    const res = await clientPOST(post('/api/client', { action: 'list' }, { cookie }));
+    expect(res.status === 401, `proof for client A accepted with client B's tokens (${res.status})`);
+});
+await check('F-01 an expired session is renewed only with a matching signed cookie', async () => {
+    reset(); const a = db.__addUser(CLIENT); const b = db.__addUser('other@example.com');
+    const ok = await clientPOST(post('/api/client', { action: 'list' }, { cookie: cookieFor({ access_token: 'expired', refresh_token: db.__refreshFor(CLIENT) }, a.id) }));
+    expect(ok.status === 200 && /nps_client=/.test(ok.headers.get('set-cookie') || ''), `refresh with a matching proof failed (${ok.status})`);
+    const bad = await clientPOST(post('/api/client', { action: 'list' }, { cookie: cookieFor({ access_token: 'expired', refresh_token: db.__refreshFor(CLIENT) }, b.id) }));
+    expect(bad.status === 401, `refresh accepted a proof for another client (${bad.status})`);
 });
 
 // --- F-02: email code first, then PIN; no lockout or PIN oracle without the email code ---
@@ -195,6 +215,21 @@ await check('F-04 daily cleanup still removes an upload that never reached stora
     await cron();
     expect(!fileRow(f.id), 'abandoned upload row was kept');
 });
+await check('F-04 files that keep failing cannot stop later uploads from being checked', async () => {
+    reset(); const o = seedOrder();
+    const old = new Date(Date.now() - 5 * 864e5).toISOString();
+    for (let i = 0; i < 100; i++) db.__state.failDownload.add(seedFile(o, { created_at: old }).storage_path);
+    const late = seedFile(o, { created_at: dayOld });
+    const realNow = Date.now;
+    try {
+        for (let day = 0; day < 2 && !fileRow(late.id).uploaded; day++) {
+            const t = realNow() + day * 864e5;
+            Date.now = () => t;
+            await cron();
+        }
+    } finally { Date.now = realNow; }
+    expect(fileRow(late.id).uploaded === true, 'a later upload was never inspected within two daily runs');
+});
 await check('F-04 daily cleanup does not confirm a file it could not download', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o, { created_at: dayOld });
     db.__state.failDownload.add(f.storage_path);
@@ -216,6 +251,16 @@ await check('F-05 a paid, replaced payment link is flagged once for Nick (and em
     expect(!o.paid_at, 'order was marked paid from a replaced link');
     expect(reviewEvents(o).length === 1, `expected 1 private review entry, got ${reviewEvents(o).length}`);
     expect(emails.some(e => e.to.includes(ADMIN) && /review/i.test(e.subject)), 'Nick was not emailed');
+});
+await check('F-05 if the alert email fails, nothing is marked and Stripe is asked to retry', async () => {
+    reset(); resendUp = false;
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 10000, stripe_session_id: 'cs_test_newlink123' });
+    const s = { id: 'cs_test_oldlink123', payment_status: 'paid', amount_total: 10000, metadata: { order_id: o.id } };
+    const first = await webhook(s);
+    expect(first.status >= 500 && reviewEvents(o).length === 0, `status ${first.status}, review entries ${reviewEvents(o).length}`);
+    resendUp = true;
+    const retry = await webhook(s);
+    expect(retry.status === 200 && reviewEvents(o).length === 1 && emails.some(e => /review/i.test(e.subject)), 'the retry did not alert Nick');
 });
 await check('F-05 an underpaid session is flagged, not applied', async () => {
     reset();
