@@ -220,6 +220,19 @@ const handlers = {
             email(o.client_email, `${o.code}: confirmed, ${money(cents)} due to start service`, o.payment_url);
             return json(adminDetail(o));
         }
+        if (a === 'export') {
+            const { track_token, payment_url, stripe_session_id, ...fields } = o;
+            return json({ exported_at: now(), request: { ...fields, tier: TIERS[o.tier]?.name },
+                timeline: events.filter(e => e.order_id === o.id).map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible })),
+                files: [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ filename, kind, size_bytes, created_at }) => ({ filename, kind, size_bytes, created_at })) });
+        }
+        if (a === 'delete') {
+            if (String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm.`);
+            for (const [fid, f] of files) if (f.order_id === o.id) files.delete(fid);
+            for (let i = events.length - 1; i >= 0; i--) if (events[i].order_id === o.id) events.splice(i, 1);
+            orders.delete(o.id);
+            return json({ ok: true, deleted: o.code });
+        }
         if (a === 'proof-upload') {
             if (!Array.isArray(body.files) || !body.files.length) fail(400, 'Choose the proof of service file.');
             return json({ uploads: prepareUploads(o.id, 'proof', body.files) });

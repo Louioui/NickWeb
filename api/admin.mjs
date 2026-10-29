@@ -2,7 +2,7 @@
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
          sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
-         HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
+         HttpError, ADMIN_EMAILS, IS_PROD, BUCKET } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, markPaid } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
 
@@ -25,6 +25,8 @@ export const POST = handle(async (request) => {
     if (a === 'proof-upload') return proofUpload(body);
     if (a === 'proof-finish') return proofFinish(request, body);
     if (a === 'file-url') return fileUrl(body);
+    if (a === 'export') return exportOrder(body);
+    if (a === 'delete') return deleteOrder(body);
     throw new HttpError(400, 'Unknown action.');
 });
 
@@ -82,7 +84,7 @@ async function logout(request) {
 // --- Jobs ---
 async function list() {
     const { data, error } = await db().from('orders')
-        .select('id, code, status, created_at, updated_at, client_name, client_firm, recipient_name, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
+        .select('id, code, status, created_at, updated_at, client_name, client_firm, client_email, recipient_name, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
         .order('created_at', { ascending: false }).limit(500);
     if (error) throw error;
     return json({ orders: await withClientReplied(data), statuses: STATUSES, tiers: TIERS });
@@ -225,4 +227,38 @@ async function fileUrl(body) {
     if (error) throw error;
     if (!data) throw new HttpError(404, 'File not found.');
     return json({ url: await signedDownload(data.storage_path, data.filename) });
+}
+
+// --- Privacy requests: a client asks for a copy of their data, or for it to be deleted ---
+// Nick finds their requests by searching their email in the dashboard, then exports or deletes each one.
+async function exportOrder(body) {
+    const { order, events, files } = await detail(body.id);
+    const { track_token, payment_url, stripe_session_id, tier_name, addon_names, ...fields } = order;   // keys, not personal data
+    return json({
+        exported_at: new Date().toISOString(),
+        note: "All information Nick's Process Services holds for this request. Uploaded documents are listed; Nick sends copies on request.",
+        request: { ...fields, tier: tier_name, addons: addon_names },
+        timeline: events.map(({ created_at, title, detail: d, client_visible }) => ({ created_at, title, detail: d, shown_to_client: client_visible })),
+        files: files.map(({ filename, kind, size_bytes, created_at }) => ({ filename, kind, size_bytes, created_at })),
+    });
+}
+
+// Permanent: removes the stored documents, then the request with its timeline and file records (cascade).
+async function deleteOrder(body) {
+    const order = await getOrder(body.id);
+    if (String(body.confirm || '').trim().toUpperCase() !== order.code) throw new HttpError(400, `Type ${order.code} to confirm.`);
+    const { data: fileRows, error } = await db().from('order_files').select('storage_path').eq('order_id', order.id);
+    if (error) throw error;
+    const paths = (fileRows || []).map(f => f.storage_path);
+    for (let i = 0; i < paths.length; i += 100) {
+        const { error: sErr } = await db().storage.from(BUCKET).remove(paths.slice(i, i + 100));
+        if (sErr) throw sErr;   // stop before deleting the record, so no stored document is ever orphaned
+    }
+    if (order.stripe_session_id?.startsWith('cs_') && !order.paid_at) {
+        await stripeClient().checkout.sessions.expire(order.stripe_session_id).catch(() => {});   // no payable link left behind
+    }
+    const { error: dErr } = await db().from('orders').delete().eq('id', order.id);
+    if (dErr) throw dErr;
+    console.log(`Request ${order.code} and ${paths.length} file(s) permanently deleted at Nick's request.`);
+    return json({ ok: true, deleted: order.code, files: paths.length });
 }

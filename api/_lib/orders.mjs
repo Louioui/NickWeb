@@ -113,7 +113,8 @@ export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, 
     const heading = clean(rawHeading, 160);
     const lines = rawLines.map(l => clean(l));
     const html = emailHtml(heading, lines, button);
-    const textBody = [heading, '', ...lines, ...(button ? ['', `${button.label}: ${button.url}`] : [])].join('\n');
+    const textBody = [heading, '', ...lines, ...(button ? ['', `${button.label}: ${button.url}`] : []), '',
+        "You're receiving this because a service request was made at nicksprocessservices.dev with this email address. It's about that request only; we don't send marketing emails."].join('\n');
     const key = process.env.RESEND_API_KEY;
     if (!key) {
         // Locally the email is printed so the flow can be tested. In production it would put login codes and client details in the logs.
@@ -141,6 +142,6 @@ function emailHtml(heading, lines, button) {
 ${lines.map(l => `<p style="margin:0 0 12px;font-size:15px;line-height:1.55">${escHtml(l)}</p>`).join('')}
 ${button ? `<p style="margin:24px 0 8px"><a href="${escHtml(button.url)}" style="display:inline-block;background:#0d422e;color:#ffffff;text-decoration:none;padding:13px 22px;font-size:14px;font-weight:bold;letter-spacing:.04em">${escHtml(button.label)}</a></p>` : ''}
 </td></tr>
-<tr><td style="padding:16px 28px;border-top:1px solid #e6e0d2;font-size:12px;color:#6b6b62">Questions? Call or text Nick at (209) 922-6817 or reply to this email.</td></tr>
+<tr><td style="padding:16px 28px;border-top:1px solid #e6e0d2;font-size:12px;color:#6b6b62">Questions? Call or text Nick at (209) 922-6817 or reply to this email.<br><br>You're receiving this because a service request was made at nicksprocessservices.dev with this email address. It's a message about that request only; we don't send marketing emails. If you didn't make this request, reply and let us know.</td></tr>
 </table></td></tr></table></body></html>`;
 }
