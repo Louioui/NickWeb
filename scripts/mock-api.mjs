@@ -169,7 +169,11 @@ const handlers = {
         if (a === 'me') return json({ email: ADMIN_EMAIL });
         if (a === 'logout') { sessions.delete(cookie); return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' }); }
         if (a === 'list') {
-            const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at));
+            const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response'];
+            const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(o => {
+                const last = events.filter(e => e.order_id === o.id && kinds.includes(e.kind)).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+                return { ...o, client_replied: last?.kind === 'action_response' };
+            });
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
         }
         if (a === 'file-url') {
@@ -192,7 +196,7 @@ const handlers = {
             } else if (body.kind === 'attempt') {
                 if (!body.outcome) fail(400, 'Outcome is required.');
                 if (['received', 'paid', 'accepted'].includes(o.status)) o.status = 'attempting';
-                const when = body.when || new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+                const when = body.when || null;
                 addEvent(o.id, 'attempt', `Attempt: ${body.outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
             } else if (body.kind === 'note') {
                 if (!note) fail(400, 'Write a note first.');

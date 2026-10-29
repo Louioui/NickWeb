@@ -84,7 +84,20 @@ async function list() {
         .select('id, code, status, created_at, updated_at, client_name, client_firm, recipient_name, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
         .order('created_at', { ascending: false }).limit(500);
     if (error) throw error;
-    return json({ orders: data, statuses: STATUSES, tiers: TIERS });
+    return json({ orders: await withClientReplied(data), statuses: STATUSES, tiers: TIERS });
+}
+
+// A job "has a client reply" when the client's answer is newer than anything Nick has done on it since.
+const NICK_KINDS = ['action', 'status', 'attempt', 'payment', 'proof'];
+async function withClientReplied(list) {
+    if (!list.length) return list;
+    const { data: evs, error } = await db().from('order_events').select('order_id, kind')
+        .in('order_id', list.map(o => o.id)).in('kind', [...NICK_KINDS, 'action_response'])
+        .order('created_at', { ascending: false }).limit(5000);
+    if (error) throw error;
+    const latest = new Map();
+    for (const e of evs) if (!latest.has(e.order_id)) latest.set(e.order_id, e.kind);
+    return list.map(o => ({ ...o, client_replied: latest.get(o.id) === 'action_response' }));
 }
 
 async function getOrder(id) {
@@ -128,7 +141,7 @@ async function update(request, body) {
         });
     } else if (kind === 'attempt') {
         const outcome = text(body.outcome, { max: 120, required: true, label: 'Outcome' });
-        const when = text(body.when, { max: 40 }) || new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+        const when = text(body.when, { max: 40 });   // blank means "now", which the entry's own timestamp already shows
         if (['received', 'paid', 'accepted'].includes(order.status)) await db().from('orders').update({ status: 'attempting' }).eq('id', order.id);
         await addEvent(order.id, 'attempt', `Attempt: ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
     } else if (kind === 'note') {

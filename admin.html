@@ -88,6 +88,8 @@
         done: { label: 'Done', test: o => ['served', 'closed', 'cancelled'].includes(o.status) },
         all: { label: 'All', test: () => true },
     };
+    // Some timeline entries are written for the client ("You sent..."); on Nick's screen they read from his side.
+    const NICK_WORDING = { 'You sent the requested information': 'Client sent the requested information' };
     const ATTEMPT_OUTCOMES = ['No answer', 'Subject not home', 'Spoke with resident, subject not there', 'Refused / evading', 'Gated, no access',
         'Wrong address / moved', 'Business closed', 'Other'];
 
@@ -153,7 +155,7 @@
     function renderStats() {
         const soon = orders.filter(o => isOpen(o) && o.deadline && daysUntil(o.deadline) <= 7).length;
         const tiles = [
-            ['New to review', orders.filter(FILTERS.review.test).length, 'review'],
+            ['New or client replied', orders.filter(FILTERS.review.test).length, 'review'],
             ['Waiting on client', orders.filter(FILTERS.waiting.test).length, 'waiting'],
             ['In progress', orders.filter(FILTERS.working.test).length, 'working'],
             ['Deadline within 7 days', soon, 'active'],
@@ -182,7 +184,9 @@
             return `
             <button type="button" class="job-row ${current?.order.id === o.id ? 'is-active' : ''}" onclick="openJob('${o.id}')">
                 <span class="font-semibold text-sm text-ink truncate">${esc(o.recipient_name)}</span>
-                <span class="status-pill ${PILL[o.status]}">${esc(statuses[o.status]?.label || o.status)}</span>
+                ${o.client_replied
+                    ? '<span class="status-pill status-alert"><i class="fa-solid fa-reply mr-1"></i>Client replied</span>'
+                    : `<span class="status-pill ${PILL[o.status]}">${esc(statuses[o.status]?.label || o.status)}</span>`}
                 <span class="text-xs text-muted truncate">${esc(o.code)} · ${esc(o.city || '')} · ${esc(o.client_firm || o.client_name)}</span>
                 <span class="text-xs text-right">${due}</span>
             </button>`;
@@ -284,7 +288,7 @@
                 <ol class="timeline">${events.slice().reverse().map(ev => `
                     <li>
                         <span class="timeline-dot ${ev.kind === 'action' ? 'is-alert' : ev.kind === 'payment' ? 'is-gold' : ev.kind === 'proof' ? 'is-done' : ''}"></span>
-                        <p class="text-sm font-semibold text-ink">${esc(ev.title)} ${ev.client_visible ? '' : '<span class="status-pill status-muted ml-1">Only you</span>'}</p>
+                        <p class="text-sm font-semibold text-ink">${esc(NICK_WORDING[ev.title] || ev.title.replace(/ added by you$/, ' added by the client'))} ${ev.client_visible ? '' : '<span class="status-pill status-muted ml-1">Only you</span>'}</p>
                         ${ev.detail ? `<p class="text-sm text-muted mt-0.5 whitespace-pre-line">${esc(ev.detail)}</p>` : ''}
                         <p class="text-[11px] text-muted mt-1">${esc(NPS.fmtDate(ev.created_at))}</p>
                     </li>`).join('')}
