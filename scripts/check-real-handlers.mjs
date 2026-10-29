@@ -125,6 +125,15 @@ await check('F-01 an expired session is renewed only with a matching signed cook
     expect(bad.status === 401, `refresh accepted a proof for another client (${bad.status})`);
 });
 
+await check('F-01 the cookie from a real sign-in renews once its access token expires', async () => {
+    reset(); db.__addUser(CLIENT); db.__state.otp.set(CLIENT, '111111');
+    const login = await clientPOST(post('/api/client', { action: 'verify-code', email: CLIENT, code: '111111' }));
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    db.__state.sessions.clear();   // every access token has expired
+    const res = await clientPOST(post('/api/client', { action: 'list' }, { cookie }));
+    expect(res.status === 200 && /nps_client=/.test(res.headers.get('set-cookie') || ''), `renewal failed (${res.status})`);
+});
+
 // --- F-02: email code first, then PIN; no lockout or PIN oracle without the email code ---
 await check('F-02 a wrong email code gives the same answer whether the PIN is right or wrong', async () => {
     reset(); db.__addUser(CLIENT); setPin(CLIENT); db.__state.otp.set(CLIENT, '111111');
@@ -194,12 +203,20 @@ await check('F-04 a failed download leaves the file unconfirmed', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o);
     db.__state.failDownload.add(f.storage_path);
     const done = await core.confirmUploads(o.id, [f.id]);
-    expect(done.length === 0 && fileRow(f.id)?.uploaded === false, `file accepted without inspection: ${JSON.stringify(fileRow(f.id))}`);
+    expect(done.files.length === 0 && done.stillChecking === 1 && fileRow(f.id)?.uploaded === false, `file accepted without inspection: ${JSON.stringify(fileRow(f.id))}`);
 });
 await check('F-04 a good file is still confirmed with its fingerprint', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o);
     const done = await core.confirmUploads(o.id, [f.id]);
-    expect(done.length === 1 && fileRow(f.id).uploaded && /^[0-9a-f]{64}$/.test(fileRow(f.id).sha256 || ''), 'good file not confirmed');
+    expect(done.files.length === 1 && done.stillChecking === 0 && fileRow(f.id).uploaded && /^[0-9a-f]{64}$/.test(fileRow(f.id).sha256 || ''), 'good file not confirmed');
+});
+await check('F-04 the new-request email says when uploads are still being checked', async () => {
+    reset(); const o = seedOrder(); const good = seedFile(o); const slow = seedFile(o);
+    db.__state.failDownload.add(slow.storage_path);
+    const { POST: requestPOST } = await import('../api/request.mjs');
+    const res = await requestPOST(post('/api/request', { step: 'finish', t: o.track_token, fileIds: [good.id, slow.id] }));
+    const toNick = emails.find(e => e.to.includes(ADMIN) && /New request/.test(e.subject));
+    expect(res.status === 200 && toNick && /1 document\(s\) attached\. 1 more could not be checked yet/.test(toNick.text), `email: ${toNick?.text}`);
 });
 const cron = () => keepaliveGET(new Request('https://site.test/api/keepalive', { headers: { authorization: 'Bearer test-cron' } }));
 const dayOld = new Date(Date.now() - 2 * 864e5).toISOString();
@@ -267,6 +284,13 @@ await check('F-05 if the alert email fails, nothing is marked and Stripe is aske
     resendUp = true;
     const retry = await webhook(s);
     expect(retry.status === 200 && reviewEvents(o).length === 1 && emails.some(e => /review/i.test(e.subject)), 'the retry did not alert Nick');
+});
+await check('F-05 with no Resend key, sendEmail reports that nothing was sent', async () => {
+    const key = process.env.RESEND_API_KEY;
+    delete process.env.RESEND_API_KEY;
+    const log = console.log; console.log = () => {};
+    try { expect(await orders.sendEmail({ to: ADMIN, subject: 'x', heading: 'x', lines: [] }) === false, 'reported as sent'); }
+    finally { process.env.RESEND_API_KEY = key; console.log = log; }
 });
 await check('F-05 an underpaid session is flagged, not applied', async () => {
     reset();

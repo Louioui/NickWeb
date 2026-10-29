@@ -25,7 +25,7 @@ export const GET = handle(async (request) => {
     // keep failing can't take the whole batch day after day: with a stable queue, every pending upload is reached within
     // ceil(pending / 100) days, however long the queue is. No cursor is stored; the day number picks the starting point.
     const pending = () => db().from('order_files').select('id, order_id, storage_path, filename')
-        .eq('uploaded', false).lt('created_at', dayAgo).order('created_at', { ascending: true });
+        .eq('uploaded', false).lt('created_at', dayAgo).order('created_at', { ascending: true }).order('id', { ascending: true });   // id breaks ties, so pages never overlap
     const { count: total, error: cErr } = await db().from('order_files').select('id', { count: 'exact', head: true })
         .eq('uploaded', false).lt('created_at', dayAgo);
     if (cErr) throw cErr;

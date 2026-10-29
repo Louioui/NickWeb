@@ -452,13 +452,15 @@ export async function inspectStoredFile(path, filename) {
 
 // Marks files uploaded only if the object really exists in storage, passes magic-byte inspection, and records a SHA-256
 // fingerprint. A disguised file is deleted; one that couldn't be read stays unconfirmed for the daily job to retry.
+// Returns { files: the confirmed files, stillChecking: how many couldn't be checked yet }, so messages can say so.
 export async function confirmUploads(orderId, fileIds) {
     const ids = uuidList(fileIds).slice(0, MAX_FILES);
-    if (!ids.length) return [];
+    if (!ids.length) return { files: [], stillChecking: 0 };
     const { data: rows, error } = await db().from('order_files').select('id, storage_path, filename, kind')
         .eq('order_id', orderId).in('id', ids);
     if (error) throw error;
     const done = [];
+    let stillChecking = 0;
     for (const r of rows) {
         const check = await inspectStoredFile(r.storage_path, r.filename);
         if (check.state === 'bad') {
@@ -466,12 +468,12 @@ export async function confirmUploads(orderId, fileIds) {
             await db().from('order_files').delete().eq('id', r.id);
             continue;
         }
-        if (check.state !== 'ok') continue;
+        if (check.state !== 'ok') { stillChecking++; continue; }
         const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id);
         if (uErr) throw uErr;
         done.push({ ...r, sha256: check.sha256 });
     }
-    return done;
+    return { files: done, stillChecking };
 }
 
 export async function signedDownload(path, filename) {

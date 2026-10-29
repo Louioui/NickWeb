@@ -35,7 +35,7 @@ export function createFakeSupabase() {
         gte(c, v) { this.filters.push(r => r[c] >= v); return this; }
         in(c, list) { this.filters.push(r => list.includes(r[c])); return this; }
         is(c, v) { this.filters.push(r => (r[c] ?? null) === v); return this; }
-        order(c, { ascending = true } = {}) { this.orderBy = { c, ascending }; return this; }
+        order(c, { ascending = true } = {}) { (this.orderBy ||= []).push({ c, ascending }); return this; }
         limit(n) { this.limitN = n; return this; }
         range(from, to) { this.offsetN = from; this.limitN = to - from + 1; return this; }
         single() { this.one = 'single'; return this; }
@@ -63,8 +63,13 @@ export function createFakeSupabase() {
             } else {
                 out = match.slice();
                 if (this.orderBy) {
-                    const { c, ascending } = this.orderBy;
-                    out.sort((a, b) => (a[c] < b[c] ? -1 : a[c] > b[c] ? 1 : 0) * (ascending ? 1 : -1));
+                    out.sort((a, b) => {
+                        for (const { c, ascending } of this.orderBy) {
+                            const d = (a[c] < b[c] ? -1 : a[c] > b[c] ? 1 : 0) * (ascending ? 1 : -1);
+                            if (d) return d;
+                        }
+                        return 0;
+                    });
                 }
                 if (this.offsetN) out = out.slice(this.offsetN);
                 if (this.limitN != null) out = out.slice(0, this.limitN);
@@ -137,9 +142,10 @@ export function createFakeSupabase() {
             verifyOtp: async ({ email, token }) => {
                 if (state.otp.get(email) !== token) return { data: {}, error: authError('Token has expired or is invalid', 'otp_expired') };
                 const user = state.users.get(email);
-                const access = `access-${randomUUID()}`;
+                const access = `access-${randomUUID()}`, refresh = `refresh-${randomUUID()}`;
                 state.sessions.set(access, email);
-                return { data: { user, session: { access_token: access, refresh_token: `refresh-${randomUUID()}` } }, error: null };
+                state.refreshTokens.set(refresh, email);
+                return { data: { user, session: { access_token: access, refresh_token: refresh } }, error: null };
             },
             getUser: async (access) => {
                 const email = state.sessions.get(access);

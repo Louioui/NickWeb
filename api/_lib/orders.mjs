@@ -216,7 +216,7 @@ export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, 
         // Locally the email is printed so the flow can be tested. In production it would put login codes and client details in the logs.
         if (IS_PROD) console.error(`Email not sent (RESEND_API_KEY is not set): "${subject.replace(/\d{6}/g, '######')}"`);
         else console.log(`\n[email not sent: no RESEND_API_KEY]\nTo: ${to}\nSubject: ${subject}\n${textBody}\n`);
-        return !IS_PROD;
+        return false;   // nothing was delivered, whatever was logged
     }
     const res = await fetch('https://api.resend.com/emails', {
         method: 'POST',

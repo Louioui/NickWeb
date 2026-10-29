@@ -198,7 +198,7 @@ export const POST = handle(async (request) => {
         if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Unlock it first.');
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
         if (order.status !== 'received') return json(await clientView(order, { unlocked }));
-        const uploaded = await confirmUploads(order.id, body.fileIds);
+        const { files: uploaded, stillChecking } = await confirmUploads(order.id, body.fileIds);
         if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} file${uploaded.length === 1 ? '' : 's'} added by you`);
         const { data: recentEvents } = await db().from('order_events').select('kind, title, created_at')
             .eq('order_id', order.id).order('created_at', { ascending: false }).limit(20);
@@ -213,7 +213,8 @@ export const POST = handle(async (request) => {
             to,
             subject: `${order.code}: client sent the information you asked for`,
             heading: `${order.client_name} responded`,
-            lines: [`Request ${order.code} (${order.recipient_name}) is back in your queue.`, uploaded.length ? `${uploaded.length} new file(s) attached.` : 'No new files.'],
+            lines: [`Request ${order.code} (${order.recipient_name}) is back in your queue.`, uploaded.length ? `${uploaded.length} new file(s) attached.` : 'No new files.',
+                ...(stillChecking ? [`${stillChecking} more file(s) could not be checked yet; they will appear on the order once checked.`] : [])],
             button: { label: 'Open in your dashboard', url: `${origin}/admin.html#${order.id}` },
         })));
         return json(await clientView(await orderByToken(body.t), { unlocked }));
