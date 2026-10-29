@@ -209,6 +209,12 @@ await check('F-04 daily cleanup keeps a file row when storage cannot be reached'
     await cron();
     expect(fileRow(f.id) && fileRow(f.id).uploaded === false, 'row deleted or confirmed after a storage error');
 });
+await check('F-04 a "bucket not found" error is not taken as a missing upload', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { created_at: dayOld });
+    db.__state.noBucket.add(f.storage_path);
+    await cron();
+    expect(fileRow(f.id) && fileRow(f.id).uploaded === false, 'row deleted after a bucket error');
+});
 await check('F-04 daily cleanup still removes an upload that never reached storage', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o, { created_at: dayOld });
     db.__state.storage.delete(f.storage_path);

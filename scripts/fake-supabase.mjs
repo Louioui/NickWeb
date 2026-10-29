@@ -10,7 +10,8 @@ export function createFakeSupabase() {
         tables: {},
         storage: new Map(),          // path -> Uint8Array
         failDownload: new Set(),     // paths whose download returns an error
-        failExists: new Set(),       // paths whose exists() returns an error
+        failExists: new Set(),       // paths whose info() fails with an auth error (storage unusable, not "missing")
+        noBucket: new Set(),         // paths whose info() fails with "Bucket not found"
         rateHits: new Map(),
         otp: new Map(),              // email -> code accepted by auth.verifyOtp
         users: new Map(),            // email -> user
@@ -108,10 +109,12 @@ export function createFakeSupabase() {
     };
 
     const bucket = {
-        // Like storage-js: a missing object is { data: false, error } (HTTP 404); an outage is an error without data.
-        exists: async (p) => {
-            if (state.failExists.has(p)) return { data: null, error: { message: 'storage unavailable' } };
-            return state.storage.has(p) ? { data: true, error: null } : { data: false, error: { message: 'Object not found', status: 404 } };
+        // Error shapes as storage-js builds them from the storage server's JSON (StorageApiError: status, statusCode, code).
+        info: async (p) => {
+            if (state.failExists.has(p)) return { data: null, error: { message: 'invalid signature', status: 400, statusCode: '403', code: 'InvalidJWT' } };
+            if (state.noBucket.has(p)) return { data: null, error: { message: 'Bucket not found', status: 400, statusCode: '404', code: 'NoSuchBucket' } };
+            if (!state.storage.has(p)) return { data: null, error: { message: 'Object not found', status: 400, statusCode: '404', code: 'not_found' } };
+            return { data: { name: p, size: state.storage.get(p).length }, error: null };
         },
         download: async (p) => {
             if (state.failDownload.has(p) || !state.storage.has(p)) return { data: null, error: { message: 'download failed' } };
@@ -156,7 +159,7 @@ export function createFakeSupabase() {
     client.__state = state;
     client.__reset = () => {
         state.tables = {};
-        for (const k of ['storage', 'failDownload', 'failExists', 'rateHits', 'otp', 'users', 'sessions', 'refreshTokens']) state[k].clear();
+        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'rateHits', 'otp', 'users', 'sessions', 'refreshTokens']) state[k].clear();
         state.revoked = [];
     };
     client.__addUser = (email) => {

@@ -424,15 +424,23 @@ export function verifyFileMagic(bytes, filename) {
     return false;
 }
 
+// True only when storage positively says the object isn't there. A bad key, a missing bucket or anything unclear is not
+// "missing" (exists() can't tell these apart: its HEAD request has no error body and it reports every 400/404 as absent).
+function isMissingObject(err) {
+    const code = String(err?.code ?? '');
+    const message = String(err?.message ?? '');
+    if (/bucket/i.test(`${code} ${message}`)) return false;
+    return String(err?.statusCode ?? '') === '404' || /^(NoSuchKey|not_found)$/i.test(code) || /object not found/i.test(message);
+}
+
 // Reads a stored upload and checks it. Returns { state: 'ok', sha256 }, 'bad' (the bytes are not what the name claims),
-// or 'unknown' (storage couldn't be reached). Like the rest of supabase-js, these calls report failures as { error }
-// instead of throwing, so each one is checked: nothing is ever accepted without being inspected.
+// 'missing' (storage confirms it never arrived), or 'unknown' (anything else: retried later, never deleted). Like the rest
+// of supabase-js, these calls report failures as { error } instead of throwing, so each one is checked.
 export async function inspectStoredFile(path, filename) {
     try {
-        // exists() answers a missing object (HTTP 400/404) with { data: false, error }; other failures throw.
-        const { data: exists, error: xErr } = await db().storage.from(BUCKET).exists(path);
-        if (exists === false) return { state: 'missing' };
-        if (xErr || exists !== true) return { state: 'unknown' };
+        const { data: info, error: iErr } = await db().storage.from(BUCKET).info(path);
+        if (iErr) return { state: isMissingObject(iErr) ? 'missing' : 'unknown' };
+        if (!info) return { state: 'unknown' };
         const { data: blob, error: dErr } = await db().storage.from(BUCKET).download(path);
         if (dErr || !blob) return { state: 'unknown' };
         const buf = Buffer.from(await blob.arrayBuffer());
