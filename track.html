@@ -235,7 +235,7 @@
             const { url } = await NPS.post('/api/track', { t: token, action: 'download', fileId: btn.dataset.file }, { notify: false });
             location.href = url;
         } catch (err) {
-            alert(err.message);
+            btn.insertAdjacentHTML('afterend', `<span class="text-xs text-[#7a1f1c]">${esc(err.message)}</span>`);
         } finally {
             btn.disabled = false;
         }

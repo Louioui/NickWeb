@@ -32,9 +32,10 @@ export const STATUSES = {
 export const money = (cents) => '$' + (cents / 100).toFixed(2);
 
 export function estimate(tier, addonKeys) {
+    if (typeof tier !== 'string' || !Object.hasOwn(TIERS, tier)) throw new HttpError(400, 'Please choose a service tier.');
     const t = TIERS[tier];
-    if (!t) throw new HttpError(400, 'Please choose a service tier.');
-    const keys = [...new Set((Array.isArray(addonKeys) ? addonKeys : []).filter(k => ADDONS[k]))];
+    // hasOwn, not ADDONS[k]: "constructor" or "__proto__" would otherwise pass and turn the price into NaN.
+    const keys = [...new Set((Array.isArray(addonKeys) ? addonKeys : []).filter(k => typeof k === 'string' && Object.hasOwn(ADDONS, k)))];
     return { keys, cents: t.cents + keys.reduce((s, k) => s + ADDONS[k].cents, 0) };
 }
 

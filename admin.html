@@ -214,7 +214,12 @@
             renderList();
             $('detail-pane').scrollIntoView({ behavior: 'smooth', block: 'start' });
         } catch (err) {
-            if (err.status !== 401) alert(err.message);
+            if (err.status === 401) return;
+            current = null;
+            history.replaceState(null, '', location.pathname);
+            $('detail').classList.add('hidden');
+            $('detail-empty').classList.remove('hidden');
+            $('detail-empty').innerHTML = `<p class="result-box result-err text-left">${esc(err.status === 404 ? "That job wasn't found. It may have been opened from an old link." : err.message)}</p>`;
         }
     }
 
@@ -398,7 +403,7 @@
             const { url } = await api('file-url', { fileId });
             location.href = url;   // the link is sent as a download, so the dashboard stays open
         } catch (err) {
-            if (err.status !== 401) alert(err.message);
+            if (err.status !== 401) btn.insertAdjacentHTML('afterend', `<span class="text-xs text-[#7a1f1c]">${esc(err.message)}</span>`);
         } finally {
             btn.disabled = false;
         }

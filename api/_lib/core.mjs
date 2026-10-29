@@ -53,19 +53,23 @@ export async function readJson(request, maxBytes = 64 * 1024) {
     try { return text ? JSON.parse(text) : {}; } catch { throw new HttpError(400, 'Invalid request.'); }
 }
 
+// Vercel sets x-real-ip itself; the first x-forwarded-for entry is only a fallback for local testing.
 export function clientIp(request) {
-    return (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'local';
+    return request.headers.get('x-real-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'local';
 }
 
+// Links in emails always point at the real domain in production, whatever address the request came in on.
 export function siteOrigin(request) {
-    return process.env.SITE_URL || new URL(request.url).origin;
+    return process.env.SITE_URL || (IS_PROD ? 'https://nicksprocessservices.dev' : new URL(request.url).origin);
 }
 
 export function getCookie(request, name) {
     const raw = request.headers.get('cookie') || '';
     for (const part of raw.split(';')) {
         const [k, ...v] = part.trim().split('=');
-        if (k === name) return decodeURIComponent(v.join('='));
+        if (k === name) {
+            try { return decodeURIComponent(v.join('=')); } catch { return null; }   // malformed cookie: treat as logged out
+        }
     }
     return null;
 }
@@ -114,9 +118,10 @@ export function cleanFileList(files) {
     if (files.length > MAX_FILES) throw new HttpError(400, `Please attach at most ${MAX_FILES} files.`);
     return files.map(f => {
         const name = text(f?.name, { max: 180, required: true, label: 'File name' });
-        const ext = name.split('.').pop().toLowerCase();
-        const type = ALLOWED_TYPES.has(f?.type) ? f.type : TYPE_BY_EXT[ext];
-        if (!type) throw new HttpError(400, `${name}: only PDF, Word, JPG, PNG or HEIC files can be uploaded.`);
+        // The type comes from the extension, never from what the browser claims, so "notes.html" labeled as a PDF is refused.
+        const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
+        const type = TYPE_BY_EXT[ext];
+        if (!type || !ALLOWED_TYPES.has(type)) throw new HttpError(400, `${name}: only PDF, Word, JPG, PNG or HEIC files can be uploaded.`);
         const size = Number(f?.size) || 0;
         if (size <= 0 || size > MAX_FILE_BYTES) throw new HttpError(400, `${name} is larger than 25 MB.`);
         return { name, type, size };

@@ -555,19 +555,19 @@
                         <div class="grid sm:grid-cols-2 gap-5 mb-9">
                             <div>
                                 <label for="client-name" class="field-label">Full Name *</label>
-                                <input type="text" id="client-name" required autocomplete="name" placeholder="e.g. Jordan Vance" class="field">
+                                <input type="text" id="client-name" maxlength="120" required autocomplete="name" placeholder="e.g. Jordan Vance" class="field">
                             </div>
                             <div>
                                 <label for="client-firm" class="field-label">Law Firm or Organization</label>
-                                <input type="text" id="client-firm" autocomplete="organization" placeholder="Optional (or private individual)" class="field">
+                                <input type="text" id="client-firm" maxlength="160" autocomplete="organization" placeholder="Optional (or private individual)" class="field">
                             </div>
                             <div>
                                 <label for="client-email" class="field-label">Email *</label>
-                                <input type="email" id="client-email" required autocomplete="email" placeholder="name@example.com" class="field">
+                                <input type="email" id="client-email" maxlength="200" required autocomplete="email" placeholder="name@example.com" class="field">
                             </div>
                             <div>
                                 <label for="client-phone" class="field-label">Phone Number *</label>
-                                <input type="tel" id="client-phone" required autocomplete="tel" placeholder="(562) 555-0144" class="field">
+                                <input type="tel" id="client-phone" maxlength="40" required autocomplete="tel" placeholder="(562) 555-0144" class="field">
                             </div>
                         </div>
 
@@ -575,15 +575,15 @@
                         <div class="grid sm:grid-cols-2 gap-5 mb-5">
                             <div>
                                 <label for="serve-casenum" class="field-label">Court Case Number (If Assigned)</label>
-                                <input type="text" id="serve-casenum" placeholder="e.g. 24LBUD01942" class="field">
+                                <input type="text" id="serve-casenum" maxlength="80" placeholder="e.g. 24LBUD01942" class="field">
                             </div>
                             <div>
                                 <label for="serve-court" class="field-label">Court</label>
-                                <input type="text" id="serve-court" placeholder="e.g. LA Superior Court, Long Beach" class="field">
+                                <input type="text" id="serve-court" maxlength="160" placeholder="e.g. LA Superior Court, Long Beach" class="field">
                             </div>
                             <div>
                                 <label for="serve-reference" class="field-label">Your Reference / Matter #</label>
-                                <input type="text" id="serve-reference" placeholder="Optional, for your own records" class="field">
+                                <input type="text" id="serve-reference" maxlength="80" placeholder="Optional, for your own records" class="field">
                             </div>
                             <div>
                                 <label for="serve-deadline" class="field-label">Hearing or Statutory Deadline</label>
@@ -614,7 +614,7 @@
                         <div class="grid sm:grid-cols-2 gap-5 mb-5">
                             <div>
                                 <label for="serve-recipient" class="field-label">Full Legal Name *</label>
-                                <input type="text" id="serve-recipient" required placeholder="As it appears on the documents" class="field">
+                                <input type="text" id="serve-recipient" maxlength="160" required placeholder="As it appears on the documents" class="field">
                             </div>
                             <div>
                                 <label for="serve-doctype" class="field-label">Document Type *</label>
@@ -636,15 +636,15 @@
                         <div class="grid sm:grid-cols-6 gap-5 mb-5">
                             <div class="sm:col-span-4">
                                 <label for="serve-address" class="field-label">Street Address *</label>
-                                <input type="text" id="serve-address" required autocomplete="off" placeholder="123 W Ocean Blvd" class="field">
+                                <input type="text" id="serve-address" maxlength="200" required autocomplete="off" placeholder="123 W Ocean Blvd" class="field">
                             </div>
                             <div class="sm:col-span-2">
                                 <label for="serve-unit" class="field-label">Unit / Apt #</label>
-                                <input type="text" id="serve-unit" placeholder="Apt 4B" class="field">
+                                <input type="text" id="serve-unit" maxlength="40" placeholder="Apt 4B" class="field">
                             </div>
                             <div class="sm:col-span-4">
                                 <label for="serve-city" class="field-label">City *</label>
-                                <input type="text" id="serve-city" required placeholder="Long Beach" class="field">
+                                <input type="text" id="serve-city" maxlength="80" required placeholder="Long Beach" class="field">
                             </div>
                             <div class="sm:col-span-2">
                                 <label for="serve-zip" class="field-label">ZIP Code *</label>
@@ -657,11 +657,11 @@
                         <div class="grid gap-5">
                             <div>
                                 <label for="serve-access" class="field-label">Gate Code / Building Access</label>
-                                <input type="text" id="serve-access" placeholder="e.g. Gate code #1492, call box under &quot;Vance&quot;" class="field">
+                                <input type="text" id="serve-access" maxlength="500" placeholder="e.g. Gate code #1492, call box under &quot;Vance&quot;" class="field">
                             </div>
                             <div>
                                 <label for="serve-physical" class="field-label">Description &amp; Best Times</label>
-                                <textarea id="serve-physical" class="field h-24 resize-none" placeholder="e.g. Tall, gray beard. Silver Honda Civic in driveway. Usually home after 6pm. Dog in the yard."></textarea>
+                                <textarea id="serve-physical" maxlength="1000" class="field h-24 resize-none" placeholder="e.g. Tall, gray beard. Silver Honda Civic in driveway. Usually home after 6pm. Dog in the yard."></textarea>
                             </div>
                         </div>
                         <div class="wizard-nav">
@@ -727,7 +727,7 @@
 
                         <div class="mb-9">
                             <label for="special-instructions" class="field-label">Anything Else Nick Should Know</label>
-                            <textarea id="special-instructions" class="field h-24 resize-none" placeholder="e.g. Subject works nights, try mornings. Call me before the first attempt."></textarea>
+                            <textarea id="special-instructions" maxlength="2000" class="field h-24 resize-none" placeholder="e.g. Subject works nights, try mornings. Call me before the first attempt."></textarea>
                         </div>
 
                         <h3 class="serif-title text-xl mb-5 pb-5 rule-b">Review Your Request</h3>
@@ -994,11 +994,11 @@
             <form id="track-form" onsubmit="lookupOrder(event)" class="space-y-3 mb-5">
                 <div>
                     <label for="track-input" class="field-label">Reference Number</label>
-                    <input type="text" id="track-input" required placeholder="NP-123456" autocomplete="off" class="field uppercase">
+                    <input type="text" id="track-input" maxlength="20" required placeholder="NP-123456" autocomplete="off" class="field uppercase">
                 </div>
                 <div>
                     <label for="track-email" class="field-label">Email Used on the Request</label>
-                    <input type="email" id="track-email" required autocomplete="email" placeholder="name@example.com" class="field">
+                    <input type="email" id="track-email" maxlength="200" required autocomplete="email" placeholder="name@example.com" class="field">
                 </div>
                 <button type="submit" class="btn btn-pine w-full">Email My Tracking Link</button>
             </form>
@@ -1680,8 +1680,10 @@
         }
 
         // --- Service Request Submission: create the order, upload documents straight to private storage, then send the emails ---
+        let submitting = false;
         async function handleOrderSubmit(e) {
             e.preventDefault();
+            if (submitting) return;                                          // a second click or Enter while sending does nothing
             if (currentStep < 3) { goToStep(currentStep + 1); return; }   // Enter in an earlier step moves forward
             showSubmitError('');
             for (const step of [1, 2]) {
@@ -1697,6 +1699,7 @@
 
             const btn = document.getElementById('submit-request-btn');
             const btnLabel = btn.textContent;
+            submitting = true;
             btn.disabled = true;
             btn.textContent = 'Sending your request…';
             const files = attachedFiles.slice();
@@ -1729,6 +1732,7 @@
             } catch (err) {
                 showSubmitError(err.message);
             } finally {
+                submitting = false;
                 btn.disabled = false;
                 btn.textContent = btnLabel;
             }

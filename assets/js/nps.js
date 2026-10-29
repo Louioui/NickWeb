@@ -46,8 +46,8 @@ const NPS = (() => {
     };
     const get = (path) => request('GET', path);
 
-    // Some phones leave file.type empty for HEIC photos; fall back to the extension so storage accepts them.
-    const typeFor = (file) => file.type || TYPE_BY_EXT[file.name.split('.').pop().toLowerCase()] || '';
+    // Like the server, the type comes from the extension (phones also leave file.type empty for HEIC photos).
+    const typeFor = (file) => (file.name.includes('.') && TYPE_BY_EXT[file.name.split('.').pop().toLowerCase()]) || '';
     const fileMeta = (file) => ({ name: file.name, size: file.size, type: typeFor(file) });
 
     // Returns an error message for the first problem with the chosen files, or '' when they are fine.

@@ -4,7 +4,7 @@ import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie,
          sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload,
          HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail } from './_lib/orders.mjs';
-import { createCheckout } from './_lib/stripe.mjs';
+import { createCheckout, stripeClient } from './_lib/stripe.mjs';
 
 const COOKIE = 'nps_admin';
 const SESSION_DAYS = 14;
@@ -31,6 +31,7 @@ export const POST = handle(async (request) => {
 // --- Login: a 6-digit code emailed to an allowed address, then a session cookie ---
 async function sendCode(request, body) {
     await rateLimit(`admin-code:${clientIp(request)}`, 5, 900);
+    await rateLimit('admin-code:all', 30, 3600);   // caps login emails to Nick even if many computers try at once
     const addr = email(body.email);
     if (ADMIN_EMAILS.includes(addr)) {
         const code = String(randomInt(0, 1000000)).padStart(6, '0');
@@ -50,14 +51,10 @@ async function verifyCode(request, body) {
     await rateLimit(`admin-verify:${clientIp(request)}`, 10, 900);
     const addr = email(body.email);
     const code = String(body.code || '').replace(/\D/g, '');
-    const { data: row } = await db().from('admin_codes').select('*').eq('email', addr).eq('used', false)
-        .gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(1).maybeSingle();
-    if (!row || row.attempts >= 5) throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
-    if (row.code_hash !== sha256(`${addr}:${code}`)) {
-        await db().from('admin_codes').update({ attempts: row.attempts + 1 }).eq('id', row.id);
-        throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
-    }
-    await db().from('admin_codes').update({ used: true }).eq('id', row.id);
+    // Checked and counted in one locked database step (use_admin_code), so parallel guesses can't get past 5 tries per code.
+    const { data: ok, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${code}`) });
+    if (error) throw error;
+    if (!ok) throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
     const token = randomToken(32);
     await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
     const secure = new URL(request.url).protocol === 'https:' ? ' Secure;' : '';
@@ -88,11 +85,13 @@ async function list() {
 }
 
 // A job "has a client reply" when the client's answer is newer than anything Nick has done on it since.
+// Only "received" jobs can be in that state (answering sets it), which keeps the id list short enough for one query.
 const NICK_KINDS = ['action', 'status', 'attempt', 'payment', 'proof'];
 async function withClientReplied(list) {
-    if (!list.length) return list;
+    const ids = list.filter(o => o.status === 'received').map(o => o.id).slice(0, 150);
+    if (!ids.length) return list.map(o => ({ ...o, client_replied: false }));
     const { data: evs, error } = await db().from('order_events').select('order_id, kind')
-        .in('order_id', list.map(o => o.id)).in('kind', [...NICK_KINDS, 'action_response'])
+        .in('order_id', ids).in('kind', [...NICK_KINDS, 'action_response'])
         .order('created_at', { ascending: false }).limit(5000);
     if (error) throw error;
     const latest = new Map();
@@ -170,6 +169,10 @@ async function paymentLink(request, body) {
     if (order.paid_at) throw new HttpError(409, 'This order is already paid.');
     const description = text(body.description, { max: 300 });
     const origin = siteOrigin(request);
+    // A new link replaces the old one: close the old checkout so the client can't end up paying twice.
+    if (order.stripe_session_id) {
+        await stripeClient().checkout.sessions.expire(order.stripe_session_id).catch(() => {});   // already paid/expired is fine
+    }
     const session = await createCheckout(order, cents, description, origin);
     await db().from('orders').update({ status: 'awaiting_payment', amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id }).eq('id', order.id);
     await addEvent(order.id, 'payment', `Payment requested: ${money(cents)}`, description);

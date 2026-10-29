@@ -3,7 +3,8 @@
   "private": true,
   "description": "Nick's Process Services: hand-written pages (index, track, admin) plus Vercel functions in api/. The CSS inside each page is compiled from src/input.css (npm run build).",
   "scripts": {
-    "build": "tailwindcss -c tailwind.config.js -i src/input.css -o build/site.css --minify && node scripts/inline-css.js"
+    "build": "tailwindcss -c tailwind.config.js -i src/input.css -o build/site.css --minify && node scripts/inline-css.js",
+    "test": "node scripts/check-inputs.mjs"
   },
   "devDependencies": {
     "tailwindcss": "3.4.17"
