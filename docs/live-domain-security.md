@@ -26,7 +26,7 @@ database. The notes repeat several sections two or three times; each item appear
 
 | # | Item | Status | Notes |
 |---|---|---|---|
-| 1 | SPF, DKIM and DMARC `p=reject` | **Needs you** | No email records exist today, so anyone can send mail as the domain (see "DNS records to add" below). |
+| 1 | SPF, DKIM and DMARC `p=reject` | **Done** (SPF, DMARC) / **Needs you** (DKIM) | Added 2026-10-29 and confirmed in public DNS: `v=spf1 -all`, `_dmarc` `p=reject`, and a null MX. DKIM comes from Resend when the domain is added there. |
 | 2 | Cloudflare Turnstile | **Needs Nick** | Adds a check to the public request form, which is visible to clients. Per-IP and per-email limits plus the Vercel firewall rule cover most abuse until then. |
 | 3 | Stripe webhook signing secret | Done (code) / **Needs you** (secret) | The signature check is built. Set `STRIPE_WEBHOOK_SECRET` when the webhook endpoint is added. |
 
@@ -121,8 +121,8 @@ and keys the recovery codes and tracking-page unlock tokens.
 - If Nick is ever locked out, run this in the Supabase SQL editor to turn two-step off:
   `update admin_totp set enabled = false where email = 'nicksprocessservices@outlook.com';`
 
-## DNS records to add (need your OK; DNS is in Vercel → Domains → nicksprocessservices.dev)
-Nothing sends email from this domain yet, so these are safe to add now, and they block spoofing at once:
+## DNS records (added 2026-10-29 with your OK; DNS is in Vercel → Domains → nicksprocessservices.dev)
+Nothing sends email from this domain yet, so these were safe to add, and they block spoofing at once. All three are live:
 
 | Type | Name | Value |
 |---|---|---|
