@@ -134,6 +134,15 @@ await check('F-01 the cookie from a real sign-in renews once its access token ex
     expect(res.status === 200 && /nps_client=/.test(res.headers.get('set-cookie') || ''), `renewal failed (${res.status})`);
 });
 
+await check('F-01 "sign out everywhere" ends every session of that client', async () => {
+    reset(); db.__addUser(CLIENT); db.__state.otp.set(CLIENT, '111111');
+    const first = (await clientPOST(post('/api/client', { action: 'verify-code', email: CLIENT, code: '111111' }))).headers.get('set-cookie').split(';')[0];
+    const second = (await clientPOST(post('/api/client', { action: 'verify-code', email: CLIENT, code: '111111' }))).headers.get('set-cookie').split(';')[0];
+    await clientPOST(post('/api/client', { action: 'logout-all' }, { cookie: first }));
+    const res = await clientPOST(post('/api/client', { action: 'list' }, { cookie: second }));
+    expect(res.status === 401 && db.__state.refreshTokens.size === 0, `other session still works (${res.status})`);
+});
+
 // --- F-02: email code first, then PIN; no lockout or PIN oracle without the email code ---
 await check('F-02 a wrong email code gives the same answer whether the PIN is right or wrong', async () => {
     reset(); db.__addUser(CLIENT); setPin(CLIENT); db.__state.otp.set(CLIENT, '111111');
@@ -233,6 +242,14 @@ await check('F-04 a proof upload with an unchecked file does not mark the order 
     db.__state.failDownload.clear();
     const retry = await adminPOST(post('/api/admin', { action: 'proof-finish', id: o.id, fileIds: [good.id, slow.id], markServed: true }, { cookie: adminCookie() }));
     expect(retry.status === 200 && o.status === 'served' && emails.some(e => e.to.includes(CLIENT)), `retry failed (${retry.status})`);
+});
+await check('F-04 a proof file that fails the file check stops the order being marked served', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' });
+    const good = seedFile(o, { kind: 'proof' }); const fake = seedFile(o, { kind: 'proof' });
+    db.__state.storage.set(fake.storage_path, new TextEncoder().encode('<html><script>alert(1)</script></html>'));
+    const res = await adminPOST(post('/api/admin', { action: 'proof-finish', id: o.id, fileIds: [good.id, fake.id], markServed: true }, { cookie: adminCookie() }));
+    expect(res.status === 400 && o.status === 'attempting' && !emails.some(e => e.to.includes(CLIENT)), `status ${res.status}, order ${o.status}`);
+    expect(!fileRow(fake.id), 'the disguised file was kept');
 });
 await check('F-04 the tracking page is told when a reply file is still being checked', async () => {
     reset(); const o = seedOrder({ status: 'received' }); const slow = seedFile(o, { kind: 'action_upload' });

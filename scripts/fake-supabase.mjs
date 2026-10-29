@@ -161,10 +161,15 @@ export function createFakeSupabase() {
                 state.sessions.set(access, email); state.refreshTokens.set(refresh, email); state.pairs.set(access, refresh);
                 return { data: { user: state.users.get(email), session: { access_token: access, refresh_token: refresh } }, error: null };
             },
-            // Like Supabase, signing a session out also revokes its refresh token.
-            admin: { signOut: async (access) => {
-                state.refreshTokens.delete(state.pairs.get(access)); state.pairs.delete(access);
-                state.sessions.delete(access); state.revoked.push(access);
+            // Like Supabase: signing a session out also revokes its refresh token; scope 'global' signs out every session
+            // of that user.
+            admin: { signOut: async (access, scope = 'global') => {
+                const email = state.sessions.get(access);
+                const targets = scope === 'global' && email ? [...state.sessions].filter(([, e]) => e === email).map(([a]) => a) : [access];
+                for (const a of targets) {
+                    state.refreshTokens.delete(state.pairs.get(a)); state.pairs.delete(a);
+                    state.sessions.delete(a); state.revoked.push(a);
+                }
                 return { data: null, error: null };
             } },
         },

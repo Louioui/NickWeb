@@ -453,21 +453,23 @@ export async function inspectStoredFile(path, filename) {
 // Marks files uploaded only if the object really exists in storage, passes magic-byte inspection, and records a SHA-256
 // fingerprint. A disguised file is deleted; one that couldn't be read stays unconfirmed for the daily job to retry.
 // Returns { files: the confirmed files, stillChecking: how many couldn't be read yet (retried later), missing: how many
-// never reached storage }, so callers can say exactly what happened.
+// never reached storage, rejected: how many failed the file check and were deleted }, so callers can say what happened.
 export async function confirmUploads(orderId, fileIds) {
     const ids = uuidList(fileIds).slice(0, MAX_FILES);
-    if (!ids.length) return { files: [], stillChecking: 0, missing: 0 };
+    if (!ids.length) return { files: [], stillChecking: 0, missing: 0, rejected: 0 };
     const { data: rows, error } = await db().from('order_files').select('id, storage_path, filename, kind')
         .eq('order_id', orderId).in('id', ids);
     if (error) throw error;
     const done = [];
     let stillChecking = 0;
     let missing = 0;
+    let rejected = 0;
     for (const r of rows) {
         const check = await inspectStoredFile(r.storage_path, r.filename);
         if (check.state === 'bad') {
             await db().storage.from(BUCKET).remove([r.storage_path]).catch(() => {});
             await db().from('order_files').delete().eq('id', r.id);
+            rejected++;
             continue;
         }
         if (check.state === 'missing') { missing++; continue; }
@@ -476,7 +478,7 @@ export async function confirmUploads(orderId, fileIds) {
         if (uErr) throw uErr;
         done.push({ ...r, sha256: check.sha256 });
     }
-    return { files: done, stillChecking, missing };
+    return { files: done, stillChecking, missing, rejected };
 }
 
 export async function signedDownload(path, filename) {

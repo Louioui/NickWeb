@@ -665,9 +665,9 @@
                 if (problem) throw new Error(problem);
                 const { uploads } = await api('proof-upload', { id, files: files.map(NPS.fileMeta) });
                 const up = await NPS.uploadAll(uploads, files);
-                if (!up.ok.length) throw new Error('The upload did not finish. Please try again.');
+                // Proof is all or nothing: if any file didn't upload, nothing is marked served or sent to the client.
+                if (up.failed.length) throw new Error(`${up.failed.join(', ')} did not upload, so nothing was sent to the client. Please try the upload again.`);
                 current = await api('proof-finish', { id, fileIds: up.ok, markServed: on('f-served') });
-                if (up.failed.length) partialUpload = ` Saved the uploaded files, but ${up.failed.join(', ')} did not upload. Select those files again to retry.`;
             }
             drafts.delete(savedKey);
             formDirty = false;

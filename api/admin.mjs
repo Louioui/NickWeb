@@ -497,7 +497,8 @@ async function proofFinish(request, body) {
     const order = await getOrder(body.id);
     // All or nothing: the order is marked served and the client emailed only once every proof file is stored and checked.
     // Files already checked stay checked, so trying again only re-checks the rest.
-    const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
+    const { files: uploaded, stillChecking, missing, rejected } = await confirmUploads(order.id, body.fileIds);
+    if (rejected) throw new HttpError(400, `${rejected} file(s) failed the file check (not a real PDF, Word file or photo) and were removed. Nothing was sent to the client. Upload the proof again.`);
     if (stillChecking) throw new HttpError(503, `${stillChecking} file(s) were stored but couldn't be checked yet. Nothing was sent to the client. Please try again in a minute.`);
     if (missing || !uploaded.length) throw new HttpError(400, 'The upload did not finish. Nothing was sent to the client. Please upload the proof again.');
     const detailText = uploaded.map(u => u.sha256 ? `${u.filename} (SHA-256: ${u.sha256.slice(0, 12)}…)` : u.filename).join(', ');
