@@ -3,7 +3,7 @@
 //   { step: 'finish', t, fileIds }                           -> confirms uploads and sends the emails
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, email, phone as cleanPhone, cleanDate,
          cleanFileList, prepareUploads, confirmUploads, addEvent, randomToken, orderCode, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
-import { TIERS, ADDONS, estimate, money, orderByToken, sendEmail } from './_lib/orders.mjs';
+import { TIERS, ADDONS, estimate, money, orderByToken, cleanTrackToken, sendEmail } from './_lib/orders.mjs';
 
 const DOC_TYPES = ['Summons & Complaint', 'Subpoena (Civil, Criminal, or Federal)', 'Writ of Garnishment', 'Small Claims Documents',
     'Eviction Notice', 'Divorce Papers', 'Child Custody & Support Order', 'Restraining Order', 'Order to Show Cause',
@@ -66,6 +66,8 @@ export const POST = handle(async (request) => {
 });
 
 async function finish(request, body) {
+    cleanTrackToken(body.t);
+    await rateLimit(`request-finish:${clientIp(request)}`, 30, 900);
     const order = await orderByToken(body.t);
     if (order.created_at < new Date(Date.now() - 60 * 60 * 1000).toISOString()) return json({ ok: true });  // only right after creating
     const uploaded = await confirmUploads(order.id, body.fileIds);

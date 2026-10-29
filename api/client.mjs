@@ -1,5 +1,5 @@
 // Passwordless client accounts. No admin actions and no client-supplied ownership filters.
-import { db, handle, json, readJson, rateLimit, clientIp, email, text, sha256, HttpError } from './_lib/core.mjs';
+import { db, handle, json, readJson, rateLimit, clientIp, siteOrigin, email, text, sha256, HttpError } from './_lib/core.mjs';
 import { clientAuth, clientCookie, savedClientSession, requireClient, verifiedClient, clientProfile } from './_lib/clients.mjs';
 import { STATUSES, TIERS, money } from './_lib/orders.mjs';
 export const POST = handle(async request => {
@@ -12,7 +12,7 @@ export const POST = handle(async request => {
         const signup = body.intent === 'signup';
         const name = signup ? text(body.name, { max: 120, required: true, label: 'Full name' }) : null;
         const firm = signup ? text(body.firm, { max: 160, label: 'Firm' }) : null;
-        const origin = new URL(request.url).origin;
+        const origin = siteOrigin(request);
         const { error } = await clientAuth().auth.signInWithOtp({ email: addr, options: {
             shouldCreateUser: signup, emailRedirectTo: `${origin}/account.html`, ...(signup ? { data: { full_name: name, firm } } : {}),
         } });

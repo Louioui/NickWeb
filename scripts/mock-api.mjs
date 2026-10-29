@@ -177,13 +177,47 @@ function prepareUploads(orderId, kind, list) {
         return { fileId: id, name, uploadUrl: `/__mock-upload/${id}` };
     });
 }
+function verifyFileMagic(bytes, filename) {
+    if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > 25 * 1024 * 1024) return false;
+    const ext = typeof filename === 'string' && filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
+    if (ext === 'pdf') {
+        return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
+    }
+    if (ext === 'docx') {
+        return bytes[0] === 0x50 && bytes[1] === 0x4B && bytes[2] === 0x03 && bytes[3] === 0x04;
+    }
+    if (ext === 'jpg' || ext === 'jpeg') {
+        return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
+    }
+    if (ext === 'png') {
+        return bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
+            bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A;
+    }
+    if (ext === 'webp') {
+        return bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+            bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
+    }
+    if (ext === 'heic' || ext === 'heif') {
+        if (bytes.length < 12 || bytes[4] !== 0x66 || bytes[5] !== 0x74 || bytes[6] !== 0x79 || bytes[7] !== 0x70) return false;
+        const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+        return /^(?:heic|heix|hevc|hevx|heim|heis|hevm|hevs|mif1|msf1)$/.test(brand);
+    }
+    return false;
+}
 function confirmUploads(orderId, ids) {
-    return (Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && UUID_RE.test(id)).map(id => files.get(id.toLowerCase()))
-        .filter(f => f && f.order_id === orderId && f.data).map(f => {
-            f.uploaded = true;
-            if (!f.sha256) f.sha256 = sha256Hex(f.data);
-            return f;
-        });
+    const out = [];
+    for (const id of (Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && UUID_RE.test(id))) {
+        const f = files.get(id.toLowerCase());
+        if (!f || f.order_id !== orderId || !f.data) continue;
+        if (!verifyFileMagic(f.data, f.filename)) {
+            files.delete(f.id);
+            continue;
+        }
+        f.uploaded = true;
+        if (!f.sha256) f.sha256 = sha256Hex(f.data);
+        out.push(f);
+    }
+    return out;
 }
 
 function markPaid(o, sessionId) {
@@ -363,6 +397,12 @@ const handlers = {
                 ok = true;
             }
             if (!ok) fail(401, 'That code is wrong or expired. Request a new one.');
+            const existingForAdmin = [...sessionEmails.entries()].filter(([, em]) => em === addr).map(([tok]) => tok);
+            while (existingForAdmin.length >= 5) {
+                const oldest = existingForAdmin.shift();
+                sessions.delete(oldest);
+                sessionEmails.delete(oldest);
+            }
             const t = token();
             sessions.add(t);
             sessionEmails.set(t, addr);
@@ -515,11 +555,13 @@ export async function handleMockRoute(req) {
     const url = new URL(req.url);
     const [, route, id] = url.pathname.match(/^\/(__mock[\w-]*)\/?([\w-]*)/) || [];
     if (route === '__mock-upload' && req.method === 'PUT') {
-        const f = files.get(id);
+        if (!UUID_RE.test(id)) return new Response('Unknown upload', { status: 404 });
+        const f = files.get(id.toLowerCase());
         if (!f) return new Response('Unknown upload', { status: 404 });
         const part = (await req.formData()).get('');
-        f.data = Buffer.from(await part.arrayBuffer());
-        f.content_type = part.type || f.content_type;
+        const buf = Buffer.from(await part.arrayBuffer());
+        if (buf.length === 0 || buf.length > 25 * 1024 * 1024) return new Response('Invalid file size', { status: 400 });
+        f.data = buf;
         return json({ Key: id });
     }
     if (route === '__mock-file') {

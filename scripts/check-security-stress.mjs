@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { handleMockApi } from './mock-api.mjs';
-import { email, phone, text, longText, cleanDate, cleanOrderCode, cleanFileList, uuid, uuidList, getCookie, readJson } from '../api/_lib/core.mjs';
+import { handleMockApi, handleMockRoute } from './mock-api.mjs';
+import { email, phone, text, longText, cleanDate, cleanOrderCode, cleanFileList, uuid, uuidList, getCookie, readJson, verifyFileMagic, timingSafeMatch } from '../api/_lib/core.mjs';
 import { cleanTrackToken, estimate, clean as scrubEmailText } from '../api/_lib/orders.mjs';
 import { savedClientSession, verifiedClient, clientCookie } from '../api/_lib/clients.mjs';
 import { POST as prodAdminPOST } from '../api/admin.mjs';
@@ -385,11 +385,24 @@ await step('Production API handlers (api/*.mjs) enforce CSRF Origin check, Conte
     const lookupBadEmail = await prodLookupPOST(makeProdReq('/api/lookup', { code: 'NP-649025', email: "admin'--@evil.com" }));
     assert.equal(lookupBadEmail.status, 400, 'Prod lookup with SQLi email rejects with 400 before DB call');
 
+    // Production /api/request step=finish rejects SQLi tokens with 404 BEFORE touching the database
+    for (const sqliToken of ["' OR '1'='1", "aaaa,id.neq.00000000000000000000"]) {
+        const res = await prodRequestPOST(makeProdReq('/api/request', { step: 'finish', t: sqliToken, fileIds: [] }));
+        assert.equal(res.status, 404, `Prod request finish must reject SQLi token (${sqliToken}) with 404 before DB call`);
+        totalAssertions++;
+    }
+
     // Production /api/keepalive rejects unauthorized requests when CRON_SECRET is set
     process.env.CRON_SECRET = 'test-cron-secret-value';
     try {
         const unauthCron = await prodKeepaliveGET(makeProdReq('/api/keepalive', null, { authorization: "Bearer ' OR 1=1--" }, 'GET'));
         assert.equal(unauthCron.status, 401);
+        assert.equal(timingSafeMatch('Bearer test-cron-secret-value', 'Bearer test-cron-secret-value'), true);
+        assert.equal(timingSafeMatch('Bearer test-cron-secret-value', 'Bearer test-cron-secret-valuX'), false);
+        assert.equal(timingSafeMatch('Bearer test-cron-secret-value', 'Bearer short'), false);
+        assert.equal(timingSafeMatch('', ''), false);
+        assert.equal(timingSafeMatch(null, 'Bearer x'), false);
+        totalAssertions += 6;
     } finally {
         delete process.env.CRON_SECRET;
     }
@@ -431,7 +444,13 @@ await step('Static audit: zero raw SQL interpolations in api/, RLS + anon/authen
     }
     assert.ok(/revoke\s+all\s+on\s+all\s+tables\s+in\s+schema\s+public\s+from\s+anon,\s*authenticated/i.test(allSql), 'Missing schema-wide REVOKE from anon, authenticated');
     assert.ok(/create\s+policy\s+"deny public roles"/i.test(allSql), 'Missing restrictive deny policy for public roles');
-    totalAssertions += 2;
+    for (const chk of ['orders_code_format_chk', 'orders_track_token_format_chk', 'orders_zip_format_chk', 'orders_amounts_positive_chk', 'order_files_size_bounds_chk', 'order_files_sha256_format_chk']) {
+        assert.ok(allSql.includes(chk), `Missing PostgreSQL CHECK constraint ${chk}`);
+        totalAssertions++;
+    }
+    const clientSrc = await readFile(path.join(root, 'api/client.mjs'), 'utf8');
+    assert.ok(clientSrc.includes('siteOrigin(request)'), 'api/client.mjs must pin magic-link origin via siteOrigin(request)');
+    totalAssertions += 3;
 
     // Verify vercel.json security headers
     const vercelConfig = JSON.parse(await readFile(path.join(root, 'vercel.json'), 'utf8'));
@@ -525,6 +544,93 @@ await step('High-concurrency stress test: 500+ parallel requests (SQLi floods, b
     totalAssertions += tasks.length;
     const elapsedMs = Date.now() - start;
     console.log(`     -> Completed ${tasks.length + 12} concurrent stress operations in ${elapsedMs}ms with 0 errors and 0 data leaks`);
+});
+
+// 11. Magic-Byte File Content Inspection & Admin Concurrent Session Cap
+await step('Magic-byte file inspection rejects disguised malware/HTML uploads and Admin session cap evicts oldest sessions beyond 5', async () => {
+    // 11a. Unit checks on verifyFileMagic
+    const validPdf = Buffer.from('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n');
+    const validDocx = Buffer.from([0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00]);
+    const validJpg = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46]);
+    const validPng = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]);
+    const validWebp = Buffer.from('RIFF\x24\x00\x00\x00WEBPVP8 ');
+    const validHeic = Buffer.from('\x00\x00\x00\x18ftypheic\x00\x00\x00\x00');
+
+    assert.equal(verifyFileMagic(validPdf, 'summons.pdf'), true);
+    assert.equal(verifyFileMagic(validDocx, 'complaint.docx'), true);
+    assert.equal(verifyFileMagic(validJpg, 'photo.jpg'), true);
+    assert.equal(verifyFileMagic(validPng, 'evidence.png'), true);
+    assert.equal(verifyFileMagic(validWebp, 'scan.webp'), true);
+    assert.equal(verifyFileMagic(validHeic, 'iphone.heic'), true);
+    totalAssertions += 6;
+
+    // Disguised payloads: Windows PE exe, HTML/XSS script, shell script, or mismatched magic bytes
+    const exeBytes = Buffer.from('MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00');
+    const htmlBytes = Buffer.from('<!doctype html><script>alert(document.cookie)</script>');
+    const shBytes = Buffer.from('#!/bin/sh\nrm -rf /\n');
+    for (const ext of ['pdf', 'docx', 'jpg', 'png', 'webp', 'heic']) {
+        assert.equal(verifyFileMagic(exeBytes, `malware.${ext}`), false, `Windows EXE disguised as .${ext} must be rejected`);
+        assert.equal(verifyFileMagic(htmlBytes, `xss.${ext}`), false, `HTML/JS disguised as .${ext} must be rejected`);
+        assert.equal(verifyFileMagic(shBytes, `script.${ext}`), false, `Shell script disguised as .${ext} must be rejected`);
+        totalAssertions += 3;
+    }
+    assert.equal(verifyFileMagic(validPng, 'renamed-png-as.pdf'), false, 'PNG bytes renamed to .pdf must be rejected');
+    totalAssertions++;
+
+    // 11b. End-to-end upload flow: disguised HTML/EXE uploaded to signed URL is purged on confirmUploads, while valid PDF succeeds
+    const createRes = await (await callMock('request', {
+        clientName: 'Magic Byte Tester',
+        clientEmail: 'magic@example.com',
+        clientPhone: '(209) 555-0199',
+        recipientName: 'Target Person',
+        docType: 'Summons & Complaint',
+        address: '100 Main St',
+        city: 'Stockton',
+        zip: '95202',
+        tier: 'standard',
+        addons: [],
+        acceptTerms: true,
+        files: [
+            { name: 'disguised-xss.pdf', size: htmlBytes.length, type: 'application/pdf' },
+            { name: 'genuine-summons.pdf', size: validPdf.length, type: 'application/pdf' },
+        ],
+    })).json();
+    assert.equal(createRes.uploads.length, 2);
+
+    const uploadBlob = async (uploadUrl, buf) => {
+        const fd = new FormData();
+        fd.append('', new Blob([buf], { type: 'application/pdf' }));
+        return handleMockRoute(new Request(`http://localhost${uploadUrl}`, { method: 'PUT', body: fd }));
+    };
+    await uploadBlob(createRes.uploads[0].uploadUrl, htmlBytes);
+    await uploadBlob(createRes.uploads[1].uploadUrl, validPdf);
+
+    await callMock('request', {
+        step: 'finish',
+        t: createRes.token,
+        fileIds: createRes.uploads.map(u => u.fileId),
+    });
+
+    const viewAfterUpload = await (await callMock('track', { t: createRes.token, action: 'view' })).json();
+    assert.equal(viewAfterUpload.files.length, 1, 'Disguised HTML-as-PDF must be purged and only genuine PDF kept');
+    assert.equal(viewAfterUpload.files[0].name, 'genuine-summons.pdf');
+    assert.match(viewAfterUpload.files[0].sha256, /^[0-9a-f]{64}$/);
+    totalAssertions += 4;
+
+    // 11c. Admin concurrent session cap (max 5 active sessions per admin; 6th login evicts the 1st)
+    const adminCookies = [];
+    for (let i = 0; i < 6; i++) {
+        const r = await callMock('admin', { action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '12345678' });
+        adminCookies.push(r.headers.get('set-cookie').split(';')[0]);
+    }
+    const oldestRes = await callMock('admin', { action: 'me' }, adminCookies[0]);
+    assert.equal(oldestRes.status, 401, '1st admin session must be evicted once 6th session is created (cap = 5)');
+    for (let i = 1; i < 6; i++) {
+        const activeRes = await callMock('admin', { action: 'me' }, adminCookies[i]);
+        assert.equal(activeRes.status, 200, `Session ${i + 1} of 6 must remain active`);
+        totalAssertions++;
+    }
+    totalAssertions += 1;
 });
 
 console.log(`${passed} security & stress test suites passed (${totalAssertions} individual security assertions verified)`);

@@ -1,7 +1,7 @@
 // Shared server code for the /api functions: database client, HTTP helpers, tokens, rate limits.
 // Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
 import { createClient } from '@supabase/supabase-js';
-import { createHash, randomBytes, randomInt } from 'node:crypto';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
 export const BUCKET = 'case-files';
@@ -100,6 +100,12 @@ export function uuid(value, label = 'Item') {
 export const uuidList = (list) => (Array.isArray(list) ? list : []).filter(v => typeof v === 'string' && UUID_RE.test(v));
 
 export const sha256 = (s) => createHash('sha256').update(s).digest('hex');
+export function timingSafeMatch(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
+    const ha = createHash('sha256').update(a).digest();
+    const hb = createHash('sha256').update(b).digest();
+    return timingSafeEqual(ha, hb);
+}
 export const randomToken = (bytes = 24) => randomBytes(bytes).toString('base64url');   // 24 bytes = 192 bits
 export const orderCode = () => 'NP-' + String(randomInt(100000, 1000000));
 
@@ -208,7 +214,42 @@ export async function prepareUploads(orderId, kind, files) {
     return out;
 }
 
-// Marks files uploaded only if the object really exists in storage, and records a SHA-256 fingerprint for chain-of-custody verification.
+// Verifies that actual uploaded file bytes match the expected binary signature (magic bytes) of the file extension.
+export function verifyFileMagic(bytes, filename) {
+    if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > MAX_FILE_BYTES) return false;
+    const ext = typeof filename === 'string' && filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
+    if (ext === 'pdf') {
+        // %PDF-
+        return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
+    }
+    if (ext === 'docx') {
+        // PK\x03\x04 (ZIP container used by OpenXML .docx)
+        return bytes[0] === 0x50 && bytes[1] === 0x4B && bytes[2] === 0x03 && bytes[3] === 0x04;
+    }
+    if (ext === 'jpg' || ext === 'jpeg') {
+        // JPEG SOI + marker: FF D8 FF
+        return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
+    }
+    if (ext === 'png') {
+        // 89 50 4E 47 0D 0A 1A 0A
+        return bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
+            bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A;
+    }
+    if (ext === 'webp') {
+        // RIFF....WEBP
+        return bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+            bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
+    }
+    if (ext === 'heic' || ext === 'heif') {
+        // ISO Base Media File Format: ....ftyp<brand>
+        if (bytes.length < 12 || bytes[4] !== 0x66 || bytes[5] !== 0x74 || bytes[6] !== 0x79 || bytes[7] !== 0x70) return false;
+        const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+        return /^(?:heic|heix|hevc|hevx|heim|heis|hevm|hevs|mif1|msf1)$/.test(brand);
+    }
+    return false;
+}
+
+// Marks files uploaded only if the object really exists in storage, passes magic-byte inspection, and records a SHA-256 fingerprint.
 export async function confirmUploads(orderId, fileIds) {
     const ids = uuidList(fileIds).slice(0, MAX_FILES);
     if (!ids.length) return [];
@@ -220,10 +261,20 @@ export async function confirmUploads(orderId, fileIds) {
         const { data: exists } = await db().storage.from(BUCKET).exists(r.storage_path);
         if (exists) {
             let fileHash = null;
+            let validMagic = true;
             try {
                 const { data: blob } = await db().storage.from(BUCKET).download(r.storage_path);
-                if (blob) fileHash = sha256(Buffer.from(await blob.arrayBuffer()));
+                if (blob) {
+                    const buf = Buffer.from(await blob.arrayBuffer());
+                    if (!verifyFileMagic(buf, r.filename)) validMagic = false;
+                    else fileHash = sha256(buf);
+                }
             } catch { /* non-fatal if storage download cannot compute hash */ }
+            if (!validMagic) {
+                await db().storage.from(BUCKET).remove([r.storage_path]).catch(() => {});
+                await db().from('order_files').delete().eq('id', r.id);
+                continue;
+            }
             const patch = fileHash ? { uploaded: true, sha256: fileHash } : { uploaded: true };
             const { error: uErr } = await db().from('order_files').update(patch).eq('id', r.id);
             if (uErr && fileHash) await db().from('order_files').update({ uploaded: true }).eq('id', r.id);

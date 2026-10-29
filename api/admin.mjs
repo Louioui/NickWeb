@@ -73,6 +73,14 @@ async function verifyCode(request, body) {
         if (!error && data) ok = true;
     }
     if (!ok) throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
+    const nowIso = new Date().toISOString();
+    await db().from('admin_sessions').delete().eq('email', addr).lt('expires_at', nowIso);
+    const { data: activeSessions } = await db().from('admin_sessions').select('token_hash, created_at')
+        .eq('email', addr).order('created_at', { ascending: false });
+    if (activeSessions && activeSessions.length >= 5) {
+        const staleHashes = activeSessions.slice(4).map(s => s.token_hash);
+        await db().from('admin_sessions').delete().in('token_hash', staleHashes);
+    }
     const token = randomToken(32);
     await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';   // HTTPS-only everywhere but local testing
