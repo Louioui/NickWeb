@@ -34,11 +34,22 @@ const send = async (res, response) => {
     res.end(Buffer.from(await response.arrayBuffer()));
 };
 
+// Apply vercel.json's redirects and headers too, so security headers (and anything they would break) show up locally.
+// Patterns are converted the simple way (":name*" -> ".*", ":name(a|b)" -> "(a|b)"), which covers the ones this project uses.
+const vercel = JSON.parse(readFileSync(path.join(root, 'vercel.json'), 'utf8'));
+const toRegex = (src) => new RegExp('^' + src.replace(/:\w+\*/g, '.*').replace(/:\w+(\()/g, '$1') + '$');
+const REDIRECTS = (vercel.redirects || []).map(r => ({ re: toRegex(r.source), to: r.destination }));
+const HEADER_RULES = (vercel.headers || []).map(h => ({ re: toRegex(h.source), headers: h.headers }));
+const vercelHeaders = (pathname) => Object.fromEntries(HEADER_RULES.filter(h => h.re.test(pathname)).flatMap(h => h.headers.map(x => [x.key.toLowerCase(), x.value])));
+
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript',
     '.svg': 'image/svg+xml', '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.woff2': 'font/woff2', '.json': 'application/json' };
 
 http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${port}`);
+    const redirect = REDIRECTS.find(r => r.re.test(url.pathname));
+    if (redirect) { res.writeHead(307, { location: redirect.to }); return res.end(); }
+    for (const [k, v] of Object.entries(vercelHeaders(url.pathname))) res.setHeader(k, v);
     try {
         if (mock && url.pathname.startsWith('/__mock')) {
             const response = await mock.handleMockRoute(await toRequest(req, url));
@@ -69,6 +80,6 @@ http.createServer(async (req, res) => {
         console.error(err);
         res.writeHead(500); res.end('Server error');
     }
-}).listen(port, () => console.log(MOCK
+}).listen(port, '127.0.0.1', () => console.log(MOCK
     ? `Dev server on http://localhost:${port} in MOCK mode (no SUPABASE_SERVICE_ROLE_KEY). Sample orders: http://localhost:${port}/__mock`
     : `Dev server on http://localhost:${port}`));

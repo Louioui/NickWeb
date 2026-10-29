@@ -63,7 +63,7 @@ export const POST = handle(async (request) => {
     await addEvent(order.id, 'created', 'Request received', `${TIERS[row.tier].name} · estimate ${money(cents)}`);
 
     const uploads = await prepareUploads(order.id, 'client_document', files);
-    return json({ ok: true, code: order.code, token: order.track_token, trackUrl: `/track.html?t=${order.track_token}`, uploads });
+    return json({ ok: true, code: order.code, token: order.track_token, trackUrl: `/track.html#t=${order.track_token}`, uploads });
 });
 
 async function finish(request, body) {
@@ -78,13 +78,13 @@ async function finish(request, body) {
     await addEvent(order.id, 'note', 'Confirmation emailed', null, false);
 
     const origin = siteOrigin(request);
-    const trackUrl = `${origin}/track.html?t=${order.track_token}`;
+    const trackUrl = `${origin}/track.html#t=${order.track_token}`;
     const addonNames = (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean);
     await Promise.all([
         sendEmail({
             to: order.client_email,
             subject: `We received your request ${order.code}`,
-            heading: `Thanks, ${order.client_name.split(' ')[0]}. Your request is in.`,
+            heading: `Thanks, ${order.client_name.split(' ')[0].slice(0, 40)}. Your request is in.`,
             lines: [
                 `Reference: ${order.code}`,
                 `Person to be served: ${order.recipient_name}`,

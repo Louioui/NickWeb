@@ -47,7 +47,12 @@ export function handle(fn) {
     };
 }
 
+// Every API call from the site is a same-site JSON POST. Refusing anything else stops other websites from sending
+// requests through a visitor's browser (a second lock next to the login cookie's SameSite=Strict).
 export async function readJson(request, maxBytes = 64 * 1024) {
+    if (!(request.headers.get('content-type') || '').toLowerCase().startsWith('application/json')) throw new HttpError(415, 'Invalid request.');
+    const origin = request.headers.get('origin');
+    if (origin && origin !== new URL(request.url).origin) throw new HttpError(403, 'Invalid request.');
     const text = await request.text();
     if (text.length > maxBytes) throw new HttpError(413, 'Request is too large.');
     try { return text ? JSON.parse(text) : {}; } catch { throw new HttpError(400, 'Invalid request.'); }
@@ -73,6 +78,14 @@ export function getCookie(request, name) {
     }
     return null;
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Ids from the browser must look like ours before they reach a database query.
+export function uuid(value, label = 'Item') {
+    if (typeof value !== 'string' || !UUID_RE.test(value)) throw new HttpError(404, `${label} not found.`);
+    return value;
+}
+export const uuidList = (list) => (Array.isArray(list) ? list : []).filter(v => typeof v === 'string' && UUID_RE.test(v));
 
 export const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 export const randomToken = (bytes = 24) => randomBytes(bytes).toString('base64url');   // 24 bytes = 192 bits
@@ -107,11 +120,12 @@ export function email(value) {
 export const MAX_FILE_BYTES = 25 * 1024 * 1024;
 export const MAX_FILES = 10;
 const ALLOWED_TYPES = new Set([
-    'application/pdf', 'application/msword',
+    // No old-style .doc: it can carry macro viruses. .docx can't.
+    'application/pdf',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'image/jpeg', 'image/png', 'image/heic', 'image/heif', 'image/webp',
 ]);
-const TYPE_BY_EXT = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', webp: 'image/webp' };
+const TYPE_BY_EXT = { pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', webp: 'image/webp' };
 
 export function cleanFileList(files) {
     if (!Array.isArray(files)) return [];
@@ -121,7 +135,7 @@ export function cleanFileList(files) {
         // The type comes from the extension, never from what the browser claims, so "notes.html" labeled as a PDF is refused.
         const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
         const type = TYPE_BY_EXT[ext];
-        if (!type || !ALLOWED_TYPES.has(type)) throw new HttpError(400, `${name}: only PDF, Word, JPG, PNG or HEIC files can be uploaded.`);
+        if (!type || !ALLOWED_TYPES.has(type)) throw new HttpError(400, `${name}: only PDF, Word (.docx), JPG, PNG or HEIC files can be uploaded.`);
         const size = Number(f?.size) || 0;
         if (size <= 0 || size > MAX_FILE_BYTES) throw new HttpError(400, `${name} is larger than 25 MB.`);
         return { name, type, size };
@@ -148,9 +162,10 @@ export async function prepareUploads(orderId, kind, files) {
 
 // Marks files uploaded only if the object really exists in storage.
 export async function confirmUploads(orderId, fileIds) {
-    if (!Array.isArray(fileIds) || !fileIds.length) return [];
+    const ids = uuidList(fileIds).slice(0, MAX_FILES);
+    if (!ids.length) return [];
     const { data: rows, error } = await db().from('order_files').select('id, storage_path, filename, kind')
-        .eq('order_id', orderId).in('id', fileIds.slice(0, MAX_FILES));
+        .eq('order_id', orderId).in('id', ids);
     if (error) throw error;
     const done = [];
     for (const r of rows) {

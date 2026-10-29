@@ -83,7 +83,7 @@ const handlers = {
             const o = orderByToken(body.t);
             const up = confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} document${up.length === 1 ? '' : 's'} uploaded`);
-            email(o.client_email, `We received your request ${o.code}`, `/track.html?t=${o.track_token}`);
+            email(o.client_email, `We received your request ${o.code}`, `/track.html#t=${o.track_token}`);
             email(ADMIN_EMAIL, `New request ${o.code}: ${o.recipient_name}`, `/admin.html#${o.id}`);
             return json({ ok: true });
         }
@@ -102,12 +102,12 @@ const handlers = {
             tier: body.tier, addons: keys, estimated_total_cents: cents,
         });
         addEvent(o.id, 'created', 'Request received', `${TIERS[o.tier].name} · estimate ${money(cents)}`);
-        return json({ ok: true, code: o.code, token: o.track_token, trackUrl: `/track.html?t=${o.track_token}`, uploads: prepareUploads(o.id, 'client_document', body.files) });
+        return json({ ok: true, code: o.code, token: o.track_token, trackUrl: `/track.html#t=${o.track_token}`, uploads: prepareUploads(o.id, 'client_document', body.files) });
     },
 
     async track(req, body, url) {
-        if (req.method === 'GET') return json(clientView(orderByToken(url.searchParams.get('t'))));
         const o = orderByToken(body.t);
+        if (body.action === 'view') return json(clientView(o));
         if (body.action === 'download') {
             const f = files.get(body.fileId);
             if (!f || f.order_id !== o.id || !f.uploaded) fail(404, 'File not found.');
@@ -146,7 +146,7 @@ const handlers = {
     async lookup(req, body) {
         const code = String(body.code || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
         const o = [...orders.values()].find(o => o.code === code && o.client_email === String(body.email || '').trim().toLowerCase());
-        if (o) email(o.client_email, `Your tracking link for ${o.code}`, `/track.html?t=${o.track_token}`);
+        if (o) email(o.client_email, `Your tracking link for ${o.code}`, `/track.html#t=${o.track_token}`);
         return json({ ok: true, message: 'If that reference number and email match a request, we just emailed you its private tracking link.' });
     },
 
@@ -183,7 +183,7 @@ const handlers = {
         }
         const o = orders.get(body.id);
         if (!o) fail(404, 'Order not found.');
-        const trackUrl = `/track.html?t=${o.track_token}`;
+        const trackUrl = `/track.html#t=${o.track_token}`;
         const note = String(body.note || '').trim() || null;
         if (a === 'get') return json(adminDetail(o));
         if (a === 'update') {
@@ -271,13 +271,14 @@ export async function handleMockRoute(req) {
     if (route === '__mock-pay') {
         const o = [...orders.values()].find(o => o.track_token === url.searchParams.get('t'));
         if (!o) return new Response('Unknown order', { status: 404 });
-        const back = `/track.html?t=${encodeURIComponent(o.track_token)}`;
+        const back = `/track.html#t=${encodeURIComponent(o.track_token)}`;
+        const paidBack = (s) => `/track.html?paid=${encodeURIComponent(s)}#t=${encodeURIComponent(o.track_token)}`;   // same shape as api/_lib/stripe.mjs
         return page(`Test checkout`, `
             <p style="color:#635bff;font-weight:700;letter-spacing:.04em;margin:0 0 6px">STRIPE CHECKOUT (LOCAL STAND-IN)</p>
             <h1 style="margin:0 0 4px;font-size:30px">${money(o.amount_due_cents)}</h1>
             <p style="color:#666;margin:0 0 24px">Nick's Process Services · ${o.code}</p>
             <p style="font-size:13px;color:#666;margin:0 0 24px">The real page is hosted by Stripe and takes card or Apple Pay. Nothing is charged here.</p>
-            <a href="${back}&paid=${encodeURIComponent(url.searchParams.get('s') || '')}" style="display:block;text-align:center;background:#635bff;color:#fff;padding:14px;border-radius:6px;text-decoration:none;font-weight:700">Pay ${money(o.amount_due_cents)}</a>
+            <a href="${paidBack(url.searchParams.get('s') || '')}" style="display:block;text-align:center;background:#635bff;color:#fff;padding:14px;border-radius:6px;text-decoration:none;font-weight:700">Pay ${money(o.amount_due_cents)}</a>
             <a href="${back}" style="display:block;text-align:center;margin-top:14px;color:#635bff;font-size:14px">Cancel and go back</a>`);
     }
     if (route === '__mock-split') {
@@ -311,7 +312,7 @@ export async function handleMockRoute(req) {
     if (route === '__mock') {
         const rows = [...orders.values()].sort((a, b) => b.created_at.localeCompare(a.created_at)).map(o => `
             <tr><td style="padding:8px 10px">${o.code}</td><td style="padding:8px 10px">${STATUSES[o.status].label}</td><td style="padding:8px 10px">${escape(o.recipient_name)}</td>
-            <td style="padding:8px 10px"><a href="/track.html?t=${encodeURIComponent(o.track_token)}">Client tracking page</a></td>
+            <td style="padding:8px 10px"><a href="/track.html#t=${encodeURIComponent(o.track_token)}">Client tracking page</a></td>
             <td style="padding:8px 10px"><a href="/admin.html#${o.id}">Dashboard</a></td></tr>`).join('');
         return page('Local preview', `
             <h1 style="margin:0 0 6px;font-size:24px;color:#0d422e">Local preview with sample data</h1>

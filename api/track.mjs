@@ -1,27 +1,26 @@
 // /api/track — the client's private tracking page (the long token in the link is the only key).
-//   GET  ?t=TOKEN                                  -> order status, timeline, files
+// Everything is POST with the token in the body, so it never appears in an address that servers log.
+//   POST { t, action: 'view' }                     -> order status, timeline, files
 //   POST { t, action: 'download', fileId }         -> short-lived download link
 //   POST { t, action: 'confirm-payment', session } -> checks Stripe after the client returns from paying
 //   POST { t, action: 'respond', ...fields, files }-> answers "Action required"; returns upload links
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, cleanFileList,
-         prepareUploads, confirmUploads, addEvent, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
+         prepareUploads, confirmUploads, addEvent, uuid, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
 import { orderByToken, clientView, fileForOrder, markPaid, sendEmail } from './_lib/orders.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
-
-export const GET = handle(async (request) => {
-    await rateLimit(`track:${clientIp(request)}`, 120, 600);
-    const order = await orderByToken(new URL(request.url).searchParams.get('t'));
-    return json(await clientView(order));
-});
 
 export const POST = handle(async (request) => {
     await rateLimit(`track:${clientIp(request)}`, 120, 600);
     const body = await readJson(request);
     const order = await orderByToken(body.t);
 
+    if (body.action === 'view') {
+        return json(await clientView(order));
+    }
+
     if (body.action === 'download') {
-        return json({ url: await fileForOrder(order.id, body.fileId) });
+        return json({ url: await fileForOrder(order.id, uuid(body.fileId, 'File')) });
     }
 
     if (body.action === 'confirm-payment') {

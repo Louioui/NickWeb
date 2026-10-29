@@ -1,10 +1,12 @@
 // GET /api/keepalive — run daily by Vercel Cron (vercel.json). A real query keeps the free Supabase project
 // from pausing after 7 quiet days, and clears out expired login codes and sessions.
-import { db, handle, json, HttpError, BUCKET, addEvent } from './_lib/core.mjs';
+import { db, handle, json, HttpError, BUCKET, addEvent, rateLimit } from './_lib/core.mjs';
 
 export const GET = handle(async (request) => {
+    // With CRON_SECRET set (recommended), only Vercel Cron can run this. Without it, anyone could, so it is throttled.
     const secret = process.env.CRON_SECRET;
     if (secret && request.headers.get('authorization') !== `Bearer ${secret}`) throw new HttpError(401, 'Unauthorized.');
+    if (!secret) await rateLimit('keepalive', 4, 3600);
     const now = new Date().toISOString();
     const { count, error } = await db().from('orders').select('id', { count: 'exact', head: true });
     if (error) throw error;

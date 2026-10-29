@@ -100,7 +100,16 @@ export async function markPaid(orderId, amountCents, sessionId) {
 const FROM = process.env.EMAIL_FROM || "Nick's Process Services <updates@nicksprocessservices.dev>";
 const REPLY_TO = 'nicksprocessservices@outlook.com';
 
-export async function sendEmail({ to, subject, heading, lines, button }) {
+// Names and notes typed on the site go into these emails. Web addresses in them are removed, so nobody can use the
+// request form to send a scam link from Nick's real address (email apps would make it clickable). Our own links
+// only ever travel in the button. Email addresses are left alone.
+const LINKISH = /\b(?:https?:\/\/|www\.)\S+|(?<![@\w.-])(?:[a-z0-9-]+\.)+(?:com|net|org|info|biz|io|co|us|me|app|dev|xyz|site|online|top|link|click|shop|live|ru|cn|ly|gl|to|tk)\b(?:\/\S*)?/gi;
+export const clean = (s, max = 600) => String(s ?? '').replace(LINKISH, '[link removed]').slice(0, max);
+
+export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, lines: rawLines, button }) {
+    const subject = clean(rawSubject, 160);
+    const heading = clean(rawHeading, 160);
+    const lines = rawLines.map(l => clean(l));
     const html = emailHtml(heading, lines, button);
     const textBody = [heading, '', ...lines, ...(button ? ['', `${button.label}: ${button.url}`] : [])].join('\n');
     const key = process.env.RESEND_API_KEY;

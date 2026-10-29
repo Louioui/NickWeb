@@ -2,7 +2,7 @@
 // Files never pass through our server: the API hands back one-time upload links and the browser sends each file straight to private storage.
 const NPS = (() => {
     const TYPE_BY_EXT = {
-        pdf: 'application/pdf', doc: 'application/msword',
+        pdf: 'application/pdf',
         docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', webp: 'image/webp',
     };
@@ -54,7 +54,7 @@ const NPS = (() => {
     function checkFiles(files) {
         if (files.length > MAX_FILES) return `Please attach at most ${MAX_FILES} files.`;
         for (const f of files) {
-            if (!typeFor(f)) return `${f.name}: only PDF, Word, JPG, PNG or HEIC files can be uploaded.`;
+            if (!typeFor(f)) return `${f.name}: only PDF, Word (.docx), JPG, PNG or HEIC files can be uploaded.`;
             if (f.size > MAX_BYTES) return `${f.name} is larger than 25 MB.`;
             if (f.size === 0) return `${f.name} is empty.`;
         }

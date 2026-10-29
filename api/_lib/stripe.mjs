@@ -29,8 +29,9 @@ export async function createCheckout(order, amountCents, description, origin) {
         }],
         metadata: { order_id: order.id, order_code: order.code },
         payment_intent_data: { metadata: { order_id: order.id, order_code: order.code }, description: `Process service ${order.code}` },
-        success_url: `${origin}/track.html?t=${order.track_token}&paid={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${origin}/track.html?t=${order.track_token}`,
+        // Stripe fills in {CHECKOUT_SESSION_ID} (query); the private code rides after "#", so no server ever logs it.
+        success_url: `${origin}/track.html?paid={CHECKOUT_SESSION_ID}#t=${order.track_token}`,
+        cancel_url: `${origin}/track.html#t=${order.track_token}`,
     });
     return session;
 }

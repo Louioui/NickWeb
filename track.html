@@ -34,7 +34,7 @@
 
         <div id="not-found" class="hidden panel p-8 sm:p-10 text-center max-w-xl mx-auto">
             <i class="fa-solid fa-link-slash text-3xl text-bronze mb-4"></i>
-            <h1 class="font-display text-3xl text-primary mb-3">We couldn't open this tracking link</h1>
+            <h1 id="not-found-title" class="font-display text-3xl text-primary mb-3">We couldn't open this tracking link</h1>
             <p id="not-found-msg" class="text-sm text-muted leading-relaxed mb-6">The link may be incomplete. Use the full link from your confirmation email, or have it sent to you again.</p>
             <a href="/#track" class="btn btn-pine">Email Me My Tracking Link</a>
         </div>
@@ -94,7 +94,7 @@
                     <div><label for="a-reply" class="field-label">Your Reply to Nick</label><textarea id="a-reply" class="field h-28 resize-none" placeholder="Answer Nick's question here"></textarea></div>
                     <div>
                         <label for="a-files" class="field-label">Add Files (Corrected Documents, Photos)</label>
-                        <input id="a-files" type="file" multiple accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,.heic,.heif,.webp" class="block w-full text-sm text-muted file:mr-4 file:cursor-pointer file:border file:border-solid file:border-primary file:bg-transparent file:px-4 file:py-2 file:text-xs file:font-semibold file:text-primary">
+                        <input id="a-files" type="file" multiple accept=".pdf,.docx,.jpg,.jpeg,.png,.heic,.heif,.webp" class="block w-full text-sm text-muted file:mr-4 file:cursor-pointer file:border file:border-solid file:border-primary file:bg-transparent file:px-4 file:py-2 file:text-xs file:font-semibold file:text-primary">
                     </div>
                     <p id="action-error" class="result-box result-err hidden" role="alert"></p>
                     <button type="submit" class="btn btn-pine">Send to Nick <i class="fa-solid fa-paper-plane"></i></button>
@@ -130,8 +130,17 @@
 
 <script src="assets/js/nps.js"></script>
 <script>
+    // The private code travels after "#", which browsers never send to a server, so it can't end up in a log.
+    // Links with ?t= (older emails, and Stripe's return after paying) still work and are moved behind "#" right away.
     const params = new URLSearchParams(location.search);
-    const token = params.get('t') || '';
+    const token = new URLSearchParams(location.hash.slice(1)).get('t') || params.get('t') || '';
+    const paidSession = params.get('paid');
+    if (params.has('t') || params.has('paid')) history.replaceState(null, '', `${location.pathname}#t=${encodeURIComponent(token)}`);
+    const view = () => NPS.post('/api/track', { t: token, action: 'view' }, { notify: false });
+    // Opening another request's link in this tab only changes the part after "#", which doesn't reload the page by itself.
+    addEventListener('hashchange', () => {
+        if (new URLSearchParams(location.hash.slice(1)).get('t') !== token) location.reload();
+    });
     const $ = id => document.getElementById(id);
     const { esc } = NPS;
 
@@ -206,12 +215,15 @@
     }
 
     async function load() {
+        if (!token && paidSession) {
+            // Back from paying, but the private code didn't come along. The payment is still recorded (Stripe tells the server directly).
+            $('not-found-title').textContent = 'Thank you for your payment';
+            return showNotFound('Your payment is being recorded. Open your request from the link in your email to follow the next steps.');
+        }
         if (!token) return showNotFound();
         try {
-            const paidSession = params.get('paid');
             if (paidSession) {
-                // Back from Stripe: confirm the payment, then drop the session id from the address bar.
-                history.replaceState(null, '', `${location.pathname}?t=${encodeURIComponent(token)}`);
+                // Back from Stripe: confirm the payment (the address bar was already cleaned up above).
                 const o = await NPS.post('/api/track', { t: token, action: 'confirm-payment', session: paidSession });
                 render(o);
                 const banner = $('paid-banner');
@@ -221,7 +233,7 @@
                 banner.classList.remove('hidden');
                 return;
             }
-            render(await NPS.get(`/api/track?t=${encodeURIComponent(token)}`));
+            render(await view());
         } catch (err) {
             showNotFound(err.status === 404 ? null : err.message);
         }
@@ -283,7 +295,7 @@
         if (!order || actionDirty || document.hidden) return;
         try {
             const before = order.status;
-            render(await NPS.get(`/api/track?t=${encodeURIComponent(token)}`));
+            render(await view());
             if (order.status !== before) $('paid-banner').classList.add('hidden');   // "payment received" is old news once Nick moves on
         } catch { /* keep showing what we have */ }
     }

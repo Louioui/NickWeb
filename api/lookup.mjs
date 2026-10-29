@@ -17,7 +17,7 @@ export const POST = handle(async (request) => {
             subject: `Your tracking link for ${order.code}`,
             heading: 'Here is your private tracking link',
             lines: [`You (or someone using your email) asked for the tracking link for request ${order.code}.`, 'Keep this link to yourself: anyone with it can see the status of this request.'],
-            button: { label: 'Track your request', url: `${siteOrigin(request)}/track.html?t=${order.track_token}` },
+            button: { label: 'Track your request', url: `${siteOrigin(request)}/track.html#t=${order.track_token}` },
         });
     }
     return json({ ok: true, message: 'If that reference number and email match a request, we just emailed you its private tracking link.' });

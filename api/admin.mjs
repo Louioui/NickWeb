@@ -1,7 +1,7 @@
 // POST /api/admin { action, ... } — Nick's dashboard. Everything except the two login steps needs his session cookie.
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
-         sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload,
+         sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
          HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, markPaid } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
@@ -56,7 +56,7 @@ async function verifyCode(request, body) {
     if (!ok) throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
     const token = randomToken(32);
     await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
-    const secure = new URL(request.url).protocol === 'https:' ? ' Secure;' : '';
+    const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';   // HTTPS-only everywhere but local testing
     return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=${token}; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}` });
 }
 
@@ -99,7 +99,7 @@ async function withClientReplied(list) {
 }
 
 async function getOrder(id) {
-    if (typeof id !== 'string') throw new HttpError(400, 'Missing order.');
+    uuid(id, 'Order');
     const { data, error } = await db().from('orders').select('*').eq('id', id).maybeSingle();
     if (error) throw error;
     if (!data) throw new HttpError(404, 'Order not found.');
@@ -123,7 +123,7 @@ async function update(request, body) {
     const order = await getOrder(body.id);
     const kind = body.kind;
     const note = longText(body.note, { max: 2000, label: 'Note' });
-    const trackUrl = `${siteOrigin(request)}/track.html?t=${order.track_token}`;
+    const trackUrl = `${siteOrigin(request)}/track.html#t=${order.track_token}`;
 
     if (kind === 'status') {
         if (!STATUSES[body.status] || body.status === 'action_required') throw new HttpError(400, 'Choose a status.');
@@ -210,13 +210,13 @@ async function proofFinish(request, body) {
         to: order.client_email, subject: `${order.code}: your proof of service is ready`,
         heading: body.markServed ? 'Service complete' : 'New document on your request',
         lines: [body.markServed ? `${order.recipient_name} has been served.` : 'Nick added a document to your request.', 'Download it from your private tracking page.'],
-        button: { label: 'Download proof of service', url: `${siteOrigin(request)}/track.html?t=${order.track_token}` },
+        button: { label: 'Download proof of service', url: `${siteOrigin(request)}/track.html#t=${order.track_token}` },
     });
     return json(await detail(order.id));
 }
 
 async function fileUrl(body) {
-    const { data, error } = await db().from('order_files').select('storage_path, filename').eq('id', body.fileId).eq('uploaded', true).maybeSingle();
+    const { data, error } = await db().from('order_files').select('storage_path, filename').eq('id', uuid(body.fileId, 'File')).eq('uploaded', true).maybeSingle();
     if (error) throw error;
     if (!data) throw new HttpError(404, 'File not found.');
     return json({ url: await signedDownload(data.storage_path, data.filename) });

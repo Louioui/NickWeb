@@ -349,7 +349,7 @@
             ${submitBtn('Send Payment Link')}`;
         }
         return `
-            <div><label for="f-proof" class="field-label">Proof of service file(s)</label><input id="f-proof" type="file" multiple accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,.heic,.heif,.webp" class="block w-full text-sm text-muted file:mr-4 file:cursor-pointer file:border file:border-solid file:border-primary file:bg-transparent file:px-4 file:py-2 file:text-xs file:font-semibold file:text-primary"></div>
+            <div><label for="f-proof" class="field-label">Proof of service file(s)</label><input id="f-proof" type="file" multiple accept=".pdf,.docx,.jpg,.jpeg,.png,.heic,.heif,.webp" class="block w-full text-sm text-muted file:mr-4 file:cursor-pointer file:border file:border-solid file:border-primary file:bg-transparent file:px-4 file:py-2 file:text-xs file:font-semibold file:text-primary"></div>
             ${check('f-served', 'Mark the job as Served', o.status !== 'served')}
             <p class="text-xs text-muted">The client gets an email and can download the file from their tracking page.</p>
             ${submitBtn('Upload Proof')}`;

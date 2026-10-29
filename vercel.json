@@ -1,33 +1,93 @@
 {
   "crons": [
-    { "path": "/api/keepalive", "schedule": "0 15 * * *" }
+    {
+      "path": "/api/keepalive",
+      "schedule": "0 15 * * *"
+    }
   ],
   "redirects": [
-    { "source": "/api/:path*.mjs", "destination": "/", "permanent": false },
-    { "source": "/api/_lib/:path*", "destination": "/", "permanent": false },
-    { "source": "/scripts/:path*", "destination": "/", "permanent": false },
-    { "source": "/src/:path*", "destination": "/", "permanent": false },
-    { "source": "/supabase/:path*", "destination": "/", "permanent": false },
-    { "source": "/build/:path*", "destination": "/", "permanent": false },
-    { "source": "/node_modules/:path*", "destination": "/", "permanent": false },
-    { "source": "/:file(package\\.json|package-lock\\.json|tailwind\\.config\\.js|vercel\\.json|LICENSE|\\.gitignore|\\.env.*)", "destination": "/", "permanent": false }
+    {
+      "source": "/api/:path*.mjs",
+      "destination": "/",
+      "permanent": false
+    },
+    {
+      "source": "/api/_lib/:path*",
+      "destination": "/",
+      "permanent": false
+    },
+    {
+      "source": "/scripts/:path*",
+      "destination": "/",
+      "permanent": false
+    },
+    {
+      "source": "/src/:path*",
+      "destination": "/",
+      "permanent": false
+    },
+    {
+      "source": "/supabase/:path*",
+      "destination": "/",
+      "permanent": false
+    },
+    {
+      "source": "/build/:path*",
+      "destination": "/",
+      "permanent": false
+    },
+    {
+      "source": "/node_modules/:path*",
+      "destination": "/",
+      "permanent": false
+    },
+    {
+      "source": "/:file(package\\.json|package-lock\\.json|tailwind\\.config\\.js|vercel\\.json|LICENSE|\\.gitignore|\\.env.*)",
+      "destination": "/",
+      "permanent": false
+    }
   ],
   "headers": [
     {
       "source": "/(.*)",
       "headers": [
-        { "key": "X-Content-Type-Options", "value": "nosniff" },
-        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
-        { "key": "Content-Security-Policy", "value": "frame-ancestors 'self'" },
-        { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()" }
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "Content-Security-Policy",
+          "value": "frame-ancestors 'self'"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), microphone=(), geolocation=()"
+        }
       ]
     },
     {
       "source": "/(track|admin)\\.html",
       "headers": [
-        { "key": "Referrer-Policy", "value": "no-referrer" },
-        { "key": "Cache-Control", "value": "no-store" },
-        { "key": "X-Robots-Tag", "value": "noindex, nofollow" }
+        {
+          "key": "Referrer-Policy",
+          "value": "no-referrer"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "no-store"
+        },
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        },
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data:; connect-src 'self' https://wlbmtcrgftermdtwnbgb.supabase.co; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'"
+        }
       ]
     }
   ]
