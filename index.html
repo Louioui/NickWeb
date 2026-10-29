@@ -1668,6 +1668,11 @@
             document.getElementById('review-recap').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
         }
 
+        // Add-ons and the plan can still change on step 3, so keep the recap in step with the summary.
+        document.querySelectorAll('.addon-checkbox, .summary-plan-btn, #pricing [data-plan]').forEach(el => {
+            el.addEventListener(el.matches('.addon-checkbox') ? 'change' : 'click', () => { if (currentStep === 3) renderRecap(); });
+        });
+
         function showSubmitError(msg) {
             const box = document.getElementById('submit-error');
             box.textContent = msg;
