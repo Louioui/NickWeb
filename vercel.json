@@ -50,6 +50,17 @@
       "source": "/docs/:path*",
       "destination": "/",
       "permanent": false
+    },
+    {
+      "source": "/demo.html",
+      "has": [
+        {
+          "type": "host",
+          "value": "(?:www\\.)?nicksprocessservices\\.dev"
+        }
+      ],
+      "destination": "/",
+      "permanent": false
     }
   ],
   "headers": [

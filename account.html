@@ -67,6 +67,17 @@
         </section>
         <div class="flex flex-wrap justify-between gap-3"><p id="client-sync" class="text-xs text-muted" role="status"></p><button id="client-refresh" class="text-sm text-primary underline underline-offset-2" type="button">Refresh requests</button></div>
         <p class="text-xs text-muted leading-relaxed">Requests made with another email won’t appear here. Existing private tracking links still work. Showing your latest 100 requests.</p>
+        <section class="panel p-5 space-y-4" aria-labelledby="security-title">
+            <div><h2 id="security-title" class="font-display text-2xl text-primary">Security</h2><p id="pin-status" class="text-sm text-muted mt-1"></p></div>
+            <form id="pin-form" class="space-y-4" novalidate>
+                <div id="pin-current-wrap" class="hidden"><label for="pin-current" class="field-label">Current Security PIN</label><input id="pin-current" class="field font-mono tracking-widest max-w-[12rem]" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off"></div>
+                <div><label for="pin-new" class="field-label">New 6-digit Security PIN</label><input id="pin-new" class="field font-mono tracking-widest max-w-[12rem]" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off"></div>
+                <div><label for="pin-confirm" class="field-label">Type the new PIN again</label><input id="pin-confirm" class="field font-mono tracking-widest max-w-[12rem]" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off"></div>
+                <div class="flex flex-wrap gap-3"><button id="pin-save" type="submit" class="btn btn-pine btn-sm">Save PIN</button><button id="pin-remove" type="button" class="hidden btn btn-outline btn-sm">Turn off PIN</button></div>
+            </form>
+            <p id="security-feedback" class="hidden result-box text-sm" role="status"></p>
+            <div class="pt-4 rule-t flex flex-wrap items-center justify-between gap-3"><p class="text-sm text-muted">Signed in on a computer or phone you no longer use?</p><button id="client-logout-all" type="button" class="btn btn-outline btn-sm">Sign out all devices</button></div>
+        </section>
     </div>
 </main>
 <footer class="on-dark bg-primaryDark text-xs text-champagne py-6 px-5 text-center">Questions? <a href="tel:+12099226817" class="underline underline-offset-2">Call Nick: (209) 922-6817</a><span aria-hidden="true"> · </span><a href="/admin.html" class="underline underline-offset-2">Nick’s staff dashboard</a></footer>

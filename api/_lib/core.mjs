@@ -374,10 +374,13 @@ export function verifyFileMagic(bytes, filename) {
     let head = '';
     for (let i = 0; i < headLen; i++) head += String.fromCharCode(bytes[i]);
     if (POLYGLOT_SCRIPT_RE.test(head)) return false;
+    // Hidden HTML is often appended after the real image or document, so the last 4 KB is checked too, for every type.
+    if (bytes.length > 4096 && POLYGLOT_SCRIPT_RE.test(Buffer.from(bytes.subarray(bytes.length - 4096)).toString('latin1'))) return false;
 
     if (ext === 'pdf') {
-        // %PDF- and no embedded Acrobat JavaScript / Launch actions
-        if (PDF_DANGEROUS_ACTION_RE.test(head)) return false;
+        // %PDF- and no Acrobat JavaScript / Launch actions anywhere in the file (not just its first 4 KB). Actions hidden
+        // inside compressed object streams can't be seen this way; this is a filter, not a full PDF parser.
+        if (PDF_DANGEROUS_ACTION_RE.test(Buffer.from(bytes).toString('latin1'))) return false;
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {
@@ -395,12 +398,7 @@ export function verifyFileMagic(bytes, filename) {
         return true;
     }
     if (ext === 'jpg' || ext === 'jpeg') {
-        // JPEG SOI + marker: FF D8 FF, plus tail polyglot check
-        if (bytes.length > 4096) {
-            let tail = '';
-            for (let i = Math.max(0, bytes.length - 4096); i < bytes.length; i++) tail += String.fromCharCode(bytes[i]);
-            if (POLYGLOT_SCRIPT_RE.test(tail)) return false;
-        }
+        // JPEG SOI + marker: FF D8 FF
         return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
     }
     if (ext === 'png') {

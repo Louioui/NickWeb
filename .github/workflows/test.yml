@@ -1,0 +1,27 @@
+name: Tests
+
+# Runs every test suite (including the real-handler checks) on each pull request and each push to Master.
+on:
+  pull_request:
+  push:
+    branches: [Master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24   # same as the Vercel runtime; the real-handler suite needs Node 22.3+
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=high
+      - run: npm test
+      # The CSS inside each page is generated from src/input.css; fail if someone edited one without the other.
+      - run: npm run build
+      - run: git diff --exit-code -- '*.html'

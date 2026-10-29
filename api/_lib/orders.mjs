@@ -53,7 +53,8 @@ export async function orderByToken(token) {
     return data;
 }
 
-const isSafePaymentUrl = (u) => typeof u === 'string' && (/^https:\/\/checkout\.stripe\.com\//i.test(u) || u.startsWith('/__mock-pay'));
+// Only real Stripe Checkout links are shown to clients; the local mock's /__mock-pay links never are in production.
+const isSafePaymentUrl = (u) => typeof u === 'string' && (/^https:\/\/checkout\.stripe\.com\//i.test(u) || (!IS_PROD && u.startsWith('/__mock-pay')));
 
 // The timeline's tamper-evident seal. Each entry was chained with SHA-256 by the database when it was written;
 // verify_order_chain recomputes the chain from the stored rows, so any later edit shows up as verified = false.

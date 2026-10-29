@@ -6,7 +6,7 @@
     // Set while the server is waiting for the Security PIN: after a code ({ kind: 'code' }) or a sign-in link, whose
     // tokens stay in memory only until the PIN is sent ({ kind: 'link', access, refresh }).
     let pinFor = null;
-    const post = (action, data = {}) => NPS.post('/api/client', { action, ...data }, { notify: ['verify-code', 'session', 'logout'].includes(action) });
+    const post = (action, data = {}) => NPS.post('/api/client', { action, ...data }, { notify: ['verify-code', 'session', 'logout', 'logout-all'].includes(action) });
     function showError(message) { $('account-error').textContent = message || ''; $('account-error').classList.toggle('hidden', !message); }
     function setMode(next) {
         mode = next;
@@ -36,8 +36,53 @@
         try { sessionStorage.clear(); } catch {}
         try { navigator.serviceWorker?.controller?.postMessage({ type: 'CLEAR_AUTH_CACHE' }); } catch {}
     }
+    // --- Security panel: the Security PIN (asked for after the email code or link at every sign-in) and global sign-out ---
+    function securityFeedback(message, ok) {
+        const box = $('security-feedback');
+        box.textContent = message || '';
+        box.className = `result-box ${ok ? 'result-ok' : 'result-err'} text-sm`;
+        box.classList.toggle('hidden', !message);
+    }
+    function clearPinFields() { for (const id of ['pin-current', 'pin-new', 'pin-confirm']) $(id).value = ''; }
+    function showSecurity(hasPin) {
+        $('pin-status').textContent = hasPin
+            ? 'Your Security PIN is on: signing in needs your email code (or link) and this PIN. It also unlocks locked tracking pages.'
+            : 'Add a 6-digit Security PIN so that someone who gets into your email still can’t sign in here.';
+        $('pin-current-wrap').classList.toggle('hidden', !hasPin);
+        $('pin-remove').classList.toggle('hidden', !hasPin);
+        $('pin-save').textContent = hasPin ? 'Change PIN' : 'Save PIN';
+    }
+    $('pin-form').onsubmit = async e => {
+        e.preventDefault(); securityFeedback('');
+        const next = $('pin-new').value.trim(), again = $('pin-confirm').value.trim();
+        if (!/^\d{6}$/.test(next)) return securityFeedback('Your new PIN must be exactly 6 digits.');
+        if (next !== again) return securityFeedback('The two new PINs don’t match.');
+        $('pin-save').disabled = true;
+        try {
+            await post('set-pin', { pin: next, currentPin: $('pin-current').value.trim() });
+            clearPinFields(); showSecurity(true); securityFeedback('Your Security PIN is saved. You’ll be asked for it at your next sign-in.', true);
+        } catch (err) { securityFeedback(err.message); $('pin-current').value = ''; }
+        finally { $('pin-save').disabled = false; }
+    };
+    $('pin-remove').onclick = async () => {
+        securityFeedback('');
+        const current = $('pin-current').value.trim();
+        if (!/^\d{6}$/.test(current)) return securityFeedback('Enter your current PIN above to turn it off.');
+        $('pin-remove').disabled = true;
+        try { await post('disable-pin', { pin: current }); clearPinFields(); showSecurity(false); securityFeedback('Your Security PIN is off.', true); }
+        catch (err) { securityFeedback(err.message); $('pin-current').value = ''; }
+        finally { $('pin-remove').disabled = false; }
+    };
+    $('client-logout-all').onclick = async () => {
+        $('client-logout-all').disabled = true;
+        try { await post('logout-all'); scrubClientState(); showAuth(); }
+        catch { securityFeedback('Signing out everywhere did not finish. Please try again.'); }
+        finally { $('client-logout-all').disabled = false; }
+    };
+
     function showAuth() {
         signedIn = false; orders = []; pendingEmail = ''; cooldownUntil = 0;
+        clearPinFields(); securityFeedback('');
         $('client-orders').replaceChildren(); $('client-identity').textContent = '';
         $('account-code').value = ''; $('client-search').value = '';
         $('account-loading').classList.add('hidden'); $('client-workspace').classList.add('hidden'); $('account-auth').classList.remove('hidden'); setMode(mode);
@@ -94,6 +139,7 @@
             const result = await post('list');
             orders = result.orders; signedIn = true;
             $('client-identity').textContent = [result.profile.name, result.profile.email].filter(Boolean).join(' · ');
+            showSecurity(!!result.profile.hasPin);
             $('account-loading').classList.add('hidden'); $('account-auth').classList.add('hidden'); $('client-workspace').classList.remove('hidden');
             $('client-feedback').classList.add('hidden'); renderOrders();
             $('client-sync').textContent = `Updated ${new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;

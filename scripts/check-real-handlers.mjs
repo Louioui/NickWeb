@@ -265,6 +265,17 @@ await check('F-04 the new-request email says when uploads are still being checke
     const toNick = emails.find(e => e.to.includes(ADMIN) && /New request/.test(e.subject));
     expect(res.status === 200 && toNick && /1 document\(s\) attached\. 1 more could not be checked yet/.test(toNick.text), `email: ${toNick?.text}`);
 });
+await check('F-10 a PDF with a script action deep inside (past 4 KB) is refused', async () => {
+    const pdf = new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n<< /S /JavaScript /JS (app.alert(1)) >>\n%%EOF`);
+    expect(core.verifyFileMagic(pdf, 'a.pdf') === false, 'deep /JavaScript action accepted');
+    expect(core.verifyFileMagic(new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n%%EOF`), 'a.pdf') === true, 'clean PDF refused');
+});
+await check('F-10 HTML appended to the end of a PNG is refused', async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, ...new Uint8Array(9000)]);
+    const tail = new TextEncoder().encode('<script>alert(1)</script>');
+    expect(core.verifyFileMagic(new Uint8Array([...png, ...tail]), 'a.png') === false, 'PNG with appended script accepted');
+    expect(core.verifyFileMagic(png, 'a.png') === true, 'clean PNG refused');
+});
 const cron = () => keepaliveGET(new Request('https://site.test/api/keepalive', { headers: { authorization: 'Bearer test-cron' } }));
 const dayOld = new Date(Date.now() - 2 * 864e5).toISOString();
 await check('F-04 daily cleanup keeps a file row when storage cannot be reached', async () => {

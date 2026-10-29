@@ -414,6 +414,8 @@ const handlers = {
         if (action === 'set-pin') {
             const pin = String(body.pin || '').trim();
             if (!/^\d{6}$/.test(pin)) fail(400, 'Please enter a 6-digit numeric Security PIN.');
+            // Same as api/client.mjs: replacing a PIN needs the current one.
+            if (sec?.pin_hash && !verifyPin(String(body.currentPin || '').trim(), sec.pin_hash)) fail(403, 'Enter your current 6-digit Security PIN to change it.');
             clientSecurity.set(verifiedEmail, { pin_hash: hashPin(pin), failed_tries: 0, locked_until: 0 });
             return json({ ok: true, hasPin: true });
         }
