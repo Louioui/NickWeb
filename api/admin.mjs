@@ -32,7 +32,7 @@ export const POST = handle(async (request) => {
     if (a === 'payment-link') return paymentLink(request, body, admin);
     if (a === 'proof-upload') return proofUpload(body);
     if (a === 'proof-finish') return proofFinish(request, body);
-    if (a === 'file-url') return fileUrl(body);
+    if (a === 'file-url') return fileUrl(request, body, admin);
     if (a === 'export') return exportOrder(request, body, admin);
     if (a === 'delete') return deleteOrder(request, body, admin);
     throw new HttpError(400, 'Unknown action.');
@@ -513,10 +513,11 @@ async function proofFinish(request, body) {
     return json(await detail(order.id));
 }
 
-async function fileUrl(body) {
-    const { data, error } = await db().from('order_files').select('storage_path, filename').eq('id', uuid(body.fileId, 'File')).eq('uploaded', true).maybeSingle();
+async function fileUrl(request, body, admin) {
+    const { data, error } = await db().from('order_files').select('storage_path, filename, orders(code)').eq('id', uuid(body.fileId, 'File')).eq('uploaded', true).maybeSingle();
     if (error) throw error;
     if (!data) throw new HttpError(404, 'File not found.');
+    await auditAdmin(request, admin, 'download_file', data.orders?.code || null, data.filename);
     return json({ url: await signedDownload(data.storage_path, data.filename) });
 }
 

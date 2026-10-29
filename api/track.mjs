@@ -140,8 +140,10 @@ export const POST = handle(async (request) => {
         const fId = uuid(body.fileId, 'File');
         const url = await fileForOrder(order.id, fId);
         let fileSha256 = null;
-        const { data: fRow } = await db().from('order_files').select('sha256').eq('order_id', order.id).eq('id', fId).maybeSingle();
+        const { data: fRow } = await db().from('order_files').select('filename, sha256').eq('order_id', order.id).eq('id', fId).maybeSingle();
         fileSha256 = fRow?.sha256 || null;
+        // Chain of custody: every document opened from the tracking page is recorded (privately) in the sealed timeline.
+        await addEvent(order.id, 'note', 'Document downloaded from tracking page', fRow?.filename || null, false);
         return json({ url, sha256: fileSha256, expiresInSeconds: 60 });
     }
 

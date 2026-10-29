@@ -121,6 +121,14 @@ await call('track', { t, action: 'send-unlock-code' });
 const unlock = await call('track', { t, action: 'verify-unlock-code', code: MOCK_CLIENT_CODE });
 check('emailed code unlocks the page', unlock.status === 200 && /^\d{10}\.[\w-]{43}$/.test(unlock.data.unlockToken));
 check('unlocked page can answer "Action required"', (await call('track', { t, action: 'respond', unit: 'Apt 1', unlockToken: unlock.data.unlockToken })).status === 200);
+// Downloads are recorded privately in the sealed timeline (chain of custody), and the seal still verifies.
+const servedId = (await call('admin', { action: 'list' }, nick)).data.orders.find(o => o.status === 'served').id;
+const servedDetail = (await call('admin', { action: 'get', id: servedId }, nick)).data;
+const dl = await call('track', { t: servedDetail.order.track_token, action: 'download', fileId: servedDetail.files[0].id });
+const afterDl = (await call('admin', { action: 'get', id: servedId }, nick)).data;
+check('client download works and returns the file fingerprint', dl.status === 200 && dl.data.url);
+check('client download is logged privately in the timeline', afterDl.events.some(e => e.title === 'Document downloaded from tracking page' && e.client_visible === false));
+check('the seal still verifies after new entries', afterDl.order.integrity_seal.verified === true && afterDl.order.integrity_seal.entries === servedDetail.order.integrity_seal.entries + 1);
 await call('admin', { action: 'rotate-token', id: lockOrder.id }, nick);
 check('after the link is replaced, the old link stops working', (await call('track', { t, action: 'view' })).status === 404);
 

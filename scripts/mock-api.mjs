@@ -544,6 +544,7 @@ const handlers = {
             const fid = cleanUuid(body.fileId, 'File');
             const f = files.get(fid);
             if (!f || f.order_id !== o.id || !f.uploaded) fail(404, 'File not found.');
+            addEvent(o.id, 'note', 'Document downloaded from tracking page', f.filename, false);   // same as api/track.mjs
             return json({ url: `/__mock-file/${f.id}`, sha256: f.sha256 || null, expiresInSeconds: 60 });
         }
         if (body.action === 'confirm-payment') {
