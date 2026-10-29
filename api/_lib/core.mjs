@@ -1,0 +1,170 @@
+// Shared server code for the /api functions: database client, HTTP helpers, tokens, rate limits.
+// Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
+import { createClient } from '@supabase/supabase-js';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
+
+export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
+export const BUCKET = 'case-files';
+export const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'nicksprocessservices@outlook.com')
+    .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+export const IS_PROD = process.env.VERCEL_ENV === 'production';
+
+let client = null;
+// Service-role client: bypasses row-level security, so it must only ever run on the server.
+export function db() {
+    if (!client) {
+        const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+        if (!key) {
+            console.error('SUPABASE_SERVICE_ROLE_KEY is not set (Vercel env vars, or .env.local when testing locally).');
+            throw new HttpError(503, 'Online requests are temporarily unavailable. Please call or text Nick at (209) 922-6817.');
+        }
+        client = createClient(SUPABASE_URL, key, { auth: { persistSession: false, autoRefreshToken: false } });
+    }
+    return client;
+}
+
+export class HttpError extends Error {
+    constructor(status, message) { super(message); this.status = status; }
+}
+
+export function json(data, status = 200, headers = {}) {
+    return new Response(JSON.stringify(data), {
+        status,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers },
+    });
+}
+
+// Wraps a handler so thrown HttpErrors become clean JSON and anything else is logged and hidden.
+export function handle(fn) {
+    return async (request) => {
+        try {
+            return await fn(request);
+        } catch (err) {
+            if (err instanceof HttpError) return json({ error: err.message }, err.status);
+            console.error(err);
+            return json({ error: 'Something went wrong on our end. Please try again or call (209) 922-6817.' }, 500);
+        }
+    };
+}
+
+export async function readJson(request, maxBytes = 64 * 1024) {
+    const text = await request.text();
+    if (text.length > maxBytes) throw new HttpError(413, 'Request is too large.');
+    try { return text ? JSON.parse(text) : {}; } catch { throw new HttpError(400, 'Invalid request.'); }
+}
+
+export function clientIp(request) {
+    return (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'local';
+}
+
+export function siteOrigin(request) {
+    return process.env.SITE_URL || new URL(request.url).origin;
+}
+
+export function getCookie(request, name) {
+    const raw = request.headers.get('cookie') || '';
+    for (const part of raw.split(';')) {
+        const [k, ...v] = part.trim().split('=');
+        if (k === name) return decodeURIComponent(v.join('='));
+    }
+    return null;
+}
+
+export const sha256 = (s) => createHash('sha256').update(s).digest('hex');
+export const randomToken = (bytes = 24) => randomBytes(bytes).toString('base64url');   // 24 bytes = 192 bits
+export const orderCode = () => 'NP-' + String(randomInt(100000, 1000000));
+
+// Throws 429 once a bucket passes `max` hits in its window (counted atomically in the database).
+export async function rateLimit(bucket, max, windowSeconds) {
+    const { data, error } = await db().rpc('hit_rate_limit', { p_bucket: bucket, p_window_seconds: windowSeconds });
+    if (error) throw error;
+    if (data > max) throw new HttpError(429, 'Too many attempts. Please wait a few minutes and try again.');
+}
+
+// --- Input cleaning ---
+export function text(value, { max = 200, required = false, label = 'This field' } = {}) {
+    const s = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+    if (required && !s) throw new HttpError(400, `${label} is required.`);
+    if (s.length > max) throw new HttpError(400, `${label} is too long.`);
+    return s || null;
+}
+export function longText(value, { max = 2000, label = 'This field' } = {}) {
+    const s = typeof value === 'string' ? value.trim() : '';
+    if (s.length > max) throw new HttpError(400, `${label} is too long.`);
+    return s || null;
+}
+export function email(value) {
+    const s = text(value, { max: 200, required: true, label: 'Email' }).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s)) throw new HttpError(400, 'Please enter a valid email address.');
+    return s;
+}
+
+// --- Files ---
+export const MAX_FILE_BYTES = 25 * 1024 * 1024;
+export const MAX_FILES = 10;
+const ALLOWED_TYPES = new Set([
+    'application/pdf', 'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'image/jpeg', 'image/png', 'image/heic', 'image/heif', 'image/webp',
+]);
+const TYPE_BY_EXT = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', webp: 'image/webp' };
+
+export function cleanFileList(files) {
+    if (!Array.isArray(files)) return [];
+    if (files.length > MAX_FILES) throw new HttpError(400, `Please attach at most ${MAX_FILES} files.`);
+    return files.map(f => {
+        const name = text(f?.name, { max: 180, required: true, label: 'File name' });
+        const ext = name.split('.').pop().toLowerCase();
+        const type = ALLOWED_TYPES.has(f?.type) ? f.type : TYPE_BY_EXT[ext];
+        if (!type) throw new HttpError(400, `${name}: only PDF, Word, JPG, PNG or HEIC files can be uploaded.`);
+        const size = Number(f?.size) || 0;
+        if (size <= 0 || size > MAX_FILE_BYTES) throw new HttpError(400, `${name} is larger than 25 MB.`);
+        return { name, type, size };
+    });
+}
+
+// Creates file rows plus one-time upload links; the browser then uploads straight to private storage.
+export async function prepareUploads(orderId, kind, files) {
+    const folder = { client_document: 'client', proof: 'proof', action_upload: 'action' }[kind];
+    const out = [];
+    for (const f of files) {
+        const safe = f.name.replace(/[^\w.\-]+/g, '_').slice(-120);
+        const path = `orders/${orderId}/${folder}/${randomToken(8)}-${safe}`;
+        const { data: row, error } = await db().from('order_files').insert({
+            order_id: orderId, kind, storage_path: path, filename: f.name, size_bytes: f.size, content_type: f.type,
+        }).select('id').single();
+        if (error) throw error;
+        const { data: signed, error: sErr } = await db().storage.from(BUCKET).createSignedUploadUrl(path);
+        if (sErr) throw sErr;
+        out.push({ fileId: row.id, name: f.name, uploadUrl: signed.signedUrl });
+    }
+    return out;
+}
+
+// Marks files uploaded only if the object really exists in storage.
+export async function confirmUploads(orderId, fileIds) {
+    if (!Array.isArray(fileIds) || !fileIds.length) return [];
+    const { data: rows, error } = await db().from('order_files').select('id, storage_path, filename, kind')
+        .eq('order_id', orderId).in('id', fileIds.slice(0, MAX_FILES));
+    if (error) throw error;
+    const done = [];
+    for (const r of rows) {
+        const { data: exists } = await db().storage.from(BUCKET).exists(r.storage_path);
+        if (exists) {
+            await db().from('order_files').update({ uploaded: true }).eq('id', r.id);
+            done.push(r);
+        }
+    }
+    return done;
+}
+
+export async function signedDownload(path, filename) {
+    const { data, error } = await db().storage.from(BUCKET).createSignedUrl(path, 300, { download: filename });
+    if (error) throw error;
+    return data.signedUrl;
+}
+
+export async function addEvent(orderId, kind, title, detail = null, clientVisible = true) {
+    const { error } = await db().from('order_events').insert({ order_id: orderId, kind, title, detail, client_visible: clientVisible });
+    if (error) throw error;
+}
