@@ -20,6 +20,10 @@ const clientCodes = new Map();
 const sessions = new Set();
 const sessionEmails = new Map();
 const adminRecoveryCodes = new Map();
+const adminAuditLogs = [];
+function auditAdmin(emailAddr, action, targetCode = null, detailText = null) {
+    adminAuditLogs.unshift({ email: emailAddr, action, target_code: targetCode, detail: detailText, created_at: now() });
+}
 
 const SHA256_K = [
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
@@ -177,10 +181,17 @@ function prepareUploads(orderId, kind, list) {
         return { fileId: id, name, uploadUrl: `/__mock-upload/${id}` };
     });
 }
+const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
+const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
 function verifyFileMagic(bytes, filename) {
     if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > 25 * 1024 * 1024) return false;
     const ext = typeof filename === 'string' && filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
+    const headLen = Math.min(bytes.length, 4096);
+    let head = '';
+    for (let i = 0; i < headLen; i++) head += String.fromCharCode(bytes[i]);
+    if (POLYGLOT_SCRIPT_RE.test(head)) return false;
     if (ext === 'pdf') {
+        if (PDF_DANGEROUS_ACTION_RE.test(head)) return false;
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {
@@ -392,11 +403,16 @@ const handlers = {
             const alnum = raw.replace(/[^A-Z0-9]/g, '');
             const codes = adminRecoveryCodes.get(addr);
             let ok = digits === MOCK_ADMIN_CODE && raw.replace(/\s+/g, '') === digits;
+            let usedRecovery = false;
             if (!ok && alnum.length === 8 && codes && codes.has(alnum)) {
                 codes.delete(alnum);
                 ok = true;
+                usedRecovery = true;
             }
-            if (!ok) fail(401, 'That code is wrong or expired. Request a new one.');
+            if (!ok) {
+                auditAdmin(addr, 'login_failed');
+                fail(401, 'That code is wrong or expired. Request a new one.');
+            }
             const existingForAdmin = [...sessionEmails.entries()].filter(([, em]) => em === addr).map(([tok]) => tok);
             while (existingForAdmin.length >= 5) {
                 const oldest = existingForAdmin.shift();
@@ -406,15 +422,20 @@ const handlers = {
             const t = token();
             sessions.add(t);
             sessionEmails.set(t, addr);
+            auditAdmin(addr, usedRecovery ? 'login_recovery_code' : 'login_success');
             return json({ ok: true }, 200, { 'set-cookie': `nps_admin=${t}; Path=/api/admin; HttpOnly; SameSite=Strict` });
         }
         const cookie = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_admin=([^;]+)/)?.[1];
         if (!cookie || !/^[A-Za-z0-9_-]{16,128}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
         const adminEmail = sessionEmails.get(cookie) || ADMIN_EMAIL;
-        if (a === 'me') return json({ email: adminEmail, recoveryRemaining: adminRecoveryCodes.get(adminEmail)?.size || 0 });
+        if (a === 'me') {
+            const auditLogs = adminAuditLogs.filter(l => l.email === adminEmail).slice(0, 10).map(({ action, target_code, detail, created_at }) => ({ action, target_code, detail, created_at }));
+            return json({ email: adminEmail, recoveryRemaining: adminRecoveryCodes.get(adminEmail)?.size || 0, auditLogs });
+        }
         if (a === 'logout') {
             sessions.delete(cookie);
             sessionEmails.delete(cookie);
+            auditAdmin(adminEmail, 'logout');
             return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' });
         }
         if (a === 'logout-all') {
@@ -422,6 +443,7 @@ const handlers = {
                 if (em === adminEmail) { sessions.delete(tok); sessionEmails.delete(tok); }
             }
             sessions.delete(cookie);
+            auditAdmin(adminEmail, 'logout_all');
             return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' });
         }
         if (a === 'generate-recovery-codes') {
@@ -434,6 +456,7 @@ const handlers = {
                 out.push(`${raw.slice(0, 4)}-${raw.slice(4)}`);
             }
             adminRecoveryCodes.set(adminEmail, set);
+            auditAdmin(adminEmail, 'generate_recovery_codes');
             return json({ codes: out, remaining: out.length });
         }
         if (a === 'list') {
@@ -489,10 +512,12 @@ const handlers = {
             Object.assign(o, { status: 'awaiting_payment', amount_due_cents: cents, stripe_session_id: session,
                 payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}` });
             addEvent(o.id, 'payment', `Payment requested: ${money(cents)}`, description);
+            auditAdmin(adminEmail, 'payment_link', o.code, money(cents));
             email(o.client_email, `${o.code}: confirmed, ${money(cents)} due to start service`, o.payment_url);
             return json(adminDetail(o));
         }
         if (a === 'export') {
+            auditAdmin(adminEmail, 'export_order', o.code);
             const { track_token, payment_url, stripe_session_id, ...fields } = o;
             return json({ exported_at: now(), request: { ...fields, tier: TIERS[o.tier]?.name },
                 timeline: events.filter(e => e.order_id === o.id).map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible })),
@@ -500,9 +525,11 @@ const handlers = {
         }
         if (a === 'delete') {
             if (String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm.`);
-            for (const [fid, f] of files) if (f.order_id === o.id) files.delete(fid);
+            let deletedFiles = 0;
+            for (const [fid, f] of files) if (f.order_id === o.id) { files.delete(fid); deletedFiles++; }
             for (let i = events.length - 1; i >= 0; i--) if (events[i].order_id === o.id) events.splice(i, 1);
             orders.delete(o.id);
+            auditAdmin(adminEmail, 'delete_order', o.code, `${deletedFiles} file(s) deleted`);
             return json({ ok: true, deleted: o.code });
         }
         if (a === 'proof-upload') {

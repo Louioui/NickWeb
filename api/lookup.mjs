@@ -1,7 +1,7 @@
 // POST /api/lookup { code, email } — "Track Existing Serve" for clients who lost their link.
 // The answer is always the same, so nobody can use this to find out which codes or emails exist;
 // if both match, the private link is emailed to the address on the order.
-import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, email } from './_lib/core.mjs';
+import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, email, sha256 } from './_lib/core.mjs';
 import { sendEmail } from './_lib/orders.mjs';
 
 export const POST = handle(async (request) => {
@@ -12,6 +12,7 @@ export const POST = handle(async (request) => {
         return json({ ok: true, message: 'If that reference number and email match a request, we just emailed you its private tracking link.' });
     }
     await rateLimit(`lookup:${clientIp(request)}`, 6, 900);
+    await rateLimit(`lookup-email:${sha256(addr)}`, 3, 900);
     const { data: order } = await db().from('orders').select('code, track_token, client_email, client_name').eq('code', code).eq('client_email', addr).maybeSingle();
     if (order) {
         await sendEmail({

@@ -17,25 +17,38 @@ export const POST = handle(async (request) => {
 
     const admin = await requireAdmin(request);
     if (a === 'me') return me(admin);
-    if (a === 'logout') return logout(request);
+    if (a === 'logout') return logout(request, admin);
     if (a === 'logout-all') return logoutAll(request, admin);
-    if (a === 'generate-recovery-codes') return generateRecoveryCodes(admin);
+    if (a === 'generate-recovery-codes') return generateRecoveryCodes(request, admin);
     if (a === 'list') return list();
     if (a === 'get') return json(await detail(body.id));
     if (a === 'update') return update(request, body);
-    if (a === 'payment-link') return paymentLink(request, body);
+    if (a === 'payment-link') return paymentLink(request, body, admin);
     if (a === 'proof-upload') return proofUpload(body);
     if (a === 'proof-finish') return proofFinish(request, body);
     if (a === 'file-url') return fileUrl(body);
-    if (a === 'export') return exportOrder(body);
-    if (a === 'delete') return deleteOrder(body);
+    if (a === 'export') return exportOrder(request, body, admin);
+    if (a === 'delete') return deleteOrder(request, body, admin);
     throw new HttpError(400, 'Unknown action.');
 });
+
+async function auditAdmin(request, emailAddr, action, targetCode = null, detailText = null) {
+    try {
+        await db().from('admin_audit_logs').insert({
+            email: emailAddr,
+            action,
+            target_code: targetCode,
+            detail: detailText,
+            ip_hash: sha256(clientIp(request)),
+        });
+    } catch { /* non-fatal if admin_audit_logs migration is not applied yet */ }
+}
 
 // --- Login: an 8-digit code emailed to an allowed address, then a session cookie ---
 async function sendCode(request, body) {
     await rateLimit(`admin-code:${clientIp(request)}`, 5, 900);
     const addr = email(body.email);
+    await rateLimit(`admin-code-email:${sha256(addr)}`, 5, 900);
     if (ADMIN_EMAILS.includes(addr)) {
         // Nick's address is public, so cap how many codes exist for it per hour (each code allows only 5 guesses, and the
         // database also caps wrong guesses per hour across all codes; see supabase/migrations).
@@ -58,10 +71,12 @@ async function sendCode(request, body) {
 async function verifyCode(request, body) {
     await rateLimit(`admin-verify:${clientIp(request)}`, 10, 900);
     const addr = email(body.email);
+    await rateLimit(`admin-verify-email:${sha256(addr)}`, 8, 900);
     const raw = String(body.code || '').trim().toUpperCase();
     const digits = raw.replace(/\D/g, '');
     const alnum = raw.replace(/[^A-Z0-9]/g, '');
     let ok = false;
+    let usedRecovery = false;
     if (digits.length === 8 && raw.replace(/\s+/g, '') === digits) {
         // Checked and counted in one locked database step (use_admin_code), so parallel guesses can't get past 5 tries per code.
         const { data, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${digits}`) });
@@ -70,9 +85,12 @@ async function verifyCode(request, body) {
     }
     if (!ok && alnum.length === 8 && ADMIN_EMAILS.includes(addr)) {
         const { data, error } = await db().rpc('use_admin_recovery_code', { p_email: addr, p_hash: sha256(`${addr}:${alnum}`) });
-        if (!error && data) ok = true;
+        if (!error && data) { ok = true; usedRecovery = true; }
     }
-    if (!ok) throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
+    if (!ok) {
+        if (ADMIN_EMAILS.includes(addr)) await auditAdmin(request, addr, 'login_failed');
+        throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
+    }
     const nowIso = new Date().toISOString();
     await db().from('admin_sessions').delete().eq('email', addr).lt('expires_at', nowIso);
     const { data: activeSessions } = await db().from('admin_sessions').select('token_hash, created_at')
@@ -83,6 +101,7 @@ async function verifyCode(request, body) {
     }
     const token = randomToken(32);
     await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
+    await auditAdmin(request, addr, usedRecovery ? 'login_recovery_code' : 'login_success');
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';   // HTTPS-only everywhere but local testing
     return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=${token}; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}` });
 }
@@ -97,28 +116,36 @@ async function requireAdmin(request) {
 
 async function me(admin) {
     let recoveryRemaining = 0;
+    let auditLogs = [];
     try {
         const { count, error } = await db().from('admin_recovery_codes').select('id', { count: 'exact', head: true }).eq('email', admin).eq('used', false);
         if (!error && typeof count === 'number') recoveryRemaining = count;
     } catch { /* table may not be migrated yet */ }
-    return json({ email: admin, recoveryRemaining });
+    try {
+        const { data } = await db().from('admin_audit_logs').select('action, target_code, detail, created_at').eq('email', admin).order('created_at', { ascending: false }).limit(10);
+        if (Array.isArray(data)) auditLogs = data;
+    } catch { /* table may not be migrated yet */ }
+    return json({ email: admin, recoveryRemaining, auditLogs });
 }
 
-async function logout(request) {
+async function logout(request, admin) {
     const token = getCookie(request, COOKIE);
     if (typeof token === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(token)) await db().from('admin_sessions').delete().eq('token_hash', sha256(token));
+    await auditAdmin(request, admin, 'logout');
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';
     return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=0` });
 }
 
 async function logoutAll(request, admin) {
     await db().from('admin_sessions').delete().eq('email', admin);
+    await auditAdmin(request, admin, 'logout_all');
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';
     return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=0` });
 }
 
 const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-async function generateRecoveryCodes(admin) {
+async function generateRecoveryCodes(request, admin) {
+    await rateLimit(`admin-recovery-gen:${sha256(admin)}`, 3, 3600);
     const codes = [];
     const rows = [];
     for (let i = 0; i < 8; i++) {
@@ -130,6 +157,7 @@ async function generateRecoveryCodes(admin) {
     await db().from('admin_recovery_codes').delete().eq('email', admin).eq('used', false);
     const { error } = await db().from('admin_recovery_codes').insert(rows);
     if (error) throw new HttpError(503, 'Backup recovery codes require the latest database migration.');
+    await auditAdmin(request, admin, 'generate_recovery_codes');
     return json({ codes, remaining: codes.length });
 }
 
@@ -225,7 +253,8 @@ async function update(request, body) {
     return json(await detail(order.id));
 }
 
-async function paymentLink(request, body) {
+async function paymentLink(request, body, admin) {
+    await rateLimit(`admin-paylink:${sha256(admin)}`, 20, 900);
     const order = await getOrder(body.id);
     const cents = Math.round(Number(body.amount) * 100);
     if (!Number.isFinite(cents) || cents < 100 || cents > 1000000) throw new HttpError(400, 'Enter an amount between $1 and $10,000.');
@@ -245,6 +274,7 @@ async function paymentLink(request, body) {
     const session = await createCheckout(order, cents, description, origin);
     await db().from('orders').update({ status: 'awaiting_payment', amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id }).eq('id', order.id);
     await addEvent(order.id, 'payment', `Payment requested: ${money(cents)}`, description);
+    await auditAdmin(request, admin, 'payment_link', order.code, money(cents));
     await sendEmail({
         to: order.client_email, subject: `${order.code}: confirmed, ${money(cents)} due to start service`,
         heading: 'Your request is confirmed',
@@ -289,8 +319,10 @@ async function fileUrl(body) {
 
 // --- Privacy requests: a client asks for a copy of their data, or for it to be deleted ---
 // Nick finds their requests by searching their email in the dashboard, then exports or deletes each one.
-async function exportOrder(body) {
+async function exportOrder(request, body, admin) {
+    await rateLimit(`admin-export:${sha256(admin)}`, 15, 900);
     const { order, events, files } = await detail(body.id);
+    await auditAdmin(request, admin, 'export_order', order.code);
     const { track_token, payment_url, stripe_session_id, tier_name, addon_names, ...fields } = order;   // keys, not personal data
     return json({
         exported_at: new Date().toISOString(),
@@ -302,7 +334,8 @@ async function exportOrder(body) {
 }
 
 // Permanent: removes the stored documents, then the request with its timeline and file records (cascade).
-async function deleteOrder(body) {
+async function deleteOrder(request, body, admin) {
+    await rateLimit(`admin-delete:${sha256(admin)}`, 5, 900);
     const order = await getOrder(body.id);
     if (String(body.confirm || '').trim().toUpperCase() !== order.code) throw new HttpError(400, `Type ${order.code} to confirm.`);
     const { data: fileRows, error } = await db().from('order_files').select('storage_path').eq('order_id', order.id);
@@ -317,6 +350,7 @@ async function deleteOrder(body) {
     }
     const { error: dErr } = await db().from('orders').delete().eq('id', order.id);
     if (dErr) throw dErr;
+    await auditAdmin(request, admin, 'delete_order', order.code, `${paths.length} file(s) deleted`);
     console.log(`Request ${order.code} and ${paths.length} file(s) permanently deleted at Nick's request.`);
     return json({ ok: true, deleted: order.code, files: paths.length });
 }

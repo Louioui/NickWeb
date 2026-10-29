@@ -28,6 +28,14 @@ self.addEventListener('activate', (event) => {
     );
 });
 
+self.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'CLEAR_AUTH_CACHE') {
+        event.waitUntil(
+            caches.keys().then((keys) => Promise.all(keys.map((k) => caches.delete(k)))).catch(() => {})
+        );
+    }
+});
+
 self.addEventListener('fetch', (event) => {
     const req = event.request;
     if (req.method !== 'GET') return;

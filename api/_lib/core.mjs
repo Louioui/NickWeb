@@ -214,12 +214,22 @@ export async function prepareUploads(orderId, kind, files) {
     return out;
 }
 
-// Verifies that actual uploaded file bytes match the expected binary signature (magic bytes) of the file extension.
+// Verifies that actual uploaded file bytes match the expected binary signature (magic bytes) of the file extension
+// and rejects polyglot files that embed HTML/script tags or executable PDF actions inside the header.
+const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
+const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
+
 export function verifyFileMagic(bytes, filename) {
     if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > MAX_FILE_BYTES) return false;
     const ext = typeof filename === 'string' && filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
+    const headLen = Math.min(bytes.length, 4096);
+    let head = '';
+    for (let i = 0; i < headLen; i++) head += String.fromCharCode(bytes[i]);
+    if (POLYGLOT_SCRIPT_RE.test(head)) return false;
+
     if (ext === 'pdf') {
-        // %PDF-
+        // %PDF- and no embedded Acrobat JavaScript / Launch actions
+        if (PDF_DANGEROUS_ACTION_RE.test(head)) return false;
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {
