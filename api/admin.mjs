@@ -28,12 +28,17 @@ export const POST = handle(async (request) => {
     throw new HttpError(400, 'Unknown action.');
 });
 
-// --- Login: a 6-digit code emailed to an allowed address, then a session cookie ---
+// --- Login: an 8-digit code emailed to an allowed address, then a session cookie ---
 async function sendCode(request, body) {
     await rateLimit(`admin-code:${clientIp(request)}`, 5, 900);
     const addr = email(body.email);
     if (ADMIN_EMAILS.includes(addr)) {
-        const code = String(randomInt(0, 1000000)).padStart(6, '0');
+        // Nick's address is public, so cap how many codes exist for it per hour (each code allows only 5 guesses, and the
+        // database also caps wrong guesses per hour across all codes; see supabase/migrations).
+        const { data: issued, error: cErr } = await db().rpc('admin_codes_last_hour', { p_email: addr });
+        if (cErr) throw cErr;
+        if (issued >= 10) return json({ ok: true });   // same answer as always; just no new code
+        const code = String(randomInt(0, 100000000)).padStart(8, '0');
         await db().from('admin_codes').insert({ email: addr, code_hash: sha256(`${addr}:${code}`), expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString() });
         await sendEmail({
             to: addr,

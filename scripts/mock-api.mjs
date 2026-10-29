@@ -4,7 +4,7 @@
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money } from '../api/_lib/orders.mjs';
 
-export const MOCK_ADMIN_CODE = '123456';
+export const MOCK_ADMIN_CODE = '12345678';
 const ADMIN_EMAIL = 'nicksprocessservices@outlook.com';
 
 const orders = new Map();      // id -> order row

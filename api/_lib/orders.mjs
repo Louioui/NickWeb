@@ -103,7 +103,9 @@ const REPLY_TO = 'nicksprocessservices@outlook.com';
 // Names and notes typed on the site go into these emails. Web addresses in them are removed, so nobody can use the
 // request form to send a scam link from Nick's real address (email apps would make it clickable). Our own links
 // only ever travel in the button. Email addresses are left alone.
-const LINKISH = /\b(?:https?:\/\/|www\.)\S+|(?<![@\w.-])(?:[a-z0-9-]+\.)+(?:com|net|org|info|biz|io|co|us|me|app|dev|xyz|site|online|top|link|click|shop|live|ru|cn|ly|gl|to|tk)\b(?:\/\S*)?/gi;
+// Any "name.ending" counts (there are 1,500+ endings: .help, .law, .ai, xn--…), except inside an email address.
+// Initials like "J.R." and amounts like "$1.50" don't match: an ending needs 2+ letters and can't be followed by a letter.
+const LINKISH = /\b(?:https?:\/\/|www\.)\S+|(?<![@\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:[a-z]{2,}|xn--[a-z0-9-]+)(?![a-z0-9-])(?:[:\/]\S*)?/gi;
 export const clean = (s, max = 600) => String(s ?? '').replace(LINKISH, '[link removed]').slice(0, max);
 
 export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, lines: rawLines, button }) {

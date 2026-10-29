@@ -65,6 +65,13 @@ const scrubbed = (s) => !/evil|scam|bit\.ly|pay-now/i.test(clean(s));
 for (const s of ['Visit https://evil.example/pay now', 'go to www.scam-site.com', 'pay at scam-site.com/invoice', 'bit.ly/3xYz',
                  'EVIL.COM', 'login at pay-now.net?x=1', 'Jordan (scam.dev)', 'http://192.168.0.1/evil'])
     ok(`link removed: ${s}`, scrubbed(s) || clean(s).includes('[link removed]'));
+for (const s of ['refund at court-fees.help', 'case.ai/pay', 'see justice.law', 'pay.page', 'x.pro', 'xn--80ak6aa92e.com', 'login.microsoftonline.support/x',
+                 'claim at nick-process.services', 'click here: EVIL.LOL', 'scam.example.museum'])
+    ok(`any ending removed: ${s}`, clean(s).includes('[link removed]'));
+ok('initials kept', clean('J.R.R. Tolkien and A.B. Smith') === 'J.R.R. Tolkien and A.B. Smith');
+ok('money kept', clean('Total due: $140.00 (Standard $75.00 + $15.50)') === 'Total due: $140.00 (Standard $75.00 + $15.50)');
+ok('time kept', clean('Tried 6:30 p.m. and 7 a.m.') === 'Tried 6:30 p.m. and 7 a.m.');
+ok('reference kept', clean('Reference: NP-482913 · Case 24STFL01234') === 'Reference: NP-482913 · Case 24STFL01234');
 ok('email address kept', clean('maria@example.com · (714) 555-0199') === 'maria@example.com · (714) 555-0199');
 ok('names kept', clean('J.R. Smith, Vance & Ortiz LLP') === 'J.R. Smith, Vance & Ortiz LLP');
 ok('address kept', clean('2250 E Ocean Blvd, Apt 7B, Long Beach 90803') === '2250 E Ocean Blvd, Apt 7B, Long Beach 90803');

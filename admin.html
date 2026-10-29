@@ -29,7 +29,7 @@
         </div>
     </header>
 
-    <!-- Login: a 6-digit code is emailed to Nick's address -->
+    <!-- Login: an 8-digit code is emailed to Nick's address -->
     <main id="login-view" class="hidden flex-1 flex items-center justify-center px-5 py-16">
         <div class="panel p-8 sm:p-10 w-full max-w-md">
             <p class="font-serif italic text-bronze mb-1">Dashboard</p>
@@ -39,8 +39,8 @@
                 <button type="submit" class="btn btn-pine w-full">Email Me a Login Code</button>
             </form>
             <form id="code-form" class="hidden space-y-4">
-                <p class="text-sm text-muted">If that address is allowed, a 6-digit code is on its way. It expires in 10 minutes.</p>
-                <div><label for="login-code" class="field-label">Login Code</label><input id="login-code" required inputmode="numeric" autocomplete="one-time-code" maxlength="6" class="field text-center text-2xl tracking-[0.5em]"></div>
+                <p class="text-sm text-muted">If that address is allowed, an 8-digit code is on its way. It expires in 10 minutes.</p>
+                <div><label for="login-code" class="field-label">Login Code</label><input id="login-code" required inputmode="numeric" autocomplete="one-time-code" maxlength="8" class="field text-center text-2xl tracking-[0.35em]"></div>
                 <button type="submit" class="btn btn-pine w-full">Log In</button>
                 <button type="button" onclick="showEmailStep()" class="text-xs text-primary underline underline-offset-2">Use a different email or send a new code</button>
             </form>
