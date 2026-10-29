@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, HttpError } from './core.mjs';
+import { db, addEvent, signedDownload, HttpError, IS_PROD } from './core.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -104,7 +104,9 @@ export async function sendEmail({ to, subject, heading, lines, button }) {
     const textBody = [heading, '', ...lines, ...(button ? ['', `${button.label}: ${button.url}`] : [])].join('\n');
     const key = process.env.RESEND_API_KEY;
     if (!key) {
-        console.log(`\n[email not sent: no RESEND_API_KEY]\nTo: ${to}\nSubject: ${subject}\n${textBody}\n`);
+        // Locally the email is printed so the flow can be tested. In production it would put login codes and client details in the logs.
+        if (IS_PROD) console.error(`Email not sent (RESEND_API_KEY is not set): "${subject.replace(/\d{6}/g, '######')}"`);
+        else console.log(`\n[email not sent: no RESEND_API_KEY]\nTo: ${to}\nSubject: ${subject}\n${textBody}\n`);
         return;
     }
     const res = await fetch('https://api.resend.com/emails', {
