@@ -466,8 +466,19 @@ await step('Static audit: zero raw SQL interpolations in api/, RLS + anon/authen
         assert.ok(adminSrc.includes(bucket), `api/admin.mjs must enforce ${bucket} rate limit`);
         totalAssertions++;
     }
-    const adminHtmlSrc = await readFile(path.join(root, 'admin.html'), 'utf8');
+    // The dashboard's code lives in assets/js/admin.js (no inline scripts, so its CSP can refuse them).
+    const adminHtmlSrc = await readFile(path.join(root, 'admin.html'), 'utf8') + await readFile(path.join(root, 'assets/js/admin.js'), 'utf8');
     assert.ok(adminHtmlSrc.includes('scrubClientState') && adminHtmlSrc.includes('CLEAR_AUTH_CACHE'), 'admin.html must scrub client state and SW cache on sign-out');
+    // Private pages: no inline <script> blocks or on…= handler attributes, and a CSP whose script-src is 'self' only.
+    for (const page of ['admin.html', 'track.html', 'account.html', 'demo.html']) {
+        const html = await readFile(path.join(root, page), 'utf8');
+        assert.ok(!/<script(?![^>]*\bsrc=)[^>]*>/i.test(html), `${page} has an inline <script>`);
+        assert.ok(!/\son[a-z]+\s*=\s*["']/i.test(html), `${page} has an inline event handler`);
+    }
+    const vercelCfg = JSON.parse(await readFile(path.join(root, 'vercel.json'), 'utf8'));
+    const privateCsp = vercelCfg.headers.find(h => h.source.includes('track|admin|account|demo')).headers.find(h => h.key === 'Content-Security-Policy').value;
+    assert.ok(/script-src 'self';/.test(privateCsp) && !/script-src[^;]*unsafe-inline/.test(privateCsp), 'private pages must not allow inline scripts');
+    totalAssertions += 9;
     const clientJsSrc = await readFile(path.join(root, 'assets/js/client-account.js'), 'utf8');
     assert.ok(clientJsSrc.includes('scrubClientState') && clientJsSrc.includes('CLEAR_AUTH_CACHE'), 'client-account.js must scrub client state and SW cache on sign-out');
     const swSrc = await readFile(path.join(root, 'sw.js'), 'utf8');

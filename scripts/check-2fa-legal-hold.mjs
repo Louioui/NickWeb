@@ -163,7 +163,7 @@ for (const fn of ['esc', 'post', 'get', 'fileMeta', 'checkFiles', 'uploadAll', '
     check(`assets/js/nps.js exports ${fn}`, typeof NPS[fn] === 'function');
 }
 check('browser helpers work', NPS.money(14000) === '$140.00' && NPS.esc('<b>') === '&lt;b&gt;');
-const pages = await Promise.all(['admin.html', 'track.html'].map(f => readFile(new URL(`../${f}`, import.meta.url), 'utf8')));
+const pages = await Promise.all(['admin.html', 'track.html', 'assets/js/admin.js', 'assets/js/track.js'].map(f => readFile(new URL(`../${f}`, import.meta.url), 'utf8')));
 check('no page ships unverifiable security claims', !/TLS 1\.3|Zero-Trust|court-certified|tamper-proof|HMAC-SHA256|device-bound/i.test(pages.join('') + npsSrc));
 
 console.log(`${passed} two-step, legal hold, document lock and seal checks passed`);

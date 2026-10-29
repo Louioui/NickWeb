@@ -262,7 +262,7 @@ const NPS = (() => {
             table{width:100%;border-collapse:collapse;margin-top:8px;font-family:sans-serif;font-size:12px}th{background:#e6eee9;text-align:left;padding:8px;border:1px solid #cdd7d1}
             .meta div{margin:2px 0}.seal{margin:16px 0;padding:12px;border:1px solid #cdd7d1;font-family:sans-serif;font-size:12px;word-break:break-all}
             @media print{.no-print{display:none}}</style></head><body>
-            <div class="no-print" style="text-align:right"><button onclick="window.print()" style="padding:8px 16px;background:#0d422e;color:#fff;border:0;cursor:pointer;font-weight:600">Print / Save as PDF</button></div>
+            <div class="no-print" style="text-align:right"><button id="print-record" type="button" style="padding:8px 16px;background:#0d422e;color:#fff;border:0;cursor:pointer;font-weight:600">Print / Save as PDF</button></div>
             <h1>Service record: ${esc(cert.code)}</h1>
             <p style="margin-top:0;color:#566860;font-size:13px">Nick's Process Services · printed ${esc(fmtDate(new Date().toISOString()))}</p>
             <div class="meta"><div><strong>Status:</strong> ${esc(cert.statusLabel)}${cert.legalHold ? ' (legal hold on)' : ''}</div>
@@ -277,6 +277,8 @@ const NPS = (() => {
             Each timeline entry is linked to the one before it by a SHA-256 hash written when the entry was created; the seal above is the newest link, and the same value was emailed to the client when proof was uploaded.</p>
         </body></html>`);
         w.document.close();
+        // A listener, not an inline onclick: the pop-up inherits the dashboard's Content Security Policy.
+        w.document.getElementById('print-record')?.addEventListener('click', () => w.print());
     }
 
     return {

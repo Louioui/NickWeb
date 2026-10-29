@@ -122,7 +122,7 @@
         },
         {
           "key": "Content-Security-Policy",
-          "value": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; connect-src 'self' https://wlbmtcrgftermdtwnbgb.supabase.co; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'"
+          "value": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; connect-src 'self' https://wlbmtcrgftermdtwnbgb.supabase.co; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'"
         }
       ]
     },
