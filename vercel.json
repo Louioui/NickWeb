@@ -95,7 +95,7 @@
       ]
     },
     {
-      "source": "/(track|admin|account)\\.html",
+      "source": "/(track|admin|account|demo)\\.html",
       "headers": [
         {
           "key": "Referrer-Policy",

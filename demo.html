@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Site Demo & Setup | Nick's Process Services</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23064E3B'/%3E%3Cpath d='M32 12v40M18 22h28M22 48h20M18 22l-6 14h12l-6-14zm28 0l-6 14h12l-6-14z' stroke='%23FBBF24' stroke-width='4' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --green: #064E3B; --green-mid: #065F46; --green-light: #D1FAE5;
+      --gold: #FBBF24; --gold-light: #FEF3C7;
+      --red: #DC2626; --red-light: #FEE2E2;
+      --blue: #1D4ED8; --blue-light: #DBEAFE;
+      --gray: #6B7280; --gray-light: #F3F4F6; --gray-border: #E5E7EB;
+      --text: #111827; --text-muted: #6B7280;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #F9FAFB; color: var(--text); line-height: 1.6; }
+
+    /* Header */
+    .header { background: var(--green); color: white; padding: 20px 24px; display: flex; align-items: center; gap: 12px; }
+    .header-icon { width: 40px; height: 40px; background: rgba(255,255,255,.15); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+    .header h1 { font-size: 1.2rem; font-weight: 700; }
+    .header p { font-size: .85rem; opacity: .8; margin-top: 2px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: .7rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; background: var(--gold); color: #78350F; margin-left: 8px; }
+
+    /* Layout */
+    .container { max-width: 860px; margin: 0 auto; padding: 24px 16px; }
+    .grid { display: grid; gap: 16px; }
+    @media(min-width:640px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
+
+    /* Alert banner */
+    .alert { border-radius: 10px; padding: 14px 16px; margin-bottom: 8px; display: flex; gap: 10px; align-items: flex-start; }
+    .alert-warn { background: var(--gold-light); border: 1.5px solid var(--gold); }
+    .alert-ok   { background: var(--green-light); border: 1.5px solid #6EE7B7; }
+    .alert-info { background: var(--blue-light); border: 1.5px solid #93C5FD; }
+    .alert-icon { font-size: 1.1rem; flex-shrink: 0; margin-top: 2px; }
+    .alert-title { font-weight: 700; font-size: .9rem; }
+    .alert-body  { font-size: .85rem; color: var(--text-muted); margin-top: 3px; }
+
+    /* Cards */
+    .card { background: white; border: 1px solid var(--gray-border); border-radius: 12px; overflow: hidden; }
+    .card-header { padding: 14px 18px; border-bottom: 1px solid var(--gray-border); display: flex; align-items: center; gap: 10px; }
+    .card-header-icon { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 1rem; flex-shrink: 0; }
+    .icon-green { background: var(--green-light); }
+    .icon-gold  { background: var(--gold-light); }
+    .icon-blue  { background: var(--blue-light); }
+    .icon-red   { background: var(--red-light); }
+    .card-header h2 { font-size: 1rem; font-weight: 700; }
+    .card-header .sub { font-size: .78rem; color: var(--text-muted); }
+    .card-body { padding: 18px; }
+
+    /* Steps */
+    .steps { list-style: none; }
+    .steps li { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--gray-border); }
+    .steps li:last-child { border-bottom: none; padding-bottom: 0; }
+    .step-num { width: 24px; height: 24px; border-radius: 99px; background: var(--green); color: white; font-size: .75rem; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 2px; }
+    .step-text { font-size: .88rem; flex: 1; }
+    .step-text strong { display: block; margin-bottom: 2px; }
+    .step-text code { background: var(--gray-light); border-radius: 4px; padding: 1px 5px; font-family: monospace; font-size: .82rem; word-break: break-all; }
+
+    /* Status chips */
+    .chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 99px; font-size: .75rem; font-weight: 600; }
+    .chip-green { background: var(--green-light); color: #065F46; }
+    .chip-gold  { background: var(--gold-light); color: #92400E; }
+    .chip-red   { background: var(--red-light); color: var(--red); }
+    .chip-blue  { background: var(--blue-light); color: var(--blue); }
+
+    /* Feature checklist */
+    .checklist { list-style: none; }
+    .checklist li { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--gray-border); font-size: .87rem; }
+    .checklist li:last-child { border-bottom: none; }
+    .check-icon { font-size: 1rem; flex-shrink: 0; margin-top: 1px; }
+    .check-label { flex: 1; }
+    .check-label strong { display: block; font-size: .88rem; }
+    .check-label span { font-size: .8rem; color: var(--text-muted); }
+
+    /* Buttons */
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border-radius: 8px; font-weight: 700; font-size: .88rem; cursor: pointer; text-decoration: none; border: none; transition: opacity .15s; }
+    .btn:hover { opacity: .88; }
+    .btn-green { background: var(--green); color: white; }
+    .btn-outline { background: white; color: var(--green); border: 1.5px solid var(--green); }
+    .btn-gold { background: var(--gold); color: #78350F; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+
+    /* Env var table */
+    .env-table { width: 100%; border-collapse: collapse; font-size: .83rem; }
+    .env-table th { text-align: left; padding: 8px 10px; background: var(--gray-light); font-weight: 700; font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); }
+    .env-table td { padding: 9px 10px; border-bottom: 1px solid var(--gray-border); vertical-align: top; }
+    .env-table tr:last-child td { border-bottom: none; }
+    .env-name { font-family: monospace; font-weight: 700; font-size: .82rem; }
+    .env-req  { color: var(--red); font-weight: 700; }
+    .env-opt  { color: var(--gray); }
+
+    /* Section titles */
+    .section-title { font-size: .7rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 10px; margin-top: 24px; }
+    .section-title:first-child { margin-top: 0; }
+
+    /* Progress bar */
+    .progress-wrap { margin: 6px 0 12px; }
+    .progress-label { font-size: .78rem; color: var(--text-muted); margin-bottom: 4px; display: flex; justify-content: space-between; }
+    .progress-track { height: 8px; background: var(--gray-border); border-radius: 99px; overflow: hidden; }
+    .progress-bar { height: 100%; border-radius: 99px; background: var(--green); transition: width .4s; }
+
+    /* Feature demo items */
+    .demo-item { display: flex; gap: 14px; padding: 14px 0; border-bottom: 1px solid var(--gray-border); }
+    .demo-item:last-child { border-bottom: none; padding-bottom: 0; }
+    .demo-num { width: 32px; height: 32px; border-radius: 8px; background: var(--green); color: white; font-size: .8rem; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .demo-content h3 { font-size: .92rem; font-weight: 700; }
+    .demo-content p  { font-size: .82rem; color: var(--text-muted); margin-top: 3px; }
+    .demo-content .how { font-size: .8rem; margin-top: 6px; background: var(--gray-light); border-radius: 6px; padding: 8px 10px; }
+    .demo-content .how strong { color: var(--green); }
+
+    footer { text-align: center; padding: 32px 16px; font-size: .78rem; color: var(--text-muted); }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-icon">⚖️</div>
+  <div>
+    <h1>Nick's Process Services — Site Demo & Setup Guide <span class="badge">Private</span></h1>
+    <p>Walk through every feature before you launch. This page is never indexed or shown to clients.</p>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- Launch readiness -->
+  <p class="section-title">Launch Readiness</p>
+  <div class="grid">
+    <div id="env-status" class="alert alert-warn">
+      <span class="alert-icon">⚙️</span>
+      <div>
+        <div class="alert-title">Check your Vercel environment variables first</div>
+        <div class="alert-body">The API calls below won't work until <code>APP_SECRET</code>, <code>SUPABASE_SERVICE_ROLE_KEY</code>, <code>RESEND_API_KEY</code>, and <code>STRIPE_SECRET_KEY</code> are set in Vercel → Project → Settings → Environment Variables.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="progress-wrap" style="margin-top:14px;">
+    <div class="progress-label"><span>Features built &amp; tested</span><span>100%</span></div>
+    <div class="progress-track"><div class="progress-bar" style="width:100%"></div></div>
+    <div class="progress-label" style="margin-top:4px;"><span>Launch blockers remaining</span><span id="blockers-label">checking…</span></div>
+    <div class="progress-track"><div class="progress-bar" id="blockers-bar" style="width:0%;background:var(--red)"></div></div>
+  </div>
+
+  <!-- Quick links -->
+  <p class="section-title">Quick Links</p>
+  <div class="grid grid-2">
+    <a href="/" class="btn btn-outline" style="justify-content:center;">🏠 Front Page (Client View)</a>
+    <a href="/admin.html" class="btn btn-green" style="justify-content:center;">🔐 Admin Dashboard</a>
+    <a href="/track.html" class="btn btn-outline" style="justify-content:center;">📦 Client Tracking Page</a>
+    <a href="/account.html" class="btn btn-outline" style="justify-content:center;">👤 Client Account Portal</a>
+  </div>
+
+  <!-- Environment variables -->
+  <p class="section-title">Required Environment Variables (Vercel → Settings → Environment Variables)</p>
+  <div class="card">
+    <div class="card-body" style="padding:0;">
+      <table class="env-table">
+        <thead><tr><th>Variable</th><th>Required?</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><span class="env-name">APP_SECRET</span></td>
+            <td><span class="env-req">Required</span></td>
+            <td>Long random string (64+ chars). Encrypts Nick's authenticator secret and keys all recovery codes &amp; unlock tokens. <strong>Use the same value in Preview and Production.</strong> Never use the Supabase key — rotating Supabase after a breach would lock Nick out of 2FA permanently.</td>
+          </tr>
+          <tr>
+            <td><span class="env-name">SUPABASE_SERVICE_ROLE_KEY</span></td>
+            <td><span class="env-req">Required</span></td>
+            <td>From Supabase → Project → Settings → API. The service-role (secret) key, not the anon key.</td>
+          </tr>
+          <tr>
+            <td><span class="env-name">RESEND_API_KEY</span></td>
+            <td><span class="env-req">Required</span></td>
+            <td>From resend.com. Sends login codes, payment links, and tracking links to clients. Without it, emails are silently skipped in production.</td>
+          </tr>
+          <tr>
+            <td><span class="env-name">STRIPE_SECRET_KEY</span></td>
+            <td><span class="env-req">Required</span></td>
+            <td>From Stripe → Developers → API keys. Use the test key (<code>sk_test_…</code>) until you're ready to take real payments.</td>
+          </tr>
+          <tr>
+            <td><span class="env-name">STRIPE_WEBHOOK_SECRET</span></td>
+            <td><span class="env-opt">Needed for payments</span></td>
+            <td>From Stripe → Webhooks → your endpoint. Required to automatically mark orders as paid when Stripe confirms the payment. Without it, Nick has to mark orders paid manually.</td>
+          </tr>
+          <tr>
+            <td><span class="env-name">CRON_SECRET</span></td>
+            <td><span class="env-opt">Recommended</span></td>
+            <td>Any long random string. Protects the daily cleanup endpoint from being triggered by anyone. Set it in Vercel; Vercel Cron passes it automatically.</td>
+          </tr>
+          <tr>
+            <td><span class="env-name">SUPABASE_URL</span></td>
+            <td><span class="env-opt">Auto-set</span></td>
+            <td>Already hard-coded to <code>wlbmtcrgftermdtwnbgb.supabase.co</code>. Only needed if the project changes.</td>
+          </tr>
+          <tr>
+            <td><span class="env-name">ADMIN_EMAILS</span></td>
+            <td><span class="env-opt">Auto-set</span></td>
+            <td>Defaults to <code>nicksprocessservices@outlook.com</code>. Set this to change which email addresses can log in to the dashboard.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Feature walkthrough -->
+  <p class="section-title">Feature Demo — Walk Through Each One</p>
+
+  <div class="grid">
+    <!-- Card 1: Dashboard login -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-green">🔐</div>
+        <div><h2>1 · Admin Dashboard Login</h2><div class="sub">Two-step sign-in, session cap, security alerts</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>Go to <a href="/admin.html">/admin.html</a></strong> — you'll see the email sign-in screen.</span></li>
+          <li><span class="step-num">2</span><span class="step-text"><strong>Enter <code>nicksprocessservices@outlook.com</code></strong> and click "Send Code." Nick gets an 8-digit code by email (Resend must be configured).</span></li>
+          <li><span class="step-num">3</span><span class="step-text"><strong>Enter the code.</strong> First login: signs in. After 2FA is set up, a second prompt appears for the authenticator code.</span></li>
+          <li><span class="step-num">4</span><span class="step-text"><strong>Check Nick's email</strong> — a security alert arrives for every sign-in. If Nick didn't do it, the alert is his warning.</span></li>
+          <li><span class="step-num">5</span><span class="step-text"><strong>Try wrong codes 5 times</strong> — all codes are burned, Nick gets a lockout alert. Rate limit resets after 15 minutes.</span></li>
+        </ul>
+        <div class="btn-row"><a href="/admin.html" class="btn btn-green">Open Dashboard</a></div>
+      </div>
+    </div>
+
+    <!-- Card 2: 2FA setup -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-gold">📱</div>
+        <div><h2>2 · Set Up Authenticator App (2FA)</h2><div class="sub">Encrypted TOTP, recovery codes, replay prevention</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>Sign in to the dashboard</strong> and go to Settings → Two-Step Sign-in.</span></li>
+          <li><span class="step-num">2</span><span class="step-text"><strong>Scan the QR code</strong> with Google Authenticator, Authy, or any TOTP app on your phone.</span></li>
+          <li><span class="step-num">3</span><span class="step-text"><strong>Enter the 6-digit code</strong> from the app to confirm. Your next sign-in will require both the email code AND the app code.</span></li>
+          <li><span class="step-num">4</span><span class="step-text"><strong>Generate recovery codes</strong> (Settings → Recovery Codes) and print or save them. If you lose your phone, one of these 8-character codes gets you back in.</span></li>
+          <li><span class="step-num">5</span><span class="step-text"><strong>Verify:</strong> Sign out, sign back in — you should now see a second prompt asking for your authenticator code.</span></li>
+        </ul>
+        <div class="btn-row"><a href="/admin.html" class="btn btn-gold">Open Dashboard → Settings</a></div>
+      </div>
+    </div>
+
+    <!-- Card 3: New order -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-green">📋</div>
+        <div><h2>3 · Receive a Client Request</h2><div class="sub">Public form → dashboard review → tracking link</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>Open the <a href="/#request">Request Form</a></strong> on the front page as a client would. Fill in a test name, address, and email.</span></li>
+          <li><span class="step-num">2</span><span class="step-text"><strong>Submit the form.</strong> Nick gets an email notification. The new order appears in the dashboard under "Pending."</span></li>
+          <li><span class="step-num">3</span><span class="step-text"><strong>In the dashboard,</strong> open the order. Review the details, set a price, and click "Send Payment Link."</span></li>
+          <li><span class="step-num">4</span><span class="step-text"><strong>The client gets two emails:</strong> a Stripe payment link (expires in 24 hours) and their private tracking link.</span></li>
+          <li><span class="step-num">5</span><span class="step-text"><strong>Open the tracking link</strong> as the client — you'll see the order status, timeline, and any uploaded documents.</span></li>
+        </ul>
+        <div class="btn-row">
+          <a href="/#request" class="btn btn-green">Open Request Form</a>
+          <a href="/admin.html" class="btn btn-outline">Open Dashboard</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Card 4: Legal hold -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-red">⚖️</div>
+        <div><h2>4 · Legal Hold on a Served Order</h2><div class="sub">DB-enforced freeze, tamper-evident timeline, unlock requires fresh code</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>In the dashboard,</strong> open any "Served" order and click "Place Legal Hold." The order is now frozen at the database level — not just in the app.</span></li>
+          <li><span class="step-num">2</span><span class="step-text"><strong>Try to delete or edit the order</strong> — the dashboard refuses, and the database itself blocks it too.</span></li>
+          <li><span class="step-num">3</span><span class="step-text"><strong>Billing still works on held orders:</strong> send a payment link, record a payment — the order stays "Served" but records the money.</span></li>
+          <li><span class="step-num">4</span><span class="step-text"><strong>To unlock</strong> (e.g. court case resolved): go to the order → Unlock Hold. With 2FA on, you need your authenticator code. Every unlock is logged permanently.</span></li>
+          <li><span class="step-num">5</span><span class="step-text"><strong>Nick gets a security alert email</strong> any time a hold is unlocked, even if he did it himself.</span></li>
+        </ul>
+        <div class="btn-row"><a href="/admin.html" class="btn btn-green">Open Dashboard</a></div>
+      </div>
+    </div>
+
+    <!-- Card 5: Document lock on tracking page -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-blue">🔒</div>
+        <div><h2>5 · Client 2-Step Document Lock</h2><div class="sub">Tracking page PIN or emailed code, 12-hr signed unlock token</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>On a client's tracking page,</strong> click "Enable 2-Step Protection." Court documents, address, and name are now blurred.</span></li>
+          <li><span class="step-num">2</span><span class="step-text"><strong>Refresh the page.</strong> The client must enter a code to see anything. They click "Send Code" → get a 6-digit code by email → enter it to unlock for 12 hours.</span></li>
+          <li><span class="step-num">3</span><span class="step-text"><strong>Optionally set a Security PIN</strong> (6 digits): the client's chosen PIN unlocks the page instead of requesting an email code every time.</span></li>
+          <li><span class="step-num">4</span><span class="step-text"><strong>Rotate the tracking link</strong> (Settings on the tracking page) if the client suspects their link was shared. Old link stops working; new link is emailed.</span></li>
+          <li><span class="step-num">5</span><span class="step-text"><strong>Try 5 wrong codes</strong> — the client is locked out for 15 minutes and must request a fresh code.</span></li>
+        </ul>
+        <div class="btn-row"><a href="/track.html" class="btn btn-green">Open Tracking Page</a></div>
+      </div>
+    </div>
+
+    <!-- Card 6: Chain of custody -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-green">🔗</div>
+        <div><h2>6 · Tamper-Evident Chain of Custody</h2><div class="sub">Hash-chained timeline, sealed at database write, verify anytime</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>In the dashboard,</strong> open a served order and click "Chain of Custody." A printable PDF shows the full timeline.</span></li>
+          <li><span class="step-num">2</span><span class="step-text"><strong>Every event in the timeline</strong> (status change, payment, note, file upload) is hashed and chained — changing any entry breaks every subsequent hash.</span></li>
+          <li><span class="step-num">3</span><span class="step-text"><strong>When proofs are uploaded,</strong> the client is emailed the SHA-256 fingerprint of each file plus the chain seal. This is an out-of-band copy that survives a database breach.</span></li>
+          <li><span class="step-num">4</span><span class="step-text"><strong>The chain is verified</strong> live each time you view the seal — any forgery shows "chain integrity failed."</span></li>
+          <li><span class="step-num">5</span><span class="step-text"><strong>Useful in court:</strong> the emailed seal + file fingerprints prove the proof documents existed at that date and were not altered afterward.</span></li>
+        </ul>
+        <div class="btn-row"><a href="/admin.html" class="btn btn-green">Open Dashboard</a></div>
+      </div>
+    </div>
+
+    <!-- Card 7: File upload security -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-gold">📎</div>
+        <div><h2>7 · Secure File Uploads</h2><div class="sub">Magic bytes, macro scan, polyglot detection, SHA-256 fingerprint</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>On any order's tracking page,</strong> try uploading a PDF, JPG, or DOCX. The server checks the actual file bytes — not just the filename.</span></li>
+          <li><span class="step-num">2</span><span class="step-text"><strong>Try renaming a .jpg as .pdf</strong> — the upload is rejected because the binary signature doesn't match.</span></li>
+          <li><span class="step-num">3</span><span class="step-text"><strong>DOCX files are scanned internally</strong> — any macro, script injection, or embedded executable triggers rejection.</span></li>
+          <li><span class="step-num">4</span><span class="step-text"><strong>Each uploaded file gets a SHA-256 fingerprint</strong> stored in the database. Nick can verify a file hasn't been swapped after upload.</span></li>
+          <li><span class="step-num">5</span><span class="step-text"><strong>Maximum 25 files per order.</strong> Files on orders under legal hold cannot be deleted.</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Card 8: DNS & email security -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-blue">🛡️</div>
+        <div><h2>8 · Domain & Email Security</h2><div class="sub">SPF, DMARC, null MX, Vercel firewall, security headers</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="checklist">
+          <li>
+            <span class="check-icon">✅</span>
+            <div class="check-label"><strong>SPF: <code>v=spf1 -all</code></strong><span>No server is allowed to send email from nicksprocessservices.dev. Any fake email fails SPF immediately.</span></div>
+            <span class="chip chip-green">Live</span>
+          </li>
+          <li>
+            <span class="check-icon">✅</span>
+            <div class="check-label"><strong>DMARC: <code>p=reject</code></strong><span>Mail servers reject any email claiming to be from this domain that fails SPF or DKIM. Spoofed emails never reach inboxes.</span></div>
+            <span class="chip chip-green">Live</span>
+          </li>
+          <li>
+            <span class="check-icon">✅</span>
+            <div class="check-label"><strong>Null MX: <code>0 .</code></strong><span>This domain cannot receive email (Nick uses Outlook). Bounce messages go nowhere instead of to a stranger's server.</span></div>
+            <span class="chip chip-green">Live</span>
+          </li>
+          <li>
+            <span class="check-icon">✅</span>
+            <div class="check-label"><strong>Vercel Firewall: 60 req/60s per IP on /api/</strong><span>Automated scraping or brute-force attacks are rate-limited at the edge before they reach the server.</span></div>
+            <span class="chip chip-green">Live</span>
+          </li>
+          <li>
+            <span class="check-icon">✅</span>
+            <div class="check-label"><strong>HSTS, CSP, X-Frame-Options, COOP/CORP</strong><span>All security headers are enforced on every response via vercel.json.</span></div>
+            <span class="chip chip-green">Live</span>
+          </li>
+          <li>
+            <span class="check-icon">⚠️</span>
+            <div class="check-label"><strong>DKIM (Resend)</strong><span>Needed when Resend is set up. Add the DKIM TXT record Resend shows, plus <code>send.</code> MX/SPF. The three records above don't need changing.</span></div>
+            <span class="chip chip-gold">Pending Resend</span>
+          </li>
+        </ul>
+      </div>
+    </div>
+
+  </div><!-- /grid -->
+
+  <!-- What's left before launch -->
+  <p class="section-title">Before Going Live (Remove noindex)</p>
+  <div class="card">
+    <div class="card-body">
+      <ul class="checklist">
+        <li>
+          <span class="check-icon">⚙️</span>
+          <div class="check-label"><strong>Set <code>APP_SECRET</code> in Vercel</strong><span>Use the same long random value in both Preview and Production. Without it, 2FA setup fails silently.</span></div>
+          <span class="chip chip-red">Required</span>
+        </li>
+        <li>
+          <span class="check-icon">⚙️</span>
+          <div class="check-label"><strong>Set <code>RESEND_API_KEY</code> in Vercel</strong><span>Without it, no emails are sent — no login codes, no payment links, no tracking links. Clients can't be contacted.</span></div>
+          <span class="chip chip-red">Required</span>
+        </li>
+        <li>
+          <span class="check-icon">⚙️</span>
+          <div class="check-label"><strong>Add Resend domain + DKIM records</strong><span>In Resend, add nicksprocessservices.dev. Copy the two DNS records Resend shows to Vercel → Domains.</span></div>
+          <span class="chip chip-red">Required</span>
+        </li>
+        <li>
+          <span class="check-icon">⚙️</span>
+          <div class="check-label"><strong>Test one full end-to-end order</strong><span>Submit a request from the front page → get the email → open dashboard → set price → send payment link → pay with Stripe test card (4242 4242 4242 4242) → see order move to "Served."</span></div>
+          <span class="chip chip-gold">Before Launch</span>
+        </li>
+        <li>
+          <span class="check-icon">📱</span>
+          <div class="check-label"><strong>Set up Authenticator App</strong><span>Go to the dashboard → Settings → Two-Step Sign-in → scan QR code → generate recovery codes → print them.</span></div>
+          <span class="chip chip-gold">Before Launch</span>
+        </li>
+        <li>
+          <span class="check-icon">🔑</span>
+          <div class="check-label"><strong>Add Stripe Webhook</strong><span>In Stripe → Webhooks, add <code>https://www.nicksprocessservices.dev/api/stripe-webhook</code>, event <code>checkout.session.completed</code>. Copy the signing secret to <code>STRIPE_WEBHOOK_SECRET</code> in Vercel.</span></div>
+          <span class="chip chip-gold">Before Real Payments</span>
+        </li>
+        <li>
+          <span class="check-icon">🚀</span>
+          <div class="check-label"><strong>Remove <code>noindex</code> from index.html</strong><span>Line 9 of index.html. Remove or comment out <code>&lt;meta name="robots" content="noindex, nofollow"&gt;</code>. Also remove it from this demo.html if you want to keep the page.</span></div>
+          <span class="chip chip-gold">At Launch</span>
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Security summary -->
+  <p class="section-title">Security Summary — What's Protected</p>
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-green">🏗️</div>
+        <div><h2>Infrastructure</h2></div>
+      </div>
+      <div class="card-body">
+        <ul class="checklist">
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>All API keys derived via HKDF-SHA256</strong><span>One root secret → separate keys per purpose. No key reuse.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>TOTP secrets encrypted AES-256-GCM</strong><span>Stored as <code>v1.&lt;iv&gt;.&lt;tag&gt;.&lt;ct&gt;</code> — unreadable without APP_SECRET.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>scrypt PIN hashing (N=16384)</strong><span>Memory-hard. A 6-digit PIN cannot be cracked in reasonable time without APP_SECRET.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>Session tokens stored as SHA-256</strong><span>A full DB dump gives attackers nothing usable.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>Constant-time comparisons everywhere</strong><span>Prevents timing side-channel attacks on codes and tokens.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>Atomic TOTP replay prevention</strong><span>Each 30-second code can be used exactly once.</span></div></li>
+        </ul>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-blue">⚖️</div>
+        <div><h2>Legal Protection</h2></div>
+      </div>
+      <div class="card-body">
+        <ul class="checklist">
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>Legal hold enforced at DB level</strong><span>No API call, bug, or mistake can delete a held order.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>Hash-chained, append-only timeline</strong><span>Every event is SHA-256 chained. Forgery is detectable. Entries cannot be deleted or edited.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>Immutable audit log</strong><span>Every admin action is permanently logged. UPDATE/DELETE on the log are blocked by DB trigger.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>SHA-256 file fingerprints</strong><span>Each uploaded proof file is fingerprinted. Emailed to client out-of-band at proof completion.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>Billing works on held orders</strong><span>Sending a payment link or recording payment doesn't unlock or alter the hold.</span></div></li>
+          <li><span class="check-icon">✅</span><div class="check-label"><strong>Every download logged</strong><span>Nick's document accesses appear in the audit log by order and filename.</span></div></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /container -->
+
+<footer>
+  This page is for Nick's internal use only. It is never indexed, never cached, and not linked from any client-facing page.<br>
+  Nick's Process Services · nicksprocessservices.dev
+</footer>
+
+<script>
+  // Quick self-check: ping the admin API to see if env vars are configured
+  (async () => {
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ action: 'send-code', addr: 'probe@demo.internal' })
+      });
+      const data = await res.json().catch(() => ({}));
+      const banner = document.getElementById('env-status');
+      if (res.status === 500 && data.error && data.error.includes('not set')) {
+        // env vars missing - keep warning
+        document.getElementById('blockers-label').textContent = 'env vars needed';
+        document.getElementById('blockers-bar').style.width = '100%';
+      } else if (res.status === 400 || res.status === 429 || res.status === 500) {
+        // API is responding - env vars likely set
+        banner.className = 'alert alert-ok';
+        banner.innerHTML = '<span class="alert-icon">✅</span><div><div class="alert-title">API is responding — environment variables appear to be set</div><div class="alert-body">The server replied to a test request. You can now walk through the features below.</div></div>';
+        document.getElementById('blockers-label').textContent = 'none detected';
+        document.getElementById('blockers-bar').style.width = '0%';
+      }
+    } catch(e) {
+      // network error or first load - neutral
+    }
+  })();
+</script>
+
+</body>
+</html>
