@@ -99,9 +99,10 @@
     let current = null;           // { order, events, files } for the open job
     let actionTab = 'attempt';
 
+    const READ_ONLY = new Set(['me', 'list', 'get', 'file-url', 'send-code', 'verify-code']);
     async function api(action, data = {}) {
         try {
-            return await NPS.post('/api/admin', { action, ...data });
+            return await NPS.post('/api/admin', { action, ...data }, { notify: !READ_ONLY.has(action) });
         } catch (err) {
             if (err.status === 401 && action !== 'verify-code' && action !== 'send-code') showLogin();
             throw err;
@@ -295,6 +296,8 @@
                 </ol>
             </div>`;
         $('action-form').addEventListener('submit', submitAction);
+        $('action-form').addEventListener('input', () => { formDirty = true; });
+        formDirty = false;
     }
 
     function setActionTab(k) {
@@ -400,6 +403,23 @@
             btn.disabled = false;
         }
     }
+
+    // --- Live refresh: at once when a client acts in another tab, otherwise every 30 seconds. ---
+    // The open job is only redrawn when Nick hasn't started typing in its action form.
+    let formDirty = false;
+    async function refresh() {
+        if (document.hidden || $('dash-view').classList.contains('hidden')) return;
+        try {
+            await loadList();
+            if (current && !formDirty) {
+                current = await api('get', { id: current.order.id });
+                renderDetail();
+            }
+        } catch { /* the next refresh will try again */ }
+    }
+    NPS.onChange(refresh);
+    setInterval(refresh, 30000);
+    document.addEventListener('visibilitychange', refresh);
 
     // --- Start: already logged in? ---
     async function start() {

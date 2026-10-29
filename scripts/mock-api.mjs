@@ -280,6 +280,34 @@ export async function handleMockRoute(req) {
             <a href="${back}&paid=${encodeURIComponent(url.searchParams.get('s') || '')}" style="display:block;text-align:center;background:#635bff;color:#fff;padding:14px;border-radius:6px;text-decoration:none;font-weight:700">Pay ${money(o.amount_due_cents)}</a>
             <a href="${back}" style="display:block;text-align:center;margin-top:14px;color:#635bff;font-size:14px">Cancel and go back</a>`);
     }
+    if (route === '__mock-split') {
+        // The client's phone on the left, Nick's dashboard on the right. Both pages refresh themselves when the other acts.
+        return new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Client + Nick, side by side</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1d2b24; font-family: -apple-system, Segoe UI, Arial, sans-serif; overflow: hidden; }
+  #stage { position: absolute; top: 0; left: 0; display: flex; gap: 24px; padding: 16px; transform-origin: 0 0; }
+  .col { display: flex; flex-direction: column; gap: 8px; }
+  .label { color: #f6d9a0; font-size: 13px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; display: flex; justify-content: space-between; gap: 12px; }
+  .label a { color: #9fc7b3; font-weight: 600; text-transform: none; letter-spacing: 0; text-decoration: none; }
+  iframe { border: 0; background: #f4f6f0; border-radius: 10px; box-shadow: 0 20px 50px -20px #000; }
+  #client { width: 390px; } #nick { width: 1100px; }
+</style>
+<div id="stage">
+  <div class="col"><div class="label">Client's phone <a href="/#checkout" target="client">New request</a></div><iframe id="client" name="client" src="/#checkout"></iframe></div>
+  <div class="col"><div class="label">Nick's dashboard <a href="/__mock" target="_blank">Sample orders</a></div><iframe id="nick" name="nick" src="/admin.html"></iframe></div>
+</div>
+<script>
+  // Lay both screens out at real size, then shrink the whole stage to fit the window.
+  const stage = document.getElementById('stage');
+  function fit() {
+    const h = 900;
+    document.querySelectorAll('iframe').forEach(f => { f.style.height = h + 'px'; });
+    const scale = Math.min(1, innerWidth / stage.scrollWidth, innerHeight / stage.scrollHeight);
+    stage.style.transform = 'scale(' + scale + ')';
+  }
+  addEventListener('resize', fit); fit();
+</script>`, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    }
     if (route === '__mock') {
         const rows = [...orders.values()].sort((a, b) => b.created_at.localeCompare(a.created_at)).map(o => `
             <tr><td style="padding:8px 10px">${o.code}</td><td style="padding:8px 10px">${STATUSES[o.status].label}</td><td style="padding:8px 10px">${escape(o.recipient_name)}</td>
@@ -288,7 +316,7 @@ export async function handleMockRoute(req) {
         return page('Local preview', `
             <h1 style="margin:0 0 6px;font-size:24px;color:#0d422e">Local preview with sample data</h1>
             <p style="color:#555;margin:0 0 18px;font-size:14px">No database keys are set, so the site is running on in-memory sample orders (they reset when the server restarts).
-            Dashboard login: <b>${ADMIN_EMAIL}</b>, code <b>${MOCK_ADMIN_CODE}</b>. <a href="/#checkout">Submit a new request</a>.</p>
+            Dashboard login: <b>${ADMIN_EMAIL}</b>, code <b>${MOCK_ADMIN_CODE}</b>. <a href="/#checkout">Submit a new request</a> or <a href="/__mock-split">see the client and Nick side by side</a>.</p>
             <table style="border-collapse:collapse;font-size:14px;width:100%">${rows}</table>`, 760);
     }
     return null;

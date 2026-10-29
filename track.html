@@ -232,7 +232,7 @@
         if (!btn) return;
         btn.disabled = true;
         try {
-            const { url } = await NPS.post('/api/track', { t: token, action: 'download', fileId: btn.dataset.file });
+            const { url } = await NPS.post('/api/track', { t: token, action: 'download', fileId: btn.dataset.file }, { notify: false });
             location.href = url;
         } catch (err) {
             alert(err.message);
@@ -260,6 +260,7 @@
             const up = r.uploads?.length ? await NPS.uploadAll(r.uploads, files) : { ok: [], failed: [] };
             render(await NPS.post('/api/track', { t: token, action: 'respond-finish', fileIds: up.ok }));
             e.target.reset();
+            actionDirty = false;
             if (up.failed.length) {
                 $('paid-banner').className = 'result-box result-warn text-sm';
                 $('paid-banner').textContent = `Your reply was sent, but ${up.failed.join(', ')} didn't upload. Please call Nick at (209) 922-6817.`;
@@ -273,6 +274,22 @@
             btn.disabled = false;
         }
     });
+
+    // Keep the page current while it is open: right away when the site changes in another tab, otherwise every 20 seconds.
+    // Never while the client is typing an answer, so their reply isn't wiped.
+    let actionDirty = false;
+    $('action-form').addEventListener('input', () => { actionDirty = true; });
+    async function refresh() {
+        if (!order || actionDirty || document.hidden) return;
+        try {
+            const before = order.status;
+            render(await NPS.get(`/api/track?t=${encodeURIComponent(token)}`));
+            if (order.status !== before) $('paid-banner').classList.add('hidden');   // "payment received" is old news once Nick moves on
+        } catch { /* keep showing what we have */ }
+    }
+    NPS.onChange(refresh);
+    setInterval(refresh, 20000);
+    document.addEventListener('visibilitychange', refresh);
 
     load();
 </script>

@@ -8,6 +8,9 @@ const NPS = (() => {
     };
     const MAX_FILES = 10;
     const MAX_BYTES = 25 * 1024 * 1024;
+    // Tells other open tabs of the site (e.g. the dashboard and a tracking page) that something changed, so they refresh at once.
+    const channel = 'BroadcastChannel' in window ? new BroadcastChannel('nps-updates') : null;
+    const onChange = (fn) => channel?.addEventListener('message', fn);
     const FALLBACK_ERROR = 'Something went wrong. Please try again, or call Nick at (209) 922-6817.';
 
     function esc(str) {
@@ -35,7 +38,12 @@ const NPS = (() => {
         }
         return data;
     }
-    const post = (path, body) => request('POST', path, body || {});
+    // notify: false for calls that only read (the dashboard loads its data by POST), so two open tabs don't ping-pong.
+    const post = async (path, body, { notify = true } = {}) => {
+        const data = await request('POST', path, body || {});
+        if (notify) channel?.postMessage(path);
+        return data;
+    };
     const get = (path) => request('GET', path);
 
     // Some phones leave file.type empty for HEIC photos; fall back to the extension so storage accepts them.
@@ -88,5 +96,5 @@ const NPS = (() => {
     };
     const fmtSize = (bytes) => bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB';
 
-    return { esc, post, get, fileMeta, checkFiles, uploadAll, money, fmtDate, fmtSize };
+    return { esc, post, get, onChange, fileMeta, checkFiles, uploadAll, money, fmtDate, fmtSize };
 })();
