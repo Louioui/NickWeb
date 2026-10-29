@@ -221,20 +221,20 @@ await check('F-04 daily cleanup still removes an upload that never reached stora
     await cron();
     expect(!fileRow(f.id), 'abandoned upload row was kept');
 });
-await check('F-04 files that keep failing cannot stop later uploads from being checked', async () => {
+await check('F-04 files that keep failing cannot stop later uploads from being checked (1,000 stuck ahead)', async () => {
     reset(); const o = seedOrder();
     const old = new Date(Date.now() - 5 * 864e5).toISOString();
-    for (let i = 0; i < 100; i++) db.__state.failDownload.add(seedFile(o, { created_at: old }).storage_path);
+    for (let i = 0; i < 1000; i++) db.__state.failDownload.add(seedFile(o, { created_at: old }).storage_path);
     const late = seedFile(o, { created_at: dayOld });
     const realNow = Date.now;
     try {
-        for (let day = 0; day < 2 && !fileRow(late.id).uploaded; day++) {
+        for (let day = 0; day < 11 && !fileRow(late.id).uploaded; day++) {
             const t = realNow() + day * 864e5;
             Date.now = () => t;
             await cron();
         }
     } finally { Date.now = realNow; }
-    expect(fileRow(late.id).uploaded === true, 'a later upload was never inspected within two daily runs');
+    expect(fileRow(late.id).uploaded === true, 'a later upload was never inspected within ceil(1001 / 100) = 11 daily runs');
 });
 await check('F-04 daily cleanup does not confirm a file it could not download', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o, { created_at: dayOld });

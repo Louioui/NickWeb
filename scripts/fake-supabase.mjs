@@ -37,6 +37,7 @@ export function createFakeSupabase() {
         is(c, v) { this.filters.push(r => (r[c] ?? null) === v); return this; }
         order(c, { ascending = true } = {}) { this.orderBy = { c, ascending }; return this; }
         limit(n) { this.limitN = n; return this; }
+        range(from, to) { this.offsetN = from; this.limitN = to - from + 1; return this; }
         single() { this.one = 'single'; return this; }
         maybeSingle() { this.one = 'maybe'; return this; }
         then(resolve, reject) { return Promise.resolve().then(() => this.run()).then(resolve, reject); }
@@ -65,6 +66,7 @@ export function createFakeSupabase() {
                     const { c, ascending } = this.orderBy;
                     out.sort((a, b) => (a[c] < b[c] ? -1 : a[c] > b[c] ? 1 : 0) * (ascending ? 1 : -1));
                 }
+                if (this.offsetN) out = out.slice(this.offsetN);
                 if (this.limitN != null) out = out.slice(0, this.limitN);
                 if (this.head) return { data: null, count: match.length, error: null };
             }

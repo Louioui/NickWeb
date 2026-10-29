@@ -21,14 +21,23 @@ export const GET = handle(async (request) => {
     // Files still marked "not uploaded" a day later: if the file did reach storage (the browser lost its connection before
     // confirming), verify its magic bytes, keep it and show it; if it never arrived or is disguised, remove it. If storage
     // can't be reached, leave the row alone and try again tomorrow, so a stored upload is never lost or accepted unchecked.
-    // Each run checks at most 100 files, starting at a different place in the queue every day, so files that keep failing
-    // can't take the whole batch day after day: every pending upload is reached within ceil(pending / 100) days.
-    const { data: stale, error: sErr } = await db().from('order_files').select('id, order_id, storage_path, filename')
-        .eq('uploaded', false).lt('created_at', dayAgo).order('created_at', { ascending: true }).limit(BATCH * 10);
+    // Each run checks at most 100 files, starting at a different place in the (oldest-first) queue every day, so files that
+    // keep failing can't take the whole batch day after day: with a stable queue, every pending upload is reached within
+    // ceil(pending / 100) days, however long the queue is. No cursor is stored; the day number picks the starting point.
+    const pending = () => db().from('order_files').select('id, order_id, storage_path, filename')
+        .eq('uploaded', false).lt('created_at', dayAgo).order('created_at', { ascending: true });
+    const { count: total, error: cErr } = await db().from('order_files').select('id', { count: 'exact', head: true })
+        .eq('uploaded', false).lt('created_at', dayAgo);
+    if (cErr) throw cErr;
+    const start = total > BATCH ? (Math.floor(Date.now() / 864e5) * BATCH) % total : 0;
+    const { data: first, error: sErr } = await pending().range(start, start + BATCH - 1);
     if (sErr) throw sErr;
-    const queue = stale || [];
-    const start = queue.length > BATCH ? (Math.floor(Date.now() / 864e5) * BATCH) % queue.length : 0;
-    const batch = [...queue.slice(start), ...queue.slice(0, start)].slice(0, BATCH);
+    let batch = first || [];
+    if (batch.length < BATCH && start > 0) {   // wrap around to the oldest uploads
+        const { data: wrapped, error: wErr } = await pending().range(0, Math.min(BATCH - batch.length, start) - 1);
+        if (wErr) throw wErr;
+        batch = batch.concat(wrapped || []);
+    }
     let recovered = 0;
     let retryLater = 0;
     const missing = [];
