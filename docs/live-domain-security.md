@@ -96,8 +96,30 @@ database. The notes repeat several sections two or three times; each item appear
 ## Also found and fixed in this pass
 - **Unapproved front-page change:** the other session had added a "Client Login" link to the front page's top bar without Nick's approval. It's removed; the client portal still works at `/account.html`.
 - **Migration file names** now match the versions the live database recorded, so a future `supabase db push` won't re-run them.
-- **Live database:** all four pending migrations are applied, plus a small one for the pending authenticator secret. Supabase's security advisor reports 0 issues.
+- **Billing after service:** the legal hold blocked it. Sending a payment link, recording a payment (including Stripe's
+  webhook), asking a question and adding a second proof all failed on served orders (confirmed live). Now billing records the
+  money without moving a held order's status back, the Pay button shows for any unpaid link on a held order, and asking a
+  question gives a clear "under legal hold" message. The mock now refuses every write the database refuses, so `npm test`
+  catches this kind of bug.
+- **Daily cleanup:** it would have failed every day after one unfinished proof upload on a held order. The hold now
+  protects only proofs that were actually stored (migration `20261029095238`).
+- **Payment links:** a failed database write was ignored and the client was still emailed the link. Now it stops first.
+- **Downloads:** they weren't logged. Client downloads are now private entries in the sealed timeline, and Nick's go to
+  his audit log.
+- **Live database:** all four pending migrations are applied, plus two small ones (the pending authenticator secret, and
+  hold protection for stored proofs only). Test rows used for the live attacks were deleted. Supabase's security advisor
+  reports 0 issues.
 - **A broken page caught during testing:** the shared browser script lost three helpers in an edit during this pass. `npm test` now loads that script for real, not only syntax-checks it.
+
+## A new required setting: `APP_SECRET`
+Add a long random value as `APP_SECRET` in Vercel, using the **same value in Preview and Production** (they share one
+database), and add it to `.env.local` for local tests against the real database. It encrypts Nick's authenticator secret
+and keys the recovery codes and tracking-page unlock tokens.
+- Never reuse the Supabase key for it. Rotating that key after a breach would then lock Nick out.
+- Changing `APP_SECRET` later means Nick sets up two-step sign-in again and creates new recovery codes.
+- Without it, the API refuses requests until it's set.
+- If Nick is ever locked out, run this in the Supabase SQL editor to turn two-step off:
+  `update admin_totp set enabled = false where email = 'nicksprocessservices@outlook.com';`
 
 ## DNS records to add (need your OK; DNS is in Vercel → Domains → nicksprocessservices.dev)
 Nothing sends email from this domain yet, so these are safe to add now, and they block spoofing at once:

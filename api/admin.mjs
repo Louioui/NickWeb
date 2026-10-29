@@ -383,6 +383,7 @@ async function update(request, body, admin) {
         await addEvent(order.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);
     } else if (kind === 'action') {
         if (!note) throw new HttpError(400, 'Tell the client what you need.');
+        if (order.legal_hold) throw new HttpError(423, 'This order is served and under legal hold, so it can’t go back to "Action required". Add a note the client can see, or contact them directly.');
         await db().from('orders').update({ status: 'action_required', action_note: note }).eq('id', order.id);
         await addEvent(order.id, 'action', 'Action required', note);
         await sendEmail({
@@ -467,7 +468,10 @@ async function paymentLink(request, body, admin) {
         if (old?.status === 'open') await stripeClient().checkout.sessions.expire(old.id).catch(() => {});
     }
     const session = await createCheckout(order, cents, description, origin);
-    await db().from('orders').update({ status: 'awaiting_payment', amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id }).eq('id', order.id);
+    // A served order (under legal hold) keeps its "Served" status while it's billed; the Pay button still shows.
+    const { error: linkErr } = await db().from('orders').update({ amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id,
+        ...(order.legal_hold ? {} : { status: 'awaiting_payment' }) }).eq('id', order.id);
+    if (linkErr) throw linkErr;   // never email a payment link the system didn't record
     await addEvent(order.id, 'payment', `Payment requested: ${money(cents)}`, description);
     await auditAdmin(request, admin, 'payment_link', order.code, money(cents));
     await sendEmail({
@@ -492,7 +496,8 @@ async function proofFinish(request, body) {
     if (!uploaded.length) throw new HttpError(400, 'The upload did not finish. Please try again.');
     const detailText = uploaded.map(u => u.sha256 ? `${u.filename} (SHA-256: ${u.sha256.slice(0, 12)}…)` : u.filename).join(', ');
     await addEvent(order.id, 'proof', 'Proof of service uploaded', detailText);
-    if (body.markServed) {
+    // Adding another proof to an order that is already served leaves its served time (frozen by legal hold) alone.
+    if (body.markServed && order.status !== 'served') {
         const { error: uErr } = await db().from('orders').update({ status: 'served', served_at: new Date().toISOString(), legal_hold: true }).eq('id', order.id);
         if (uErr) throw uErr;
         await addEvent(order.id, 'status', STATUSES.served.label);

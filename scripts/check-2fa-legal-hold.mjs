@@ -105,6 +105,21 @@ const unlocked = await call('admin', { action: 'unlock-legal-hold', id: held.id,
 check('unlocking with a fresh authenticator code works', unlocked.status === 200 && unlocked.data.order.legal_hold === false);
 check('the record seal verifies', unlocked.data.order.integrity_seal.verified === true && /^[0-9a-f]{64}$/.test(unlocked.data.order.integrity_seal.head));
 
+// Work that must still be possible on a served (held) order. The mock refuses exactly what the database trigger refuses,
+// so these would fail here if the app tried a write the real database won't accept.
+const relock = await call('admin', { action: 'unlock-legal-hold', id: held.id, hold: true }, nick);
+check('legal hold can be turned back on', relock.data.order.legal_hold === true);
+const billLater = await call('admin', { action: 'payment-link', id: held.id, amount: '75', description: 'Standard' }, nick);
+check('a payment link can be sent after serving', billLater.status === 200 && billLater.data.order.status !== 'awaiting_payment' && billLater.data.order.legal_hold === true);
+const heldView = (await call('track', { t: created.data.token, action: 'view' })).data;
+check('the client sees the Pay button on a served order', !!heldView.payUrl);
+const sessionId = new URL(billLater.data.order.payment_url, 'http://x').searchParams.get('s');
+const paidLater = await call('track', { t: created.data.token, action: 'confirm-payment', session: sessionId });
+check('a payment after serving is recorded and the order stays served/closed', paidLater.status === 200 && !!paidLater.data.paidAt && !['paid', 'awaiting_payment'].includes(paidLater.data.status));
+check('asking the client a question on a held order gives a clear refusal, not an error', (await call('admin', { action: 'update', id: held.id, kind: 'action', note: 'Which unit?' }, nick)).status === 423);
+const extraProof = await call('admin', { action: 'proof-upload', id: held.id, files: [{ name: 'second-proof.pdf', size: 10, type: 'application/pdf' }] }, nick);
+check('a second proof can be added to a held order', extraProof.status === 200 && extraProof.data.uploads.length === 1);
+
 // --- Document lock on the client's tracking page ---
 const created2 = await call('request', { step: 'create', clientName: 'Lock Test', clientEmail: 'lock.test@example.com', clientPhone: '7145550199',
     recipientName: 'Locked Person', docType: 'Summons & Complaint', address: '42 Ocean Blvd', city: 'Long Beach', zip: '90802',

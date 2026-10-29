@@ -110,14 +110,20 @@ export const randomToken = (bytes = 24) => randomBytes(bytes).toString('base64ur
 export const orderCode = () => 'NP-' + String(randomInt(100000, 1000000));
 
 // --- Server-side secrets ---
-// One server-only root secret (APP_SECRET, or the service-role key when APP_SECRET isn't set) is stretched into separate
-// keys per purpose with HKDF, so a key for one job can never be replayed for another. None of these keys is ever stored
-// in the database, so a copy of the database alone cannot decrypt authenticator secrets or forge tokens.
+// One server-only root secret, APP_SECRET, is stretched into separate keys per purpose with HKDF, so a key for one job
+// can never be replayed for another. None of these keys is ever stored in the database, so a copy of the database alone
+// cannot decrypt authenticator secrets, crack recovery codes or forge unlock tokens.
+// APP_SECRET must be its own value (never the Supabase key: rotating that after a breach would make Nick's authenticator
+// secret undecryptable and lock him out), and the same in Preview and Production, which share one database.
+// Only the local mock (no database key at all) may use a built-in development value.
 const appKeys = new Map();
 export function appKey(purpose) {
     if (!appKeys.has(purpose)) {
-        const root = process.env.APP_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || (IS_PROD ? '' : 'local-dev-only-secret');
-        if (!root) throw new HttpError(503, 'Online requests are temporarily unavailable. Please call or text Nick at (209) 922-6817.');
+        const root = process.env.APP_SECRET || (process.env.SUPABASE_SERVICE_ROLE_KEY ? '' : 'local-dev-only-secret');
+        if (!root) {
+            console.error('APP_SECRET is not set. Add a long random value in Vercel (Preview and Production) and in .env.local.');
+            throw new HttpError(503, 'Online requests are temporarily unavailable. Please call or text Nick at (209) 922-6817.');
+        }
         appKeys.set(purpose, Buffer.from(hkdfSync('sha256', root, 'nps-app-keys-v1', purpose, 32)));
     }
     return appKeys.get(purpose);

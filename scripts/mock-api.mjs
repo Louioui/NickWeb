@@ -181,7 +181,7 @@ function clientView(o, { unlocked = true } = {}) {
         tier: TIERS[o.tier]?.name, addons: o.addons.map(k => ADDONS[k]?.name).filter(Boolean),
         estimate: money(o.estimated_total_cents),
         amountDue: o.amount_due_cents != null ? money(o.amount_due_cents) : null,
-        payUrl: o.status === 'awaiting_payment' ? o.payment_url : null,
+        payUrl: (o.status === 'awaiting_payment' || (o.legal_hold && !o.paid_at)) ? o.payment_url : null,
         paidAt: o.paid_at, actionNote: o.status === 'action_required' ? o.action_note : null,
         docLock: !!o.doc_lock,
         unlocked: !isLocked,
@@ -300,9 +300,23 @@ function markPaid(o, sessionId, amountCents = o?.amount_due_cents) {
     const paidCents = Number(amountCents);
     if (!Number.isSafeInteger(paidCents) || paidCents <= 0) return false;
     if (o.amount_due_cents != null && paidCents < o.amount_due_cents) return false;
-    Object.assign(o, { status: 'paid', paid_at: now(), stripe_session_id: sessionId });
+    // Same as api/_lib/orders.mjs: a held (served) order records the payment and keeps its status.
+    updateOrder(o, { paid_at: now(), stripe_session_id: sessionId, ...(o.legal_hold ? {} : { status: 'paid' }) });
     addEvent(o.id, 'payment', `Payment received: ${money(paidCents)}`);
     return true;
+}
+
+// Mirrors the database trigger enforce_legal_hold: every order write in the mock goes through this, so a write the
+// real database would refuse also fails here (as a 500, like an unhandled database error would).
+const HELD_FIELDS = ['client_name', 'client_email', 'recipient_name', 'doc_type', 'address', 'unit', 'city', 'zip', 'case_number', 'court', 'served_at'];
+function updateOrder(o, patch) {
+    const next = { ...o, ...patch };
+    if (o.legal_hold && next.legal_hold) {
+        if (next.status !== o.status && !['served', 'closed'].includes(next.status)) fail(500, `Order ${o.code} is under legal hold; its status cannot be moved back.`);
+        if (HELD_FIELDS.some(k => (next[k] ?? null) !== (o[k] ?? null))) fail(500, `Order ${o.code} is under legal hold; its record cannot be changed.`);
+        if (o.paid_at && next.paid_at !== o.paid_at) fail(500, `Order ${o.code} is under legal hold; its recorded payment cannot be changed.`);
+    }
+    Object.assign(o, patch);
 }
 
 // --- Handlers, keyed by the api/<name>.mjs they stand in for ---
@@ -549,7 +563,8 @@ const handlers = {
         }
         if (body.action === 'confirm-payment') {
             if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) fail(400, 'Invalid payment session.');
-            if (body.session === o.stripe_session_id && o.status === 'awaiting_payment') markPaid(o, body.session);
+            // Like api/track.mjs (which asks Stripe): the matching unpaid session counts, whatever the status. Held orders are billed while served.
+            if (body.session === o.stripe_session_id && !o.paid_at) markPaid(o, body.session);
             return json(clientView(o, { unlocked }));
         }
         if (body.action === 'respond') {
@@ -573,7 +588,7 @@ const handlers = {
             const fileList = Array.isArray(body.files) ? body.files : [];
             if (!Object.keys(changes).length && !reply && !fileList.length) fail(400, 'Please add the missing information, a reply, or a file.');
             const uploads = prepareUploads(o.id, 'action_upload', fileList);
-            Object.assign(o, changes, { status: 'received', action_note: null, updated_at: now() });
+            updateOrder(o, { ...changes, status: 'received', action_note: null, updated_at: now() });
             const attemptCount = events.filter(e => e.order_id === o.id && e.kind === 'attempt').length;
             const amendDigest = sha256Hex(`${o.code}|${changes.address || ''}|${changes.unit || ''}|${changes.city || ''}|${changes.zip || ''}|${changes.access_notes || ''}|${reply || ''}`).slice(0, 16);
             const summary = [
@@ -790,21 +805,21 @@ const handlers = {
                 if (o.legal_hold && !['served', 'closed'].includes(body.status)) {
                     fail(423, 'This order is under legal hold, so its status can only move to Closed. Unlock legal hold first if it really needs to change.');
                 }
-                o.status = body.status;
-                if (body.status === 'served') Object.assign(o, { served_at: now(), legal_hold: true });
+                updateOrder(o, { status: body.status, ...(body.status === 'served' ? { served_at: now(), legal_hold: true } : {}) });
                 addEvent(o.id, 'status', STATUSES[body.status].label, note, body.clientVisible !== false);
                 if (body.notify) email(o.client_email, `${o.code}: ${STATUSES[body.status].label}`, trackUrl);
             } else if (body.kind === 'attempt') {
                 const outcome = cleanText(body.outcome, 120, true, 'Outcome');
                 const when = cleanText(body.when, 40, false, 'When');
-                if (['received', 'paid', 'accepted'].includes(o.status)) o.status = 'attempting';
+                if (['received', 'paid', 'accepted'].includes(o.status)) updateOrder(o, { status: 'attempting' });
                 addEvent(o.id, 'attempt', `Attempt: ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
             } else if (body.kind === 'note') {
                 if (!note) fail(400, 'Write a note first.');
                 addEvent(o.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);
             } else if (body.kind === 'action') {
                 if (!note) fail(400, 'Tell the client what you need.');
-                Object.assign(o, { status: 'action_required', action_note: note });
+                if (o.legal_hold) fail(423, 'This order is served and under legal hold, so it can’t go back to "Action required". Add a note the client can see, or contact them directly.');
+                updateOrder(o, { status: 'action_required', action_note: note });
                 addEvent(o.id, 'action', 'Action required', note);
                 email(o.client_email, `${o.code}: Nick needs a little more information`, trackUrl);
             } else fail(400, 'Unknown update.');
@@ -816,7 +831,7 @@ const handlers = {
             if (o.paid_at) fail(409, 'This order is already paid.');
             const description = cleanText(body.description, 300, false, 'Description');
             const session = `cs_mock_${randomBytes(6).toString('hex')}`;
-            Object.assign(o, { status: 'awaiting_payment', amount_due_cents: cents, stripe_session_id: session,
+            updateOrder(o, { ...(o.legal_hold ? {} : { status: 'awaiting_payment' }), amount_due_cents: cents, stripe_session_id: session,
                 payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}` });
             addEvent(o.id, 'payment', `Payment requested: ${money(cents)}`, description);
             auditAdmin(adminEmail, 'payment_link', o.code, money(cents));
@@ -851,7 +866,7 @@ const handlers = {
             if (!up.length) fail(400, 'The upload did not finish. Please try again.');
             const detailText = up.map(f => f.sha256 ? `${f.filename} (SHA-256: ${f.sha256.slice(0, 12)}…)` : f.filename).join(', ');
             addEvent(o.id, 'proof', 'Proof of service uploaded', detailText);
-            if (body.markServed) { Object.assign(o, { status: 'served', served_at: now(), legal_hold: true }); addEvent(o.id, 'status', STATUSES.served.label); }
+            if (body.markServed && o.status !== 'served') { updateOrder(o, { status: 'served', served_at: now(), legal_hold: true }); addEvent(o.id, 'status', STATUSES.served.label); }
             email(o.client_email, `${o.code}: your proof of service is ready`, trackUrl);
             return json(adminDetail(o));
         }

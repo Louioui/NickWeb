@@ -100,7 +100,8 @@ export async function clientView(order, { unlocked = true } = {}) {
         addons: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
         estimate: money(order.estimated_total_cents),
         amountDue: order.amount_due_cents != null ? money(order.amount_due_cents) : null,
-        payUrl: order.status === 'awaiting_payment' && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
+        // Held (served) orders keep their status when billed afterwards, so an unpaid link alone shows the Pay button.
+        payUrl: (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
         paidAt: order.paid_at,
         actionNote: order.status === 'action_required' ? order.action_note : null,
         docLock: !!order.doc_lock,
@@ -142,12 +143,13 @@ export function canMarkPaid(order, amountCents, sessionId) {
 
 export async function markPaid(orderId, amountCents, sessionId) {
     uuid(orderId, 'Order');
-    const { data: order, error } = await db().from('orders').select('id, status, paid_at, stripe_session_id, amount_due_cents').eq('id', orderId).maybeSingle();
+    const { data: order, error } = await db().from('orders').select('id, status, paid_at, stripe_session_id, amount_due_cents, legal_hold').eq('id', orderId).maybeSingle();
     if (error) throw error;
     if (!canMarkPaid(order, amountCents, sessionId)) return false;
-    const { error: uErr } = await db().from('orders').update({
-        status: 'paid', paid_at: new Date().toISOString(), stripe_session_id: sessionId,
-    }).eq('id', orderId).is('paid_at', null);
+    // Paying after the job was served (Nick serves first for some clients): record the money, keep the status "Served".
+    // The legal hold would refuse moving a served order back to "Paid", and the webhook would then fail for days.
+    const patch = { paid_at: new Date().toISOString(), stripe_session_id: sessionId, ...(order.legal_hold ? {} : { status: 'paid' }) };
+    const { error: uErr } = await db().from('orders').update(patch).eq('id', orderId).is('paid_at', null);
     if (uErr) throw uErr;
     await addEvent(orderId, 'payment', `Payment received: ${money(Number(amountCents))}`);
     return true;
