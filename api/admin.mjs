@@ -3,7 +3,7 @@ import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
          sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload,
          HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
-import { STATUSES, TIERS, ADDONS, money, sendEmail } from './_lib/orders.mjs';
+import { STATUSES, TIERS, ADDONS, money, sendEmail, markPaid } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
 
 const COOKIE = 'nps_admin';
@@ -31,7 +31,6 @@ export const POST = handle(async (request) => {
 // --- Login: a 6-digit code emailed to an allowed address, then a session cookie ---
 async function sendCode(request, body) {
     await rateLimit(`admin-code:${clientIp(request)}`, 5, 900);
-    await rateLimit('admin-code:all', 30, 3600);   // caps login emails to Nick even if many computers try at once
     const addr = email(body.email);
     if (ADMIN_EMAILS.includes(addr)) {
         const code = String(randomInt(0, 1000000)).padStart(6, '0');
@@ -169,9 +168,15 @@ async function paymentLink(request, body) {
     if (order.paid_at) throw new HttpError(409, 'This order is already paid.');
     const description = text(body.description, { max: 300 });
     const origin = siteOrigin(request);
-    // A new link replaces the old one: close the old checkout so the client can't end up paying twice.
-    if (order.stripe_session_id) {
-        await stripeClient().checkout.sessions.expire(order.stripe_session_id).catch(() => {});   // already paid/expired is fine
+    // A new link replaces the old one. If the client already paid the old one, record that and stop;
+    // otherwise close it, so they can't end up paying twice.
+    if (order.stripe_session_id?.startsWith('cs_')) {
+        const old = await stripeClient().checkout.sessions.retrieve(order.stripe_session_id).catch(() => null);
+        if (old?.payment_status === 'paid') {
+            await markPaid(order.id, old.amount_total, old.id);
+            throw new HttpError(409, 'The client already paid the previous link. Refresh to see it.');
+        }
+        if (old?.status === 'open') await stripeClient().checkout.sessions.expire(old.id).catch(() => {});
     }
     const session = await createCheckout(order, cents, description, origin);
     await db().from('orders').update({ status: 'awaiting_payment', amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id }).eq('id', order.id);

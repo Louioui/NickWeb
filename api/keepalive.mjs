@@ -1,6 +1,6 @@
 // GET /api/keepalive — run daily by Vercel Cron (vercel.json). A real query keeps the free Supabase project
 // from pausing after 7 quiet days, and clears out expired login codes and sessions.
-import { db, handle, json, HttpError, BUCKET } from './_lib/core.mjs';
+import { db, handle, json, HttpError, BUCKET, addEvent } from './_lib/core.mjs';
 
 export const GET = handle(async (request) => {
     const secret = process.env.CRON_SECRET;
@@ -11,12 +11,22 @@ export const GET = handle(async (request) => {
     await db().from('admin_codes').delete().lt('expires_at', now);
     await db().from('admin_sessions').delete().lt('expires_at', now);
 
-    // Upload links that were handed out but never finished (closed tab, bots) would otherwise use up free storage.
+    // Files still marked "not uploaded" a day later: if the file did reach storage (the browser lost its connection before
+    // confirming), keep it and show it; if it never arrived, drop the empty record. 100 per run keeps each query short.
     const dayAgo = new Date(Date.now() - 864e5).toISOString();
-    const { data: stale } = await db().from('order_files').select('id, storage_path').eq('uploaded', false).lt('created_at', dayAgo).limit(500);
-    if (stale?.length) {
-        await db().storage.from(BUCKET).remove(stale.map(f => f.storage_path));
-        await db().from('order_files').delete().in('id', stale.map(f => f.id));
+    const { data: stale } = await db().from('order_files').select('id, order_id, storage_path, filename').eq('uploaded', false).lt('created_at', dayAgo).limit(100);
+    let recovered = 0;
+    const missing = [];
+    for (const f of stale || []) {
+        const { data: exists } = await db().storage.from(BUCKET).exists(f.storage_path);
+        if (exists) {
+            await db().from('order_files').update({ uploaded: true }).eq('id', f.id);
+            await addEvent(f.order_id, 'note', 'Document received', f.filename);
+            recovered++;
+        } else {
+            missing.push(f.id);
+        }
     }
-    return json({ ok: true, orders: count, staleUploadsRemoved: stale?.length || 0 });
+    if (missing.length) await db().from('order_files').delete().in('id', missing);
+    return json({ ok: true, orders: count, uploadsRecovered: recovered, emptyUploadsRemoved: missing.length });
 });

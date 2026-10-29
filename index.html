@@ -1723,7 +1723,8 @@
                 }
                 btn.textContent = 'Finishing…';
                 // The order already exists at this point, so a failure here must not hide its reference number from the client.
-                await NPS.post('/api/request', { step: 'finish', t: created.token, fileIds: upload.ok }).catch(() => {});
+                const finish = () => NPS.post('/api/request', { step: 'finish', t: created.token, fileIds: upload.ok });
+                await finish().catch(() => new Promise(r => setTimeout(r, 1500)).then(finish)).catch(() => {});
                 showConfirmation(created, upload.failed);
                 requestForm.reset();
                 updateFileLabel(null, null);

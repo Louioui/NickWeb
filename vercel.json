@@ -7,6 +7,7 @@
     { "source": "/api/_lib/:path*", "destination": "/", "permanent": false },
     { "source": "/scripts/:path*", "destination": "/", "permanent": false },
     { "source": "/src/:path*", "destination": "/", "permanent": false },
+    { "source": "/supabase/:path*", "destination": "/", "permanent": false },
     { "source": "/build/:path*", "destination": "/", "permanent": false },
     { "source": "/node_modules/:path*", "destination": "/", "permanent": false },
     { "source": "/:file(package\\.json|package-lock\\.json|tailwind\\.config\\.js|vercel\\.json|LICENSE|\\.gitignore|\\.env.*)", "destination": "/", "permanent": false }

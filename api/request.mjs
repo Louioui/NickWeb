@@ -16,7 +16,6 @@ export const POST = handle(async (request) => {
     // Bots fill every field, including this one that people never see.
     if (body.website) return json({ ok: true, code: 'NP-000000', trackUrl: '/' });
     await rateLimit(`request:${clientIp(request)}`, 8, 3600);
-    await rateLimit('request:all', 60, 3600);   // a flood from many computers can't fill the free storage or Nick's inbox
 
     const phone = text(body.clientPhone, { max: 40, required: true, label: 'Phone number' });
     if (phone.replace(/\D/g, '').length < 10) throw new HttpError(400, 'Please enter a phone number with area code.');
