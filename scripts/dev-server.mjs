@@ -43,7 +43,8 @@ const HEADER_RULES = (vercel.headers || []).map(h => ({ re: toRegex(h.source), h
 const vercelHeaders = (pathname) => Object.fromEntries(HEADER_RULES.filter(h => h.re.test(pathname)).flatMap(h => h.headers.map(x => [x.key.toLowerCase(), x.value])));
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript',
-    '.svg': 'image/svg+xml', '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.woff2': 'font/woff2', '.json': 'application/json' };
+    '.svg': 'image/svg+xml', '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.mp4': 'video/mp4',
+    '.woff2': 'font/woff2', '.json': 'application/json', '.webmanifest': 'application/manifest+json' };
 
 http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${port}`);

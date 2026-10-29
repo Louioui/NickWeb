@@ -455,16 +455,65 @@ export async function handleMockRoute(req) {
   addEventListener('resize', fit); fit();
 </script>`, { headers: { 'content-type': 'text/html; charset=utf-8' } });
     }
+    if (route === '__mock-login') {
+        const clientAddr = url.searchParams.get('client');
+        const adminAddr = url.searchParams.get('admin');
+        if (clientAddr) {
+            if (!clients.has(clientAddr)) clients.set(clientAddr, { name: clientAddr === DEVTEAM_EMAIL ? 'Dev Team Tester' : 'Demo Client', firm: 'Partnership With Media', email: clientAddr });
+            const t = token();
+            clientSessions.set(t, clientAddr);
+            return new Response(null, { status: 302, headers: { location: '/account.html', 'set-cookie': `nps_client=${t}; Path=/api/client; HttpOnly; SameSite=Strict` } });
+        }
+        if (adminAddr && MOCK_ADMIN_EMAILS.includes(adminAddr)) {
+            const t = token();
+            sessions.add(t);
+            sessionEmails.set(t, adminAddr);
+            return new Response(null, { status: 302, headers: { location: '/admin.html', 'set-cookie': `nps_admin=${t}; Path=/api/admin; HttpOnly; SameSite=Strict` } });
+        }
+        return new Response(null, { status: 302, headers: { location: '/__mock' } });
+    }
     if (route === '__mock') {
-        const rows = [...orders.values()].sort((a, b) => b.created_at.localeCompare(a.created_at)).map(o => `
-            <tr><td style="padding:8px 10px">${o.code}</td><td style="padding:8px 10px">${STATUSES[o.status].label}</td><td style="padding:8px 10px">${escape(o.recipient_name)}</td>
-            <td style="padding:8px 10px"><a href="/track.html#t=${encodeURIComponent(o.track_token)}">Client tracking page</a></td>
-            <td style="padding:8px 10px"><a href="/admin.html#${o.id}">Dashboard</a></td></tr>`).join('');
-        return page('Local preview', `
-            <h1 style="margin:0 0 6px;font-size:24px;color:#0d422e">Local preview with sample data</h1>
-            <p style="color:#555;margin:0 0 18px;font-size:14px">No database keys are set, so the site is running on in-memory sample orders (they reset when the server restarts).
-            Dashboard login: <b>${ADMIN_EMAIL}</b>, code <b>${MOCK_ADMIN_CODE}</b>. <a href="/#checkout">Submit a new request</a> or <a href="/__mock-split">see the client and Nick side by side</a>.</p>
-            <table style="border-collapse:collapse;font-size:14px;width:100%">${rows}</table>`, 760);
+        const sorted = [...orders.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+        const byCode = Object.fromEntries(sorted.map(o => [o.code, o]));
+        const linkFor = code => byCode[code] ? `/track.html#t=${encodeURIComponent(byCode[code].track_token)}` : '/__mock';
+        const rows = sorted.map(o => `
+            <tr><td style="padding:10px 8px;border-bottom:1px solid #e3e8e5;font-weight:600">${o.code}</td><td style="padding:10px 8px;border-bottom:1px solid #e3e8e5">${STATUSES[o.status].label}</td><td style="padding:10px 8px;border-bottom:1px solid #e3e8e5">${escape(o.recipient_name)}</td>
+            <td style="padding:10px 8px;border-bottom:1px solid #e3e8e5"><a href="/track.html#t=${encodeURIComponent(o.track_token)}" style="color:#0d422e;font-weight:600">Client tracking page</a> · <a href="/admin.html#${o.id}" style="color:#0d422e;font-weight:600">Nick’s view</a></td></tr>`).join('');
+        const btn = 'display:inline-block;padding:9px 13px;margin:6px 6px 0 0;background:#0d422e;color:#f6e9cc;border:1px solid #0d422e;border-radius:3px;font-size:13px;font-weight:600;text-decoration:none';
+        const btnAlt = 'display:inline-block;padding:9px 13px;margin:6px 6px 0 0;background:#fff;color:#0d422e;border:1px solid #0d422e;border-radius:3px;font-size:13px;font-weight:600;text-decoration:none';
+        return page('Interactive Demo Hub | Nick’s Process Services', `
+            <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:12px;margin-bottom:8px">
+                <h1 style="margin:0;font-size:26px;color:#0d422e">Interactive Demo Hub</h1>
+                <a href="/" style="color:#0d422e;font-weight:700;font-size:14px">Open Front Website &rarr;</a>
+            </div>
+            <p style="color:#42544b;margin:0 0 18px;font-size:14px;line-height:1.5">Try the complete client and staff workflow locally. No real emails or charges are sent while in demo mode.</p>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:18px">
+                <div style="border:1px solid #d6ded8;border-radius:6px;padding:16px;background:#fafbf9">
+                    <h2 style="margin:0 0 6px;font-size:17px;color:#0d422e">1. Try as a Client</h2>
+                    <p style="margin:0 0 10px;font-size:13px;color:#555">One-click sign-in to the private client portal (manual code: <b>${MOCK_CLIENT_CODE}</b>).</p>
+                    <a href="/__mock-login?client=paralegal%40example.com" style="${btn}">Sign in as Jordan Vance (5 requests)</a>
+                    <a href="/__mock-login?client=${encodeURIComponent(DEVTEAM_EMAIL)}" style="${btnAlt}">Sign in as ${DEVTEAM_EMAIL}</a>
+                    <p style="margin:10px 0 0;font-size:13px"><a href="/account.html" style="color:#0d422e">Manual Client Login</a> · <a href="/#checkout" style="color:#0d422e">New Service Request</a> · <a href="/__mock-split" style="color:#0d422e">Side-by-Side Split View</a></p>
+                </div>
+                <div style="border:1px solid #d6ded8;border-radius:6px;padding:16px;background:#fafbf9">
+                    <h2 style="margin:0 0 6px;font-size:17px;color:#0d422e">2. Try as Nick (Staff Dashboard)</h2>
+                    <p style="margin:0 0 10px;font-size:13px;color:#555">One-click sign-in to Nick’s dashboard (manual code: <b>${MOCK_ADMIN_CODE}</b> or backup code).</p>
+                    <a href="/__mock-login?admin=${encodeURIComponent(ADMIN_EMAIL)}" style="${btn}">Open Dashboard as Nick</a>
+                    <a href="/__mock-login?admin=${encodeURIComponent(DEVTEAM_EMAIL)}" style="${btnAlt}">Open as ${DEVTEAM_EMAIL}</a>
+                    <p style="margin:10px 0 0;font-size:13px"><a href="/admin.html" style="color:#0d422e">Manual Staff Login Screen</a></p>
+                </div>
+            </div>
+            <div style="border:1px solid #d8b46b;background:#fffbf0;border-radius:6px;padding:16px;margin-bottom:20px">
+                <h2 style="margin:0 0 8px;font-size:16px;color:#0d422e">Guided 4-Step End-to-End Walkthrough</h2>
+                <ol style="margin:0;padding-left:20px;font-size:13.5px;line-height:1.7;color:#2c3a33">
+                    <li><b>Reply to an “Action required” request:</b> Open <a href="${linkFor('NP-649025')}" style="color:#0d422e;font-weight:600">NP-649025 (Dana Whitfield)</a>, add the apartment number, and click <i>Send to Nick</i>.</li>
+                    <li><b>Complete a simulated payment:</b> Open <a href="${linkFor('NP-403182')}" style="color:#0d422e;font-weight:600">NP-403182 (Pacific Harbor Logistics LLC)</a>, click <i>Pay Securely</i>, and simulate the $175.00 payment.</li>
+                    <li><b>Work the queue as Nick:</b> Click <i>Open Dashboard as Nick</i> above to see <i>Client replied</i> &amp; <i>Paid</i>, log an attempt, upload Proof of Service, or open <i>Security &amp; App</i> in the top bar.</li>
+                    <li><b>Verify Proof of Service &amp; SHA-256 badge:</b> Open <a href="${linkFor('NP-894771')}" style="color:#0d422e;font-weight:600">NP-894771 (Alicia Moreno — Served)</a> to see the Proof of Service PDF and its verified SHA-256 chain-of-custody fingerprint.</li>
+                </ol>
+            </div>
+            <h2 style="margin:0 0 8px;font-size:16px;color:#0d422e">Sample Service Requests</h2>
+            <table style="border-collapse:collapse;font-size:14px;width:100%">${rows}</table>`, 820);
     }
     return null;
 }
