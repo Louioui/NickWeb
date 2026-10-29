@@ -290,7 +290,7 @@
             const due = o.deadline && isOpen(o)
                 ? `<span class="${days <= 3 ? 'text-[#7a1f1c] font-semibold' : 'text-muted'}"><i class="fa-regular fa-calendar mr-1"></i>${days < 0 ? 'Past due' : days === 0 ? 'Due today' : `Due in ${days}d`}</span>` : '';
             return `
-            <button type="button" aria-pressed="${current?.order.id === o.id}" class="job-row ${current?.order.id === o.id ? 'is-active' : ''}" onclick="openJob('${o.id}')">
+            <button type="button" aria-pressed="${current?.order.id === o.id}" class="job-row ${current?.order.id === o.id ? 'is-active' : ''}" onclick="openJob('${esc(o.id)}')">
                 <span class="font-semibold text-sm text-ink truncate">${esc(o.recipient_name)}</span>
                 ${o.client_replied
                     ? '<span class="status-pill status-alert"><i class="fa-solid fa-reply mr-1"></i>Client replied</span>'
@@ -381,7 +381,7 @@
         const { order: o, events, files } = current;
         const fullAddress = `${o.address}${o.unit ? ', ' + o.unit : ''}, ${o.city} ${o.zip}`;
         const mapUrl = 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(fullAddress);
-        const fileChip = f => `<button type="button" class="file-chip" onclick="downloadFile('${f.id}', this)" ${f.sha256 ? `title="Verified SHA-256 fingerprint: ${esc(f.sha256)}"` : ''}><i class="fa-solid ${f.kind === 'proof' ? 'fa-file-signature' : 'fa-file-lines'} text-bronze"></i><span>${esc(f.filename)}</span><span class="text-muted font-normal">${NPS.fmtSize(f.size_bytes)}</span>${f.sha256 ? `<span class="text-[11px] font-mono text-primary bg-primaryLight/60 px-1.5 py-0.5 rounded-sm"><i class="fa-solid fa-shield-halved mr-0.5" aria-hidden="true"></i>SHA-256 ${esc(f.sha256.slice(0, 8))}…</span>` : ''}</button>`;
+        const fileChip = f => `<button type="button" class="file-chip" onclick="downloadFile('${esc(f.id)}', this)" ${f.sha256 ? `title="Verified SHA-256 fingerprint: ${esc(f.sha256)}"` : ''}><i class="fa-solid ${f.kind === 'proof' ? 'fa-file-signature' : 'fa-file-lines'} text-bronze"></i><span>${esc(f.filename)}</span><span class="text-muted font-normal">${NPS.fmtSize(f.size_bytes)}</span>${f.sha256 ? `<span class="text-[11px] font-mono text-primary bg-primaryLight/60 px-1.5 py-0.5 rounded-sm"><i class="fa-solid fa-shield-halved mr-0.5" aria-hidden="true"></i>SHA-256 ${esc(f.sha256.slice(0, 8))}…</span>` : ''}</button>`;
         const groups = [['Client documents', 'client_document'], ['Sent after "Action required"', 'action_upload'], ['Proof of service', 'proof']]
             .map(([label, kind]) => [label, files.filter(f => f.kind === kind)]).filter(([, list]) => list.length);
 

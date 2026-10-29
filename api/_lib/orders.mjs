@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, HttpError, IS_PROD } from './core.mjs';
+import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD } from './core.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -39,13 +39,21 @@ export function estimate(tier, addonKeys) {
     return { keys, cents: t.cents + keys.reduce((s, k) => s + ADDONS[k].cents, 0) };
 }
 
+const TOKEN_RE = /^[A-Za-z0-9_-]{20,64}$/;
+export function cleanTrackToken(token) {
+    if (typeof token !== 'string' || !TOKEN_RE.test(token)) throw new HttpError(404, 'This tracking link is not valid.');
+    return token;
+}
+
 export async function orderByToken(token) {
-    if (typeof token !== 'string' || token.length < 20 || token.length > 64) throw new HttpError(404, 'This tracking link is not valid.');
-    const { data, error } = await db().from('orders').select('*').eq('track_token', token).maybeSingle();
+    const safeToken = cleanTrackToken(token);
+    const { data, error } = await db().from('orders').select('*').eq('track_token', safeToken).maybeSingle();
     if (error) throw error;
     if (!data) throw new HttpError(404, 'This tracking link is not valid.');
     return data;
 }
+
+const isSafePaymentUrl = (u) => typeof u === 'string' && (/^https:\/\/checkout\.stripe\.com\//i.test(u) || u.startsWith('/__mock-pay'));
 
 // The client's view of an order: no internal notes, only client-visible events and files.
 export async function clientView(order) {
@@ -74,7 +82,7 @@ export async function clientView(order) {
         addons: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
         estimate: money(order.estimated_total_cents),
         amountDue: order.amount_due_cents != null ? money(order.amount_due_cents) : null,
-        payUrl: order.status === 'awaiting_payment' ? order.payment_url : null,
+        payUrl: order.status === 'awaiting_payment' && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
         paidAt: order.paid_at,
         actionNote: order.status === 'action_required' ? order.action_note : null,
         events: events || [],
@@ -83,6 +91,8 @@ export async function clientView(order) {
 }
 
 export async function fileForOrder(orderId, fileId) {
+    uuid(orderId, 'Order');
+    uuid(fileId, 'File');
     const { data, error } = await db().from('order_files').select('storage_path, filename')
         .eq('order_id', orderId).eq('id', fileId).eq('uploaded', true).maybeSingle();
     if (error) throw error;
@@ -91,6 +101,7 @@ export async function fileForOrder(orderId, fileId) {
 }
 
 export async function markPaid(orderId, amountCents, sessionId) {
+    uuid(orderId, 'Order');
     const { data: order, error } = await db().from('orders').select('id, status, paid_at').eq('id', orderId).maybeSingle();
     if (error) throw error;
     if (!order || order.paid_at) return false;           // already handled (webhook and redirect can both arrive)

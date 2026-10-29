@@ -7,12 +7,13 @@
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, cleanFileList,
          prepareUploads, confirmUploads, addEvent, uuid, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
-import { orderByToken, clientView, fileForOrder, markPaid, sendEmail } from './_lib/orders.mjs';
+import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, sendEmail } from './_lib/orders.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
 
 export const POST = handle(async (request) => {
-    await rateLimit(`track:${clientIp(request)}`, 120, 600);
     const body = await readJson(request);
+    cleanTrackToken(body.t);
+    await rateLimit(`track:${clientIp(request)}`, 120, 600);
     const order = await orderByToken(body.t);
 
     if (body.action === 'view') {
@@ -24,7 +25,7 @@ export const POST = handle(async (request) => {
     }
 
     if (body.action === 'confirm-payment') {
-        if (typeof body.session !== 'string' || !body.session.startsWith('cs_')) throw new HttpError(400, 'Invalid payment session.');
+        if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) throw new HttpError(400, 'Invalid payment session.');
         const session = await stripeClient().checkout.sessions.retrieve(body.session);
         if (session.metadata?.order_id === order.id && session.payment_status === 'paid') {
             await markPaid(order.id, session.amount_total, session.id);
@@ -67,8 +68,17 @@ export const POST = handle(async (request) => {
     }
 
     if (body.action === 'respond-finish') {
+        if (order.status !== 'received') return json(await clientView(order));
         const uploaded = await confirmUploads(order.id, body.fileIds);
         if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} file${uploaded.length === 1 ? '' : 's'} added by you`);
+        const { data: recentEvents } = await db().from('order_events').select('kind, title, created_at')
+            .eq('order_id', order.id).order('created_at', { ascending: false }).limit(20);
+        const lastResponse = (recentEvents || []).find(e => e.kind === 'action_response');
+        const lastEmailed = (recentEvents || []).find(e => e.title === 'Reply emailed');
+        if (!lastResponse || (lastEmailed && lastEmailed.created_at >= lastResponse.created_at)) {
+            return json(await clientView(await orderByToken(body.t)));
+        }
+        await addEvent(order.id, 'note', 'Reply emailed', null, false);
         const origin = siteOrigin(request);
         await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
             to,

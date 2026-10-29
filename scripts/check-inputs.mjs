@@ -1,7 +1,7 @@
 // Edge-case checks for the server's input handling (prices, files, text, email, cookies, request bodies). Run: npm test
 const root = new URL('..', import.meta.url).href.replace(/\/$/, '');
-const { estimate, clean } = await import(root + '/api/_lib/orders.mjs');
-const { cleanFileList, text, email, getCookie, readJson, uuid, uuidList, ADMIN_EMAILS } = await import(root + '/api/_lib/core.mjs');
+const { estimate, clean, cleanTrackToken } = await import(root + '/api/_lib/orders.mjs');
+const { cleanFileList, text, longText, email, phone, cleanOrderCode, cleanDate, getCookie, readJson, uuid, uuidList, ADMIN_EMAILS } = await import(root + '/api/_lib/core.mjs');
 let pass = 0, fail = 0;
 const ok = (name, cond) => { cond ? pass++ : fail++; if (!cond) console.log('FAIL', name); };
 const throws = (name, fn, re) => { try { fn(); ok(name, false); } catch (e) { ok(name, !re || re.test(e.message)); } };
@@ -85,6 +85,69 @@ ok('id list keeps only real ids', uuidList(['4c190c16-ccb0-40c6-9c81-da1842658d5
 ok('id list from non-list', uuidList('x').length === 0);
 ok('default ADMIN_EMAILS includes Nick and devteam@partnershipwithmedia-dev.com',
     ADMIN_EMAILS.includes('nicksprocessservices@outlook.com') && ADMIN_EMAILS.includes('devteam@partnershipwithmedia-dev.com'));
+
+// Hardened SQLi / PostgREST / control-char / prototype-pollution checks
+for (const badEmail of [
+    "admin'--@evil.com",
+    'user"quote@evil.com',
+    "a@b.com' OR '1'='1",
+    'user,id.eq.1@evil.com',
+    'user(1)@evil.com',
+    'user;drop@evil.com',
+    '.leading@evil.com',
+    'trailing.@evil.com',
+    'double..dot@evil.com',
+    'user@-bad.com',
+    'user@bad-.com',
+    'user@bad..com',
+]) throws(`SQLi/malformed email rejected: ${badEmail}`, () => email(badEmail), /valid email/);
+ok('plus-tagged email accepted', email('devteam+test@partnershipwithmedia-dev.com') === 'devteam+test@partnershipwithmedia-dev.com');
+
+ok('valid US phone accepted', phone('(562) 555-0144 ext 12') === '(562) 555-0144 ext 12');
+for (const badPhone of [
+    "2099226817' OR 1=1--",
+    '5625550144; DROP TABLE orders',
+    '<script>1234567890</script>',
+    '12345',
+    '12345678901234567',
+]) throws(`SQLi/bad phone rejected: ${badPhone}`, () => phone(badPhone), /phone number/);
+
+ok('valid calendar date accepted', cleanDate('2026-10-29') === '2026-10-29');
+ok('leap year date accepted', cleanDate('2028-02-29') === '2028-02-29');
+ok('empty date -> null', cleanDate('') === null && cleanDate(null) === null);
+for (const badDate of ['9999-99-99', '2026-02-29', '2026-02-31', '2026-13-01', '2026-00-10', '1800-01-01', "2026-10-29' OR '1'='1"])
+    throws(`invalid date rejected: ${badDate}`, () => cleanDate(badDate), /valid deadline date/);
+
+ok('valid order code normalized', cleanOrderCode('np-649025') === 'NP-649025' && cleanOrderCode('649025') === 'NP-649025');
+for (const badCode of ['NP-12345', 'NP-1234567', "NP-123456' OR 1=1", 'NP-ABCDEF', ''])
+    throws(`bad order code rejected: ${badCode}`, () => cleanOrderCode(badCode), /reference number/i);
+
+ok('valid track token accepted', cleanTrackToken('AbCdEfGhIjKlMnOpQrStUvWxYz012345') === 'AbCdEfGhIjKlMnOpQrStUvWxYz012345');
+for (const badTok of ['short', "AbCdEfGhIjKlMnOpQrSt' OR '1'='1", 'aaaa,id.neq.00000000000000', '../etc/passwd/123456789012', 'a'.repeat(65)])
+    throws(`bad track token rejected: ${badTok}`, () => cleanTrackToken(badTok), /tracking link/);
+
+ok('NUL bytes and bidi override stripped from text', text('Hello\u0000\u0007\u202EWorld') === 'HelloWorld');
+ok('NUL bytes and bidi override stripped from longText', longText('Line 1\u0000\u202E\nLine 2') === 'Line 1\nLine 2');
+
+for (const badFile of [
+    { name: '../secret.pdf', size: 100 },
+    { name: 'sub/secret.pdf', size: 100 },
+    { name: '..\\secret.pdf', size: 100 },
+    { name: 'invoice.php.pdf', size: 100 },
+    { name: 'malware.exe.pdf', size: 100 },
+    { name: 'xss.svg.pdf', size: 100 },
+    { name: 'payload.html.jpg', size: 100 },
+    { name: 'script.js.png', size: 100 },
+    { name: 'valid.pdf', size: 100.5 },
+]) throws(`bad file rejected: ${badFile.name} (${badFile.size})`, () => cleanFileList([badFile]), /only PDF|25 MB/i);
+
+const polluted = await readJson(post('{"__proto__":{"polluted":true},"constructor":{"prototype":{"polluted":true}},"nested":{"__proto__":{"x":1}},"ok":1}'));
+ok('prototype pollution keys stripped from JSON', polluted.ok === 1 && !({}).polluted && !Object.hasOwn(polluted, '__proto__') && !Object.hasOwn(polluted, 'constructor'));
+for (const badRoot of ['null', '[]', '[1,2,3]', '"hello"', '42', 'true'])
+    await throwsAsync(`non-object JSON root rejected: ${badRoot}`, () => readJson(post(badRoot)), /Invalid/);
+
+ok('cookie with NUL byte rejected', getCookie(req('nps_admin=abc%00def'), 'nps_admin') === null);
+ok('oversized cookie header rejected', getCookie(req('nps_admin=' + 'a'.repeat(9000)), 'nps_admin') === null);
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

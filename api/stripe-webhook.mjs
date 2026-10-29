@@ -7,6 +7,7 @@ export const POST = handle(async (request) => {
     const secret = process.env.STRIPE_WEBHOOK_SECRET;
     if (!secret) throw new HttpError(503, 'Webhook not configured.');
     const raw = await request.text();
+    if (raw.length > 256 * 1024) throw new HttpError(413, 'Payload too large.');
     let event;
     try {
         event = await stripeClient().webhooks.constructEventAsync(raw, request.headers.get('stripe-signature'), secret);

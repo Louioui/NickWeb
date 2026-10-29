@@ -33,7 +33,10 @@ export const POST = handle(async request => {
             verifiedClient(data.user);
             session = data.session;
         } else {
-            if (typeof body.access !== 'string' || body.access.length > 4096 || typeof body.refresh !== 'string' || body.refresh.length > 1024) throw new HttpError(401, 'This sign-in link is invalid. Please request a new email.');
+            if (typeof body.access !== 'string' || !body.access || body.access.length > 4096 || /[\u0000-\u001F\u007F]/.test(body.access) ||
+                typeof body.refresh !== 'string' || !body.refresh || body.refresh.length > 1024 || /[\u0000-\u001F\u007F]/.test(body.refresh)) {
+                throw new HttpError(401, 'This sign-in link is invalid. Please request a new email.');
+            }
             const { data, error } = await auth.auth.getUser(body.access);
             if (error) throw new HttpError(401, 'This sign-in link is invalid or expired. Please request a new email.');
             verifiedClient(data.user);

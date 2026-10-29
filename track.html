@@ -189,10 +189,11 @@
             return `<li class="wizard-step ${cls}" ${i === stage ? 'aria-current="step"' : ''}><span class="wizard-num" aria-hidden="true">${i < stage || cls === 'is-done' ? '<i class="fa-solid fa-check text-[0.65rem]"></i>' : i + 1}</span><span>${name}</span></li>`;
         }).join('');
 
-        $('pay-panel').classList.toggle('hidden', !o.payUrl);
-        if (o.payUrl) {
+        const safePayUrl = typeof o.payUrl === 'string' && (/^https:\/\/checkout\.stripe\.com\//i.test(o.payUrl) || /^\/__mock-pay\b/.test(o.payUrl)) ? o.payUrl : null;
+        $('pay-panel').classList.toggle('hidden', !safePayUrl);
+        if (safePayUrl) {
             $('pay-amount').textContent = o.amountDue;
-            $('pay-btn').href = o.payUrl;
+            $('pay-btn').href = safePayUrl;
         }
 
         $('action-panel').classList.toggle('hidden', !o.actionNote);

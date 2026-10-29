@@ -5,12 +5,14 @@ import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, emai
 import { sendEmail } from './_lib/orders.mjs';
 
 export const POST = handle(async (request) => {
-    await rateLimit(`lookup:${clientIp(request)}`, 6, 900);
     const body = await readJson(request);
     const code = (text(body.code, { max: 20, required: true, label: 'Reference number' }) || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
     const addr = email(body.email);
-    const { data: order } = await db().from('orders').select('code, track_token, client_email, client_name')
-        .eq('code', code).eq('client_email', addr).maybeSingle();
+    if (!/^NP-\d{6}$/.test(code)) {
+        return json({ ok: true, message: 'If that reference number and email match a request, we just emailed you its private tracking link.' });
+    }
+    await rateLimit(`lookup:${clientIp(request)}`, 6, 900);
+    const { data: order } = await db().from('orders').select('code, track_token, client_email, client_name').eq('code', code).eq('client_email', addr).maybeSingle();
     if (order) {
         await sendEmail({
             to: order.client_email,

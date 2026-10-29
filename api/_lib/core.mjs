@@ -55,7 +55,14 @@ export async function readJson(request, maxBytes = 64 * 1024) {
     if (origin && origin !== new URL(request.url).origin) throw new HttpError(403, 'Invalid request.');
     const text = await request.text();
     if (text.length > maxBytes) throw new HttpError(413, 'Request is too large.');
-    try { return text ? JSON.parse(text) : {}; } catch { throw new HttpError(400, 'Invalid request.'); }
+    let parsed;
+    try {
+        parsed = text ? JSON.parse(text, (k, v) => (k === '__proto__' || k === 'constructor' || k === 'prototype') ? undefined : v) : {};
+    } catch {
+        throw new HttpError(400, 'Invalid request.');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new HttpError(400, 'Invalid request.');
+    return parsed;
 }
 
 // Vercel sets x-real-ip itself; the first x-forwarded-for entry is only a fallback for local testing.
@@ -70,10 +77,15 @@ export function siteOrigin(request) {
 
 export function getCookie(request, name) {
     const raw = request.headers.get('cookie') || '';
+    if (raw.length > 8192) return null;
     for (const part of raw.split(';')) {
         const [k, ...v] = part.trim().split('=');
         if (k === name) {
-            try { return decodeURIComponent(v.join('=')); } catch { return null; }   // malformed cookie: treat as logged out
+            try {
+                const decoded = decodeURIComponent(v.join('='));
+                if (/[\u0000-\u001F\u007F]/.test(decoded)) return null;
+                return decoded;
+            } catch { return null; }   // malformed cookie: treat as logged out
         }
     }
     return null;
@@ -99,20 +111,52 @@ export async function rateLimit(bucket, max, windowSeconds) {
 }
 
 // --- Input cleaning ---
+// Strip NUL bytes, ASCII control chars, and Unicode bidirectional override chars (which could crash Postgres UTF-8 or spoof extensions).
+const CTRL_INLINE_RE = /[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g;
+const CTRL_MULTILINE_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g;
+
 export function text(value, { max = 200, required = false, label = 'This field' } = {}) {
-    const s = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+    const s = typeof value === 'string' ? value.replace(/[\r\n\t]+/g, ' ').replace(CTRL_INLINE_RE, '').trim().replace(/\s+/g, ' ') : '';
     if (required && !s) throw new HttpError(400, `${label} is required.`);
     if (s.length > max) throw new HttpError(400, `${label} is too long.`);
     return s || null;
 }
 export function longText(value, { max = 2000, label = 'This field' } = {}) {
-    const s = typeof value === 'string' ? value.trim() : '';
+    const s = typeof value === 'string' ? value.replace(/\r\n?/g, '\n').replace(CTRL_MULTILINE_RE, '').trim() : '';
     if (s.length > max) throw new HttpError(400, `${label} is too long.`);
     return s || null;
 }
+// Strict RFC-safe email validator: forbids quotes, parens, commas, semicolons, backslashes, and SQL/PostgREST operators.
+const EMAIL_RE = /^[a-z0-9._%+-]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 export function email(value) {
     const s = text(value, { max: 200, required: true, label: 'Email' }).toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s)) throw new HttpError(400, 'Please enter a valid email address.');
+    const local = s.split('@')[0] || '';
+    if (!EMAIL_RE.test(s) || /^\.|\.$|\.\./.test(local)) throw new HttpError(400, 'Please enter a valid email address.');
+    return s;
+}
+const PHONE_RE = /^[0-9+().\-\s]{10,28}(?:\s*(?:ext\.?|x)\s*\d{1,6})?$/i;
+export function phone(value, { label = 'Phone number' } = {}) {
+    const s = text(value, { max: 40, required: true, label });
+    const digits = s.replace(/\D/g, '');
+    if (!PHONE_RE.test(s) || digits.length < 10 || digits.length > 15) {
+        throw new HttpError(400, 'Please enter a valid phone number with area code.');
+    }
+    return s;
+}
+export function cleanOrderCode(value) {
+    const raw = (text(value, { max: 20, required: true, label: 'Reference number' }) || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
+    if (!/^NP-\d{6}$/.test(raw)) throw new HttpError(400, 'Please enter a valid 6-digit reference number (e.g. NP-482913).');
+    return raw;
+}
+export function cleanDate(value, { label = 'Deadline' } = {}) {
+    if (value === null || value === undefined || value === '') return null;
+    const s = typeof value === 'string' ? value.trim() : '';
+    if (!s) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new HttpError(400, `Please enter a valid ${label.toLowerCase()} date.`);
+    const d = new Date(s + 'T00:00:00Z');
+    if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s || d.getUTCFullYear() < 2020 || d.getUTCFullYear() > 2100) {
+        throw new HttpError(400, `Please enter a valid ${label.toLowerCase()} date.`);
+    }
     return s;
 }
 
@@ -126,18 +170,22 @@ const ALLOWED_TYPES = new Set([
     'image/jpeg', 'image/png', 'image/heic', 'image/heif', 'image/webp',
 ]);
 const TYPE_BY_EXT = { pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', webp: 'image/webp' };
+const DANGEROUS_EXT_RE = /\.(?:php\d?|phtml|phar|exe|dll|bat|cmd|sh|bash|zsh|ps1|vbs|scr|msi|com|jar|py|pl|rb|cgi|asp|aspx|jsp|jspx|html?|xhtml|shtml|svg|xml|js|mjs|cjs|wasm|hta)\./i;
 
 export function cleanFileList(files) {
     if (!Array.isArray(files)) return [];
     if (files.length > MAX_FILES) throw new HttpError(400, `Please attach at most ${MAX_FILES} files.`);
     return files.map(f => {
         const name = text(f?.name, { max: 180, required: true, label: 'File name' });
+        if (/[/\\<>:"'|?*;`$]|\.\./.test(name) || DANGEROUS_EXT_RE.test(name)) {
+            throw new HttpError(400, `${name}: only PDF, Word (.docx), JPG, PNG or HEIC files can be uploaded.`);
+        }
         // The type comes from the extension, never from what the browser claims, so "notes.html" labeled as a PDF is refused.
         const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
         const type = TYPE_BY_EXT[ext];
         if (!type || !ALLOWED_TYPES.has(type)) throw new HttpError(400, `${name}: only PDF, Word (.docx), JPG, PNG or HEIC files can be uploaded.`);
-        const size = Number(f?.size) || 0;
-        if (size <= 0 || size > MAX_FILE_BYTES) throw new HttpError(400, `${name} is larger than 25 MB.`);
+        const size = Number(f?.size);
+        if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_FILE_BYTES) throw new HttpError(400, `${name} is larger than 25 MB.`);
         return { name, type, size };
     });
 }

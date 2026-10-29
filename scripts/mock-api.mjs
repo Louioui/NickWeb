@@ -2,7 +2,7 @@
 // form, tracking page and dashboard can be clicked through before any keys exist. Orders live in memory and reset on restart.
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
-import { TIERS, ADDONS, STATUSES, estimate, money } from '../api/_lib/orders.mjs';
+import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken } from '../api/_lib/orders.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
 export const MOCK_CLIENT_CODE = '123456';
@@ -75,12 +75,60 @@ class MockError extends Error { constructor(status, msg) { super(msg); this.stat
 const fail = (status, msg) => { throw new MockError(status, msg); };
 const email = (to, subject, link) => console.log(`[mock email] To: ${to} | ${subject}${link ? ` | ${link}` : ''}`);
 
+const UNSAFE_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/g;
+const EMAIL_RE = /^[a-z0-9._%+-]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const PHONE_RE = /^[0-9+().\-\s]{10,28}(?:\s*(?:ext\.?|x)\s*\d{1,6})?$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DANGEROUS_EXT_RE = /\.(?:exe|scr|bat|cmd|com|msi|ps1|vbs|js|mjs|cjs|html|htm|xhtml|svg|xml|php|phtml|sh|bash|zsh|py|rb|pl|jar|apk|dmg|iso|dll|so|dylib|lnk|htaccess|sql)(?:\.|$)/i;
+const MOCK_FILE_TYPES = { pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif', tif: 'image/tiff', tiff: 'image/tiff', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
+
+function cleanText(v, max = 200, required = false, label = 'Field') {
+    const s = typeof v === 'string' ? v.replace(UNSAFE_CHARS_RE, '').replace(/[\r\n\t]+/g, ' ').trim() : '';
+    if (!s) { if (required) fail(400, `${label} is required.`); return null; }
+    if (s.length > max) fail(400, `${label} is too long (max ${max} characters).`);
+    return s;
+}
+function cleanLongText(v, max = 2000, label = 'Field') {
+    const s = typeof v === 'string' ? v.replace(/\r\n/g, '\n').replace(UNSAFE_CHARS_RE, '').trim() : '';
+    if (!s) return null;
+    if (s.length > max) fail(400, `${label} is too long (max ${max} characters).`);
+    return s;
+}
+function cleanEmail(v) {
+    const s = cleanText(v, 160, true, 'Email').toLowerCase();
+    const [local] = s.split('@');
+    if (!EMAIL_RE.test(s) || !local || local.length > 64 || /^\.|\.$|\.\./.test(local)) fail(400, 'Please enter a valid email.');
+    return s;
+}
+function cleanPhone(v) {
+    const s = cleanText(v, 40, true, 'Phone number');
+    const digits = s.replace(/\D/g, '');
+    if (!PHONE_RE.test(s) || digits.length < 10 || digits.length > 15) fail(400, 'Please enter a phone number with area code.');
+    return s;
+}
+function cleanDate(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const s = typeof v === 'string' ? v.trim() : '';
+    if (!s) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) fail(400, 'Please enter a valid deadline date.');
+    const d = new Date(s + 'T00:00:00Z');
+    if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s || d.getUTCFullYear() < 2020 || d.getUTCFullYear() > 2100) {
+        fail(400, 'Please enter a valid deadline date.');
+    }
+    return s;
+}
+function cleanUuid(v, label = 'Record') {
+    if (typeof v !== 'string' || !UUID_RE.test(v)) fail(404, `${label} not found.`);
+    return v.toLowerCase();
+}
+
 function addEvent(orderId, kind, title, detail = null, clientVisible = true, at = now()) {
     events.push({ id: randomUUID(), order_id: orderId, created_at: at, kind, title, detail, client_visible: clientVisible });
 }
 
 function orderByToken(t) {
-    const o = [...orders.values()].find(o => o.track_token === t);
+    const safe = cleanTrackToken(t);
+    const o = [...orders.values()].find(o => o.track_token === safe);
     if (!o) fail(404, 'This tracking link is not valid.');
     return o;
 }
@@ -115,14 +163,22 @@ function prepareUploads(orderId, kind, list) {
     if (!Array.isArray(list)) return [];
     if (list.length > 10) fail(400, 'Please attach at most 10 files.');
     return list.map(f => {
-        if (!(f?.size > 0) || f.size > 25 * 1024 * 1024) fail(400, `${f?.name} is larger than 25 MB.`);
+        if (!f || typeof f !== 'object') fail(400, 'Invalid file entry.');
+        const name = cleanText(f.name, 180, true, 'File name');
+        if (/[/\\<>:"'|?*;`$]|\.\./.test(name)) fail(400, `${name}: invalid file name.`);
+        const dot = name.lastIndexOf('.');
+        const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
+        const type = MOCK_FILE_TYPES[ext];
+        if (!type || DANGEROUS_EXT_RE.test(name)) fail(400, `${name}: only PDF, Word (.docx) and image files are accepted.`);
+        const size = Number(f.size);
+        if (!Number.isSafeInteger(size) || size <= 0 || size > 25 * 1024 * 1024) fail(400, `${name} must be under 25 MB.`);
         const id = randomUUID();
-        files.set(id, { id, order_id: orderId, kind, filename: String(f.name), size_bytes: f.size, content_type: f.type, sha256: null, uploaded: false, data: null, created_at: now() });
-        return { fileId: id, name: f.name, uploadUrl: `/__mock-upload/${id}` };
+        files.set(id, { id, order_id: orderId, kind, filename: name, size_bytes: size, content_type: type, sha256: null, uploaded: false, data: null, created_at: now() });
+        return { fileId: id, name, uploadUrl: `/__mock-upload/${id}` };
     });
 }
 function confirmUploads(orderId, ids) {
-    return (Array.isArray(ids) ? ids : []).map(id => files.get(id))
+    return (Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && UUID_RE.test(id)).map(id => files.get(id.toLowerCase()))
         .filter(f => f && f.order_id === orderId && f.data).map(f => {
             f.uploaded = true;
             if (!f.sha256) f.sha256 = sha256Hex(f.data);
@@ -137,21 +193,29 @@ function markPaid(o, sessionId) {
 }
 
 // --- Handlers, keyed by the api/<name>.mjs they stand in for ---
+const DOC_TYPES = ['Summons & Complaint', 'Subpoena (Civil, Criminal, or Federal)', 'Writ of Garnishment', 'Small Claims Documents',
+    'Eviction Notice', 'Divorce Papers', 'Child Custody & Support Order', 'Restraining Order', 'Order to Show Cause',
+    'Debt Collection Notice', 'Other Legal Document'];
+
 const handlers = {
     async client(req, body) {
-        const addr = String(body.email || '').trim().toLowerCase();
         const action = body.action;
         if (action === 'send-code') {
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(addr)) fail(400, 'Please enter a valid email.');
-            if (body.intent === 'signup' && !String(body.name || '').trim()) fail(400, 'Full name is required.');
-            clientCodes.set(addr, { intent: body.intent, name: String(body.name || '').trim().slice(0,120), firm: String(body.firm || '').trim().slice(0,160), expires: Date.now() + 600000, attempts: 0 });
+            const addr = cleanEmail(body.email);
+            const signup = body.intent === 'signup';
+            const name = signup ? cleanText(body.name, 120, true, 'Full name') : '';
+            const firm = signup ? (cleanText(body.firm, 160, false, 'Firm') || '') : '';
+            clientCodes.set(addr, { intent: body.intent, name, firm, expires: Date.now() + 600000, attempts: 0 });
             return json({ ok: true, demo: true });
         }
         if (action === 'verify-code') {
+            const addr = cleanEmail(body.email);
+            const code = String(body.code || '').trim();
+            if (!/^\d{6,8}$/.test(code)) fail(400, 'Enter the verification code from your email.');
             const pending = clientCodes.get(addr);
             if (!pending || pending.expires < Date.now() || pending.attempts >= 5) fail(401, 'That code is invalid or expired. Request another email.');
             pending.attempts++;
-            if (String(body.code) !== '123456') fail(401, 'That code is invalid or expired. Request another email.');
+            if (code !== '123456') fail(401, 'That code is invalid or expired. Request another email.');
             if (!clients.has(addr)) {
                 if (pending.intent !== 'signup') fail(401, 'That code is invalid or expired. Create an account first.');
                 clients.set(addr, { name: pending.name, firm: pending.firm, email: addr });
@@ -163,8 +227,8 @@ const handlers = {
             return json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
         }
         const value = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_client=([^;]+)/)?.[1];
-        const verifiedEmail = clientSessions.get(value);
-        if (action === 'logout') { clientSessions.delete(value); return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' }); }
+        const verifiedEmail = value && /^[A-Za-z0-9_-]{16,128}$/.test(value) ? clientSessions.get(value) : null;
+        if (action === 'logout') { if (value) clientSessions.delete(value); return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' }); }
         if (!verifiedEmail || !clients.has(verifiedEmail)) fail(401, 'Please sign in to see your requests.');
         const profile = clients.get(verifiedEmail);
         if (action === 'me') return json({ profile });
@@ -184,18 +248,31 @@ const handlers = {
             email(ADMIN_EMAIL, `New request ${o.code}: ${o.recipient_name}`, `/admin.html#${o.id}`);
             return json({ ok: true });
         }
-        for (const [k, label] of [['clientName', 'Your name'], ['clientEmail', 'Email'], ['recipientName', 'Person to be served'], ['address', 'Street address'], ['city', 'City']]) {
-            if (!String(body[k] || '').trim()) fail(400, `${label} is required.`);
-        }
-        if (String(body.clientPhone || '').replace(/\D/g, '').length < 10) fail(400, 'Please enter a phone number with area code.');
-        if (!/^\d{5}(-\d{4})?$/.test(body.zip || '')) fail(400, 'Please enter a valid 5-digit ZIP code.');
+        if (body.website) return json({ ok: true, code: 'NP-000000', trackUrl: '/' });
+        const clientName = cleanText(body.clientName, 120, true, 'Your name');
+        const clientFirm = cleanText(body.clientFirm, 160, false, 'Firm');
+        const clientEmail = cleanEmail(body.clientEmail);
+        const clientPhone = cleanPhone(body.clientPhone);
+        const recipientName = cleanText(body.recipientName, 160, true, 'Person to be served');
+        const address = cleanText(body.address, 200, true, 'Street address');
+        const unit = cleanText(body.unit, 40, false, 'Unit');
+        const city = cleanText(body.city, 80, true, 'City');
+        const zip = cleanText(body.zip, 10, true, 'ZIP code');
+        if (!/^\d{5}(-\d{4})?$/.test(zip)) fail(400, 'Please enter a valid 5-digit ZIP code.');
+        const deadline = cleanDate(body.deadline);
+        const docType = DOC_TYPES.includes(body.docType) ? body.docType : 'Other Legal Document';
         if (body.acceptTerms !== true) fail(400, 'Please accept the Terms of Service to submit your request.');
         const { keys, cents } = estimate(body.tier, body.addons);
         const o = createOrder({
-            client_name: body.clientName, client_firm: body.clientFirm || null, client_email: body.clientEmail.toLowerCase(), client_phone: body.clientPhone,
-            case_number: body.caseNumber || null, court: body.court || null, client_reference: body.clientReference || null, deadline: body.deadline || null,
-            recipient_name: body.recipientName, doc_type: body.docType, address: body.address, unit: body.unit || null, city: body.city, zip: body.zip,
-            access_notes: body.accessNotes || null, physical_notes: body.physicalNotes || null, instructions: body.instructions || null,
+            client_name: clientName, client_firm: clientFirm, client_email: clientEmail, client_phone: clientPhone,
+            case_number: cleanText(body.caseNumber, 80, false, 'Case number'),
+            court: cleanText(body.court, 160, false, 'Court'),
+            client_reference: cleanText(body.clientReference, 80, false, 'Client reference'),
+            deadline,
+            recipient_name: recipientName, doc_type: docType, address, unit, city, zip,
+            access_notes: cleanLongText(body.accessNotes, 500, 'Gate code / access notes'),
+            physical_notes: cleanLongText(body.physicalNotes, 1000, 'Description notes'),
+            instructions: cleanLongText(body.instructions, 2000, 'Special instructions'),
             tier: body.tier, addons: keys, estimated_total_cents: cents,
         });
         addEvent(o.id, 'created', 'Request received', `${TIERS[o.tier].name} · estimate ${money(cents)}`);
@@ -206,43 +283,62 @@ const handlers = {
         const o = orderByToken(body.t);
         if (body.action === 'view') return json(clientView(o));
         if (body.action === 'download') {
-            const f = files.get(body.fileId);
+            const fid = cleanUuid(body.fileId, 'File');
+            const f = files.get(fid);
             if (!f || f.order_id !== o.id || !f.uploaded) fail(404, 'File not found.');
             return json({ url: `/__mock-file/${f.id}` });
         }
         if (body.action === 'confirm-payment') {
+            if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) fail(400, 'Invalid payment session.');
             if (body.session === o.stripe_session_id && o.status === 'awaiting_payment') markPaid(o, body.session);
             return json(clientView(o));
         }
         if (body.action === 'respond') {
             if (o.status !== 'action_required') fail(409, 'Nothing is needed from you right now.');
             const changes = {};
-            for (const [k, col] of [['address', 'address'], ['unit', 'unit'], ['city', 'city'], ['zip', 'zip'], ['accessNotes', 'access_notes']]) {
-                const v = String(body[k] || '').trim();
-                if (v) changes[col] = v;
+            const address = cleanText(body.address, 200, false, 'Street address');
+            if (address) changes.address = address;
+            const unit = cleanText(body.unit, 40, false, 'Unit');
+            if (unit) changes.unit = unit;
+            const city = cleanText(body.city, 80, false, 'City');
+            if (city) changes.city = city;
+            const zip = cleanText(body.zip, 10, false, 'ZIP code');
+            if (zip) {
+                if (!/^\d{5}(-\d{4})?$/.test(zip)) fail(400, 'Please enter a valid 5-digit ZIP code.');
+                changes.zip = zip;
             }
-            if (changes.zip && !/^\d{5}(-\d{4})?$/.test(changes.zip)) fail(400, 'Please enter a valid 5-digit ZIP code.');
-            const reply = String(body.reply || '').trim();
+            const access = cleanLongText(body.accessNotes, 500, 'Access notes');
+            if (access) changes.access_notes = access;
+            const reply = cleanLongText(body.reply, 2000, 'Your reply');
             const fileList = Array.isArray(body.files) ? body.files : [];
             if (!Object.keys(changes).length && !reply && !fileList.length) fail(400, 'Please add the missing information, a reply, or a file.');
+            const uploads = prepareUploads(o.id, 'action_upload', fileList);
             Object.assign(o, changes, { status: 'received', action_note: null, updated_at: now() });
             const summary = [changes.address || changes.unit || changes.city || changes.zip ? 'Updated the service address' : null,
                 changes.access_notes ? `Access notes: ${changes.access_notes}` : null, reply].filter(Boolean).join(' · ');
             addEvent(o.id, 'action_response', 'You sent the requested information', summary || null);
-            return json({ ok: true, uploads: prepareUploads(o.id, 'action_upload', fileList) });
+            return json({ ok: true, uploads });
         }
         if (body.action === 'respond-finish') {
+            if (o.status !== 'received') return json(clientView(o));
             const up = confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
-            email(ADMIN_EMAIL, `${o.code}: client sent the information you asked for`, `/admin.html#${o.id}`);
+            const orderEvents = events.filter(e => e.order_id === o.id);
+            const lastResponse = [...orderEvents].reverse().find(e => e.kind === 'action_response');
+            const lastEmailed = [...orderEvents].reverse().find(e => e.title === 'Reply emailed');
+            if (lastResponse && (!lastEmailed || lastEmailed.created_at < lastResponse.created_at)) {
+                addEvent(o.id, 'note', 'Reply emailed', null, false);
+                email(ADMIN_EMAIL, `${o.code}: client sent the information you asked for`, `/admin.html#${o.id}`);
+            }
             return json(clientView(o));
         }
         fail(400, 'Unknown action.');
     },
 
     async lookup(req, body) {
-        const code = String(body.code || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
-        const o = [...orders.values()].find(o => o.code === code && o.client_email === String(body.email || '').trim().toLowerCase());
+        const code = (cleanText(body.code, 20, true, 'Reference number') || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
+        const addr = cleanEmail(body.email);
+        const o = /^NP-\d{6}$/.test(code) ? [...orders.values()].find(o => o.code === code && o.client_email === addr) : null;
         if (o) email(o.client_email, `Your tracking link for ${o.code}`, `/track.html#t=${o.track_token}`);
         return json({ ok: true, message: 'If that reference number and email match a request, we just emailed you its private tracking link.' });
     },
@@ -250,12 +346,12 @@ const handlers = {
     async admin(req, body) {
         const a = body.action;
         if (a === 'send-code') {
-            const addr = String(body.email || '').trim().toLowerCase();
+            const addr = cleanEmail(body.email);
             if (MOCK_ADMIN_EMAILS.includes(addr)) console.log(`[mock] dashboard login code for ${addr}: ${MOCK_ADMIN_CODE}`);
             return json({ ok: true });
         }
         if (a === 'verify-code') {
-            const addr = String(body.email || '').trim().toLowerCase();
+            const addr = cleanEmail(body.email);
             if (!MOCK_ADMIN_EMAILS.includes(addr)) fail(401, 'That code is wrong or expired. Request a new one.');
             const raw = String(body.code || '').trim().toUpperCase();
             const digits = raw.replace(/\D/g, '');
@@ -273,7 +369,7 @@ const handlers = {
             return json({ ok: true }, 200, { 'set-cookie': `nps_admin=${t}; Path=/api/admin; HttpOnly; SameSite=Strict` });
         }
         const cookie = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_admin=([^;]+)/)?.[1];
-        if (!cookie || !sessions.has(cookie)) fail(401, 'Please log in.');
+        if (!cookie || !/^[A-Za-z0-9_-]{16,128}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
         const adminEmail = sessionEmails.get(cookie) || ADMIN_EMAIL;
         if (a === 'me') return json({ email: adminEmail, recoveryRemaining: adminRecoveryCodes.get(adminEmail)?.size || 0 });
         if (a === 'logout') {
@@ -309,14 +405,17 @@ const handlers = {
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
         }
         if (a === 'file-url') {
-            const f = files.get(body.fileId);
+            const fid = cleanUuid(body.fileId, 'File');
+            const f = files.get(fid);
             if (!f?.uploaded) fail(404, 'File not found.');
             return json({ url: `/__mock-file/${f.id}` });
         }
-        const o = orders.get(body.id);
+        if (!['get', 'update', 'payment-link', 'export', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
+        const oid = cleanUuid(body.id, 'Order');
+        const o = orders.get(oid);
         if (!o) fail(404, 'Order not found.');
         const trackUrl = `/track.html#t=${o.track_token}`;
-        const note = String(body.note || '').trim() || null;
+        const note = cleanLongText(body.note, 2000, 'Note');
         if (a === 'get') return json(adminDetail(o));
         if (a === 'update') {
             if (body.kind === 'status') {
@@ -326,10 +425,10 @@ const handlers = {
                 addEvent(o.id, 'status', STATUSES[body.status].label, note, body.clientVisible !== false);
                 if (body.notify) email(o.client_email, `${o.code}: ${STATUSES[body.status].label}`, trackUrl);
             } else if (body.kind === 'attempt') {
-                if (!body.outcome) fail(400, 'Outcome is required.');
+                const outcome = cleanText(body.outcome, 120, true, 'Outcome');
+                const when = cleanText(body.when, 40, false, 'When');
                 if (['received', 'paid', 'accepted'].includes(o.status)) o.status = 'attempting';
-                const when = body.when || null;
-                addEvent(o.id, 'attempt', `Attempt: ${body.outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
+                addEvent(o.id, 'attempt', `Attempt: ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
             } else if (body.kind === 'note') {
                 if (!note) fail(400, 'Write a note first.');
                 addEvent(o.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);
@@ -345,10 +444,11 @@ const handlers = {
             const cents = Math.round(Number(body.amount) * 100);
             if (!Number.isFinite(cents) || cents < 100 || cents > 1000000) fail(400, 'Enter an amount between $1 and $10,000.');
             if (o.paid_at) fail(409, 'This order is already paid.');
+            const description = cleanText(body.description, 300, false, 'Description');
             const session = `cs_mock_${randomBytes(6).toString('hex')}`;
             Object.assign(o, { status: 'awaiting_payment', amount_due_cents: cents, stripe_session_id: session,
                 payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}` });
-            addEvent(o.id, 'payment', `Payment requested: ${money(cents)}`, String(body.description || '').trim() || null);
+            addEvent(o.id, 'payment', `Payment requested: ${money(cents)}`, description);
             email(o.client_email, `${o.code}: confirmed, ${money(cents)} due to start service`, o.payment_url);
             return json(adminDetail(o));
         }
@@ -382,14 +482,28 @@ const handlers = {
     },
 };
 
+const PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+function parseSafeJson(raw) {
+    if (!raw) return {};
+    if (raw.length > 65536) fail(413, 'Request too large.');
+    let parsed;
+    try {
+        parsed = JSON.parse(raw, (k, v) => (PROTO_KEYS.has(k) ? undefined : v));
+    } catch {
+        fail(400, 'Invalid JSON.');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail(400, 'Invalid request.');
+    return parsed;
+}
+
 export async function handleMockApi(name, req) {
     const handler = handlers[name];
     if (!handler) return null;
     try {
         const raw = req.method === 'GET' ? '' : await req.text();
-        return await handler(req, raw ? JSON.parse(raw) : {}, new URL(req.url));
+        return await handler(req, parseSafeJson(raw), new URL(req.url));
     } catch (err) {
-        if (err instanceof MockError) return json({ error: err.message }, err.status);
+        if (err instanceof MockError || typeof err?.status === 'number') return json({ error: err.message }, err.status);
         if (err?.message === 'Please choose a service tier.') return json({ error: err.message }, 400);
         console.error(err);
         return json({ error: 'Something went wrong on our end.' }, 500);

@@ -18,7 +18,7 @@ export const POST = handle(async (request) => {
     const admin = await requireAdmin(request);
     if (a === 'me') return me(admin);
     if (a === 'logout') return logout(request);
-    if (a === 'logout-all') return logoutAll(admin);
+    if (a === 'logout-all') return logoutAll(request, admin);
     if (a === 'generate-recovery-codes') return generateRecoveryCodes(admin);
     if (a === 'list') return list();
     if (a === 'get') return json(await detail(body.id));
@@ -81,7 +81,7 @@ async function verifyCode(request, body) {
 
 async function requireAdmin(request) {
     const token = getCookie(request, COOKIE);
-    if (!token) throw new HttpError(401, 'Please log in.');
+    if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(token)) throw new HttpError(401, 'Please log in.');
     const { data } = await db().from('admin_sessions').select('email, expires_at').eq('token_hash', sha256(token)).maybeSingle();
     if (!data || data.expires_at < new Date().toISOString() || !ADMIN_EMAILS.includes(data.email)) throw new HttpError(401, 'Please log in.');
     return data.email;
@@ -98,13 +98,15 @@ async function me(admin) {
 
 async function logout(request) {
     const token = getCookie(request, COOKIE);
-    if (token) await db().from('admin_sessions').delete().eq('token_hash', sha256(token));
-    return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Strict; Max-Age=0` });
+    if (typeof token === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(token)) await db().from('admin_sessions').delete().eq('token_hash', sha256(token));
+    const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';
+    return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=0` });
 }
 
-async function logoutAll(admin) {
+async function logoutAll(request, admin) {
     await db().from('admin_sessions').delete().eq('email', admin);
-    return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Strict; Max-Age=0` });
+    const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';
+    return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=0` });
 }
 
 const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';

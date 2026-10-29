@@ -1,6 +1,6 @@
 // Client identity comes only from Supabase Auth's verified user, never a form field or user_metadata.
 import { createClient } from '@supabase/supabase-js';
-import { SUPABASE_URL, HttpError, getCookie } from './core.mjs';
+import { SUPABASE_URL, HttpError, getCookie, email } from './core.mjs';
 export const CLIENT_COOKIE = 'nps_client';
 export function clientAuth() {
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -14,10 +14,18 @@ export function clientCookie(request, session) {
     return `${CLIENT_COOKIE}=${value}; Path=/api/client; HttpOnly; SameSite=Strict; Max-Age=${session ? 86400 * 7 : 0}${secure}`;
 }
 export function savedClientSession(request) {
-    try { return JSON.parse(getCookie(request, CLIENT_COOKIE) || 'null'); } catch { return null; }
+    try {
+        const parsed = JSON.parse(getCookie(request, CLIENT_COOKIE) || 'null');
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+        if (typeof parsed.access !== 'string' || typeof parsed.refresh !== 'string') return null;
+        if (!parsed.access || !parsed.refresh || parsed.access.length > 4096 || parsed.refresh.length > 1024) return null;
+        if (/[\u0000-\u001F\u007F]/.test(parsed.access) || /[\u0000-\u001F\u007F]/.test(parsed.refresh)) return null;
+        return { access: parsed.access, refresh: parsed.refresh };
+    } catch { return null; }
 }
 export function verifiedClient(user) {
     if (!user?.id || !user?.email || !user.email_confirmed_at) throw new HttpError(401, 'Please verify your email to sign in.');
+    try { email(user.email); } catch { throw new HttpError(401, 'Please verify your email to sign in.'); }
     return user;
 }
 export async function requireClient(request) {
@@ -34,5 +42,6 @@ export async function requireClient(request) {
 }
 export function clientProfile(user) {
     // Display-only metadata cannot grant roles, choose an email, or grant access to orders.
-    return { name: String(user.user_metadata?.full_name || '').slice(0, 120), firm: String(user.user_metadata?.firm || '').slice(0, 160), email: user.email };
+    const cleanMeta = (v, max) => String(v || '').replace(/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]+/g, ' ').trim().slice(0, max);
+    return { name: cleanMeta(user.user_metadata?.full_name, 120), firm: cleanMeta(user.user_metadata?.firm, 160), email: String(user.email || '').trim().toLowerCase() };
 }

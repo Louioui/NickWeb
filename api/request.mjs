@@ -1,7 +1,7 @@
 // POST /api/request — a client submits a service request from the website.
 //   { step: 'create', ...form, files: [{name, size, type}] } -> creates the order and returns upload links
 //   { step: 'finish', t, fileIds }                           -> confirms uploads and sends the emails
-import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, email,
+import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, email, phone as cleanPhone, cleanDate,
          cleanFileList, prepareUploads, confirmUploads, addEvent, randomToken, orderCode, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
 import { TIERS, ADDONS, estimate, money, orderByToken, sendEmail } from './_lib/orders.mjs';
 
@@ -17,12 +17,11 @@ export const POST = handle(async (request) => {
     if (body.website) return json({ ok: true, code: 'NP-000000', trackUrl: '/' });
     await rateLimit(`request:${clientIp(request)}`, 8, 3600);
 
-    const phone = text(body.clientPhone, { max: 40, required: true, label: 'Phone number' });
-    if (phone.replace(/\D/g, '').length < 10) throw new HttpError(400, 'Please enter a phone number with area code.');
+    const phone = cleanPhone(body.clientPhone);
     const zip = text(body.zip, { max: 10, required: true, label: 'ZIP code' });
     if (!/^\d{5}(-\d{4})?$/.test(zip)) throw new HttpError(400, 'Please enter a valid 5-digit ZIP code.');
     const docType = DOC_TYPES.includes(body.docType) ? body.docType : 'Other Legal Document';
-    const deadline = /^\d{4}-\d{2}-\d{2}$/.test(body.deadline || '') ? body.deadline : null;
+    const deadline = cleanDate(body.deadline);
     const { keys: addons, cents } = estimate(body.tier, body.addons);
     if (body.acceptTerms !== true) throw new HttpError(400, 'Please accept the Terms of Service to submit your request.');
     const files = cleanFileList(body.files);
