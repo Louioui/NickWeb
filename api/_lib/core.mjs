@@ -5,7 +5,7 @@ import { createHash, randomBytes, randomInt } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
 export const BUCKET = 'case-files';
-export const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'nicksprocessservices@outlook.com')
+export const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'nicksprocessservices@outlook.com,devteam@partnershipwithmedia-dev.com')
     .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 export const IS_PROD = process.env.VERCEL_ENV === 'production';
 
@@ -160,7 +160,7 @@ export async function prepareUploads(orderId, kind, files) {
     return out;
 }
 
-// Marks files uploaded only if the object really exists in storage.
+// Marks files uploaded only if the object really exists in storage, and records a SHA-256 fingerprint for chain-of-custody verification.
 export async function confirmUploads(orderId, fileIds) {
     const ids = uuidList(fileIds).slice(0, MAX_FILES);
     if (!ids.length) return [];
@@ -171,8 +171,15 @@ export async function confirmUploads(orderId, fileIds) {
     for (const r of rows) {
         const { data: exists } = await db().storage.from(BUCKET).exists(r.storage_path);
         if (exists) {
-            await db().from('order_files').update({ uploaded: true }).eq('id', r.id);
-            done.push(r);
+            let fileHash = null;
+            try {
+                const { data: blob } = await db().storage.from(BUCKET).download(r.storage_path);
+                if (blob) fileHash = sha256(Buffer.from(await blob.arrayBuffer()));
+            } catch { /* non-fatal if storage download cannot compute hash */ }
+            const patch = fileHash ? { uploaded: true, sha256: fileHash } : { uploaded: true };
+            const { error: uErr } = await db().from('order_files').update(patch).eq('id', r.id);
+            if (uErr && fileHash) await db().from('order_files').update({ uploaded: true }).eq('id', r.id);
+            done.push({ ...r, sha256: fileHash });
         }
     }
     return done;

@@ -16,8 +16,10 @@ export const POST = handle(async (request) => {
     if (a === 'verify-code') return verifyCode(request, body);
 
     const admin = await requireAdmin(request);
-    if (a === 'me') return json({ email: admin });
+    if (a === 'me') return me(admin);
     if (a === 'logout') return logout(request);
+    if (a === 'logout-all') return logoutAll(admin);
+    if (a === 'generate-recovery-codes') return generateRecoveryCodes(admin);
     if (a === 'list') return list();
     if (a === 'get') return json(await detail(body.id));
     if (a === 'update') return update(request, body);
@@ -56,10 +58,20 @@ async function sendCode(request, body) {
 async function verifyCode(request, body) {
     await rateLimit(`admin-verify:${clientIp(request)}`, 10, 900);
     const addr = email(body.email);
-    const code = String(body.code || '').replace(/\D/g, '');
-    // Checked and counted in one locked database step (use_admin_code), so parallel guesses can't get past 5 tries per code.
-    const { data: ok, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${code}`) });
-    if (error) throw error;
+    const raw = String(body.code || '').trim().toUpperCase();
+    const digits = raw.replace(/\D/g, '');
+    const alnum = raw.replace(/[^A-Z0-9]/g, '');
+    let ok = false;
+    if (digits.length === 8 && raw.replace(/\s+/g, '') === digits) {
+        // Checked and counted in one locked database step (use_admin_code), so parallel guesses can't get past 5 tries per code.
+        const { data, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${digits}`) });
+        if (error) throw error;
+        ok = !!data;
+    }
+    if (!ok && alnum.length === 8 && ADMIN_EMAILS.includes(addr)) {
+        const { data, error } = await db().rpc('use_admin_recovery_code', { p_email: addr, p_hash: sha256(`${addr}:${alnum}`) });
+        if (!error && data) ok = true;
+    }
     if (!ok) throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
     const token = randomToken(32);
     await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
@@ -75,10 +87,40 @@ async function requireAdmin(request) {
     return data.email;
 }
 
+async function me(admin) {
+    let recoveryRemaining = 0;
+    try {
+        const { count, error } = await db().from('admin_recovery_codes').select('id', { count: 'exact', head: true }).eq('email', admin).eq('used', false);
+        if (!error && typeof count === 'number') recoveryRemaining = count;
+    } catch { /* table may not be migrated yet */ }
+    return json({ email: admin, recoveryRemaining });
+}
+
 async function logout(request) {
     const token = getCookie(request, COOKIE);
     if (token) await db().from('admin_sessions').delete().eq('token_hash', sha256(token));
     return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Strict; Max-Age=0` });
+}
+
+async function logoutAll(admin) {
+    await db().from('admin_sessions').delete().eq('email', admin);
+    return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Strict; Max-Age=0` });
+}
+
+const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+async function generateRecoveryCodes(admin) {
+    const codes = [];
+    const rows = [];
+    for (let i = 0; i < 8; i++) {
+        let raw = '';
+        for (let j = 0; j < 8; j++) raw += RECOVERY_ALPHABET[randomInt(0, RECOVERY_ALPHABET.length)];
+        codes.push(`${raw.slice(0, 4)}-${raw.slice(4)}`);
+        rows.push({ email: admin, code_hash: sha256(`${admin}:${raw}`) });
+    }
+    await db().from('admin_recovery_codes').delete().eq('email', admin).eq('used', false);
+    const { error } = await db().from('admin_recovery_codes').insert(rows);
+    if (error) throw new HttpError(503, 'Backup recovery codes require the latest database migration.');
+    return json({ codes, remaining: codes.length });
 }
 
 // --- Jobs ---
@@ -115,10 +157,15 @@ async function getOrder(id) {
 
 async function detail(id) {
     const order = await getOrder(id);
-    const [{ data: events }, { data: files }] = await Promise.all([
+    const [{ data: events }, fileRes] = await Promise.all([
         db().from('order_events').select('*').eq('order_id', id).order('created_at', { ascending: true }),
-        db().from('order_files').select('id, kind, filename, size_bytes, created_at, uploaded').eq('order_id', id).order('created_at'),
+        db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at, uploaded').eq('order_id', id).order('created_at'),
     ]);
+    let files = fileRes.data;
+    if (fileRes.error) {
+        const fallback = await db().from('order_files').select('id, kind, filename, size_bytes, created_at, uploaded').eq('order_id', id).order('created_at');
+        files = fallback.data;
+    }
     return {
         order: { ...order, tier_name: TIERS[order.tier]?.name, addon_names: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean) },
         events, files: (files || []).filter(f => f.uploaded), statuses: STATUSES,
@@ -208,7 +255,8 @@ async function proofFinish(request, body) {
     const order = await getOrder(body.id);
     const uploaded = await confirmUploads(order.id, body.fileIds);
     if (!uploaded.length) throw new HttpError(400, 'The upload did not finish. Please try again.');
-    await addEvent(order.id, 'proof', 'Proof of service uploaded', uploaded.map(u => u.filename).join(', '));
+    const detailText = uploaded.map(u => u.sha256 ? `${u.filename} (SHA-256: ${u.sha256.slice(0, 12)}…)` : u.filename).join(', ');
+    await addEvent(order.id, 'proof', 'Proof of service uploaded', detailText);
     if (body.markServed) {
         await db().from('orders').update({ status: 'served', served_at: new Date().toISOString() }).eq('id', order.id);
         await addEvent(order.id, 'status', STATUSES.served.label);
@@ -239,7 +287,7 @@ async function exportOrder(body) {
         note: "All information Nick's Process Services holds for this request. Uploaded documents are listed; Nick sends copies on request.",
         request: { ...fields, tier: tier_name, addons: addon_names },
         timeline: events.map(({ created_at, title, detail: d, client_visible }) => ({ created_at, title, detail: d, shown_to_client: client_visible })),
-        files: files.map(({ filename, kind, size_bytes, created_at }) => ({ filename, kind, size_bytes, created_at })),
+        files: files.map(({ filename, kind, size_bytes, sha256: h, created_at }) => ({ filename, kind, size_bytes, sha256: h || null, created_at })),
     });
 }
 

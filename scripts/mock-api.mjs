@@ -5,12 +5,68 @@ import { randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money } from '../api/_lib/orders.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
+export const MOCK_CLIENT_CODE = '123456';
 const ADMIN_EMAIL = 'nicksprocessservices@outlook.com';
+const DEVTEAM_EMAIL = 'devteam@partnershipwithmedia-dev.com';
+const MOCK_ADMIN_EMAILS = [ADMIN_EMAIL, DEVTEAM_EMAIL];
+const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
 const orders = new Map();      // id -> order row
 const events = [];             // { order_id, created_at, kind, title, detail, client_visible }
-const files = new Map();       // id -> { id, order_id, kind, filename, size_bytes, content_type, uploaded, data, created_at }
+const files = new Map();       // id -> { id, order_id, kind, filename, size_bytes, content_type, sha256, uploaded, data, created_at }
+const clients = new Map();
+const clientSessions = new Map();
+const clientCodes = new Map();
 const sessions = new Set();
+const sessionEmails = new Map();
+const adminRecoveryCodes = new Map();
+
+const SHA256_K = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+];
+function sha256Hex(input) {
+    const bytes = typeof input === 'string' ? Uint8Array.from(input, c => c.charCodeAt(0) & 255) : new Uint8Array(input);
+    const bitLen = bytes.length * 8;
+    const padLen = ((bytes.length + 9 + 63) & ~63);
+    const buf = new Uint8Array(padLen);
+    buf.set(bytes);
+    buf[bytes.length] = 0x80;
+    const view = new DataView(buf.buffer);
+    view.setUint32(padLen - 8, Math.floor(bitLen / 0x100000000), false);
+    view.setUint32(padLen - 4, bitLen >>> 0, false);
+    let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+    let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+    const w = new Uint32Array(64);
+    const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+    for (let i = 0; i < padLen; i += 64) {
+        for (let t = 0; t < 16; t++) w[t] = view.getUint32(i + t * 4, false);
+        for (let t = 16; t < 64; t++) {
+            const s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+            const s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+            w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+        }
+        let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+        for (let t = 0; t < 64; t++) {
+            const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const ch = (e & f) ^ (~e & g);
+            const temp1 = (h + S1 + ch + SHA256_K[t] + w[t]) >>> 0;
+            const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const maj = (a & b) ^ (a & c) ^ (b & c);
+            const temp2 = (S0 + maj) >>> 0;
+            h = g; g = f; f = e; e = (d + temp1) >>> 0; d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+        }
+        h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+        h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+    }
+    return [h0, h1, h2, h3, h4, h5, h6, h7].map(v => v.toString(16).padStart(8, '0')).join('');
+}
 
 const now = () => new Date().toISOString();
 const token = () => randomBytes(24).toString('base64url');
@@ -42,7 +98,7 @@ function clientView(o) {
         events: events.filter(e => e.order_id === o.id && e.client_visible).sort((a, b) => a.created_at.localeCompare(b.created_at))
             .map(({ created_at, kind, title, detail }) => ({ created_at, kind, title, detail })),
         files: [...files.values()].filter(f => f.order_id === o.id && f.uploaded)
-            .map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, at: f.created_at })),
+            .map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, sha256: f.sha256 || null, at: f.created_at })),
     };
 }
 
@@ -61,13 +117,17 @@ function prepareUploads(orderId, kind, list) {
     return list.map(f => {
         if (!(f?.size > 0) || f.size > 25 * 1024 * 1024) fail(400, `${f?.name} is larger than 25 MB.`);
         const id = randomUUID();
-        files.set(id, { id, order_id: orderId, kind, filename: String(f.name), size_bytes: f.size, content_type: f.type, uploaded: false, data: null, created_at: now() });
+        files.set(id, { id, order_id: orderId, kind, filename: String(f.name), size_bytes: f.size, content_type: f.type, sha256: null, uploaded: false, data: null, created_at: now() });
         return { fileId: id, name: f.name, uploadUrl: `/__mock-upload/${id}` };
     });
 }
 function confirmUploads(orderId, ids) {
     return (Array.isArray(ids) ? ids : []).map(id => files.get(id))
-        .filter(f => f && f.order_id === orderId && f.data).map(f => { f.uploaded = true; return f; });
+        .filter(f => f && f.order_id === orderId && f.data).map(f => {
+            f.uploaded = true;
+            if (!f.sha256) f.sha256 = sha256Hex(f.data);
+            return f;
+        });
 }
 
 function markPaid(o, sessionId) {
@@ -78,6 +138,43 @@ function markPaid(o, sessionId) {
 
 // --- Handlers, keyed by the api/<name>.mjs they stand in for ---
 const handlers = {
+    async client(req, body) {
+        const addr = String(body.email || '').trim().toLowerCase();
+        const action = body.action;
+        if (action === 'send-code') {
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(addr)) fail(400, 'Please enter a valid email.');
+            if (body.intent === 'signup' && !String(body.name || '').trim()) fail(400, 'Full name is required.');
+            clientCodes.set(addr, { intent: body.intent, name: String(body.name || '').trim().slice(0,120), firm: String(body.firm || '').trim().slice(0,160), expires: Date.now() + 600000, attempts: 0 });
+            return json({ ok: true, demo: true });
+        }
+        if (action === 'verify-code') {
+            const pending = clientCodes.get(addr);
+            if (!pending || pending.expires < Date.now() || pending.attempts >= 5) fail(401, 'That code is invalid or expired. Request another email.');
+            pending.attempts++;
+            if (String(body.code) !== '123456') fail(401, 'That code is invalid or expired. Request another email.');
+            if (!clients.has(addr)) {
+                if (pending.intent !== 'signup') fail(401, 'That code is invalid or expired. Create an account first.');
+                clients.set(addr, { name: pending.name, firm: pending.firm, email: addr });
+            } else if (pending.intent === 'signup' && pending.name) {
+                clients.set(addr, { name: pending.name, firm: pending.firm, email: addr });
+            }
+            clientCodes.delete(addr);
+            const value = token(); clientSessions.set(value, addr);
+            return json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
+        }
+        const value = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_client=([^;]+)/)?.[1];
+        const verifiedEmail = clientSessions.get(value);
+        if (action === 'logout') { clientSessions.delete(value); return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' }); }
+        if (!verifiedEmail || !clients.has(verifiedEmail)) fail(401, 'Please sign in to see your requests.');
+        const profile = clients.get(verifiedEmail);
+        if (action === 'me') return json({ profile });
+        if (action === 'list') {
+            const list = [...orders.values()].filter(o => o.client_email.toLowerCase() === verifiedEmail).sort((a,b) => b.created_at.localeCompare(a.created_at)).slice(0,100);
+            return json({ profile, orders: list.map(o => ({ code: o.code, status: o.status, label: STATUSES[o.status].label, recipient: o.recipient_name, document: o.doc_type,
+                service: TIERS[o.tier]?.name, created: o.created_at, amount: money(o.amount_due_cents ?? o.estimated_total_cents), paid: !!o.paid_at, trackUrl: `/track.html#t=${o.track_token}` })) });
+        }
+        fail(400, 'Unknown action.');
+    },
     async request(req, body) {
         if (body.step === 'finish') {
             const o = orderByToken(body.t);
@@ -153,21 +250,56 @@ const handlers = {
     async admin(req, body) {
         const a = body.action;
         if (a === 'send-code') {
-            if (String(body.email || '').trim().toLowerCase() === ADMIN_EMAIL) console.log(`[mock] dashboard login code: ${MOCK_ADMIN_CODE}`);
+            const addr = String(body.email || '').trim().toLowerCase();
+            if (MOCK_ADMIN_EMAILS.includes(addr)) console.log(`[mock] dashboard login code for ${addr}: ${MOCK_ADMIN_CODE}`);
             return json({ ok: true });
         }
         if (a === 'verify-code') {
-            if (String(body.email || '').trim().toLowerCase() !== ADMIN_EMAIL || String(body.code).replace(/\D/g, '') !== MOCK_ADMIN_CODE) {
-                fail(401, 'That code is wrong or expired. Request a new one.');
+            const addr = String(body.email || '').trim().toLowerCase();
+            if (!MOCK_ADMIN_EMAILS.includes(addr)) fail(401, 'That code is wrong or expired. Request a new one.');
+            const raw = String(body.code || '').trim().toUpperCase();
+            const digits = raw.replace(/\D/g, '');
+            const alnum = raw.replace(/[^A-Z0-9]/g, '');
+            const codes = adminRecoveryCodes.get(addr);
+            let ok = digits === MOCK_ADMIN_CODE && raw.replace(/\s+/g, '') === digits;
+            if (!ok && alnum.length === 8 && codes && codes.has(alnum)) {
+                codes.delete(alnum);
+                ok = true;
             }
+            if (!ok) fail(401, 'That code is wrong or expired. Request a new one.');
             const t = token();
             sessions.add(t);
+            sessionEmails.set(t, addr);
             return json({ ok: true }, 200, { 'set-cookie': `nps_admin=${t}; Path=/api/admin; HttpOnly; SameSite=Strict` });
         }
         const cookie = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_admin=([^;]+)/)?.[1];
         if (!cookie || !sessions.has(cookie)) fail(401, 'Please log in.');
-        if (a === 'me') return json({ email: ADMIN_EMAIL });
-        if (a === 'logout') { sessions.delete(cookie); return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' }); }
+        const adminEmail = sessionEmails.get(cookie) || ADMIN_EMAIL;
+        if (a === 'me') return json({ email: adminEmail, recoveryRemaining: adminRecoveryCodes.get(adminEmail)?.size || 0 });
+        if (a === 'logout') {
+            sessions.delete(cookie);
+            sessionEmails.delete(cookie);
+            return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' });
+        }
+        if (a === 'logout-all') {
+            for (const [tok, em] of [...sessionEmails.entries()]) {
+                if (em === adminEmail) { sessions.delete(tok); sessionEmails.delete(tok); }
+            }
+            sessions.delete(cookie);
+            return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' });
+        }
+        if (a === 'generate-recovery-codes') {
+            const set = new Set();
+            const out = [];
+            for (let i = 0; i < 8; i++) {
+                let raw = '';
+                for (let j = 0; j < 8; j++) raw += RECOVERY_ALPHABET[randomInt(0, RECOVERY_ALPHABET.length)];
+                set.add(raw);
+                out.push(`${raw.slice(0, 4)}-${raw.slice(4)}`);
+            }
+            adminRecoveryCodes.set(adminEmail, set);
+            return json({ codes: out, remaining: out.length });
+        }
         if (a === 'list') {
             const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response'];
             const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(o => {
@@ -224,7 +356,7 @@ const handlers = {
             const { track_token, payment_url, stripe_session_id, ...fields } = o;
             return json({ exported_at: now(), request: { ...fields, tier: TIERS[o.tier]?.name },
                 timeline: events.filter(e => e.order_id === o.id).map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible })),
-                files: [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ filename, kind, size_bytes, created_at }) => ({ filename, kind, size_bytes, created_at })) });
+                files: [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ filename, kind, size_bytes, sha256, created_at }) => ({ filename, kind, size_bytes, sha256: sha256 || null, created_at })) });
         }
         if (a === 'delete') {
             if (String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm.`);
@@ -240,7 +372,8 @@ const handlers = {
         if (a === 'proof-finish') {
             const up = confirmUploads(o.id, body.fileIds);
             if (!up.length) fail(400, 'The upload did not finish. Please try again.');
-            addEvent(o.id, 'proof', 'Proof of service uploaded', up.map(f => f.filename).join(', '));
+            const detailText = up.map(f => f.sha256 ? `${f.filename} (SHA-256: ${f.sha256.slice(0, 12)}…)` : f.filename).join(', ');
+            addEvent(o.id, 'proof', 'Proof of service uploaded', detailText);
             if (body.markServed) { Object.assign(o, { status: 'served', served_at: now() }); addEvent(o.id, 'status', STATUSES.served.label); }
             email(o.client_email, `${o.code}: your proof of service is ready`, trackUrl);
             return json(adminDetail(o));
@@ -367,10 +500,15 @@ function samplePdf(line) {
 function sampleFile(orderId, kind, filename, at) {
     const data = samplePdf(`Sample file: ${filename}`);
     const id = randomUUID();
-    files.set(id, { id, order_id: orderId, kind, filename, size_bytes: data.length, content_type: 'application/pdf', uploaded: true, data, created_at: at });
+    const sha256 = sha256Hex(data);
+    files.set(id, { id, order_id: orderId, kind, filename, size_bytes: data.length, content_type: 'application/pdf', sha256, uploaded: true, data, created_at: at });
+    return files.get(id);
 }
 
 (function seed() {
+    clients.set('paralegal@example.com', { name: 'Jordan Vance', firm: 'Vance & Ortiz LLP', email: 'paralegal@example.com' });
+    clients.set(DEVTEAM_EMAIL, { name: 'Dev Team Tester', firm: 'Partnership With Media', email: DEVTEAM_EMAIL });
+
     const ago = (h) => new Date(Date.now() - h * 3600e3).toISOString();
     const inDays = (d) => new Date(Date.now() + d * 864e5).toISOString().slice(0, 10);
     const base = { client_firm: 'Vance & Ortiz LLP', client_email: 'paralegal@example.com', client_phone: '(562) 555-0144', court: 'LA Superior Court, Long Beach',
@@ -378,34 +516,34 @@ function sampleFile(orderId, kind, filename, at) {
     const mk = (f, h) => createOrder({ ...base, case_number: '24LBCV0' + randomInt(1000, 9999), client_name: 'Jordan Vance', unit: null,
         access_notes: null, physical_notes: null, instructions: null, client_reference: null, deadline: null, ...f }, ago(h));
 
-    const a = mk({ recipient_name: 'Marcus Reyes', address: '412 W Broadway', deadline: inDays(12) }, 2);
+    const a = mk({ code: 'NP-218940', recipient_name: 'Marcus Reyes', address: '412 W Broadway', deadline: inDays(12) }, 2);
     addEvent(a.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(2));
     sampleFile(a.id, 'client_document', 'Summons-and-Complaint.pdf', ago(2));
 
-    const b = mk({ recipient_name: 'Dana Whitfield', address: '1840 E 7th St', zip: '90813', status: 'action_required',
+    const b = mk({ code: 'NP-649025', recipient_name: 'Dana Whitfield', address: '1840 E 7th St', zip: '90813', status: 'action_required',
         action_note: 'The building has 24 units and the documents do not list an apartment number. Which unit does Dana live in? A gate code would help too.' }, 30);
     addEvent(b.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(30));
     addEvent(b.id, 'action', 'Action required', b.action_note, true, ago(5));
 
-    const c = mk({ recipient_name: 'Pacific Harbor Logistics LLC', address: '21100 S Figueroa St', city: 'Carson', zip: '90745', doc_type: 'Subpoena (Civil, Criminal, or Federal)',
+    const c = mk({ code: 'NP-403182', recipient_name: 'Pacific Harbor Logistics LLC', address: '21100 S Figueroa St', city: 'Carson', zip: '90745', doc_type: 'Subpoena (Civil, Criminal, or Federal)',
         tier: 'sameday', addons: [], estimated_total_cents: 17500, status: 'awaiting_payment', amount_due_cents: 17500, stripe_session_id: 'cs_mock_seed' }, 6);
     c.payment_url = `/__mock-pay?t=${encodeURIComponent(c.track_token)}&s=cs_mock_seed`;
     addEvent(c.id, 'created', 'Request received', 'Same-Day Rush Service · estimate $175.00', true, ago(6));
     addEvent(c.id, 'payment', 'Payment requested: $175.00', 'Same-Day Rush Service', true, ago(1));
 
-    const d = mk({ recipient_name: 'Kevin Tran', address: '3300 Atlantic Ave', zip: '90807', status: 'attempting', amount_due_cents: 14000, paid_at: ago(40), deadline: inDays(3) }, 50);
+    const d = mk({ code: 'NP-517309', recipient_name: 'Kevin Tran', address: '3300 Atlantic Ave', zip: '90807', status: 'attempting', amount_due_cents: 14000, paid_at: ago(40), deadline: inDays(3) }, 50);
     addEvent(d.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(50));
     addEvent(d.id, 'payment', 'Payment received: $140.00', null, true, ago(40));
     addEvent(d.id, 'attempt', 'Attempt: No answer', 'Lights on, car in driveway, no answer after 3 knocks.', true, ago(26));
     addEvent(d.id, 'note', 'Internal note', 'Neighbor says he leaves around 7:15am. Try early.', false, ago(25));
     addEvent(d.id, 'attempt', 'Attempt: Subject not home', 'Spoke with roommate, said he works evenings.', true, ago(4));
 
-    const e = mk({ recipient_name: 'Alicia Moreno', address: '520 Pine Ave', status: 'served', amount_due_cents: 14000, paid_at: ago(100), served_at: ago(20) }, 120);
+    const e = mk({ code: 'NP-894771', recipient_name: 'Alicia Moreno', address: '520 Pine Ave', status: 'served', amount_due_cents: 14000, paid_at: ago(100), served_at: ago(20) }, 120);
     addEvent(e.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(120));
     addEvent(e.id, 'payment', 'Payment received: $140.00', null, true, ago(100));
     addEvent(e.id, 'attempt', 'Attempt: No answer', null, true, ago(70));
     addEvent(e.id, 'status', 'Served', 'Personally served at residence.', true, ago(20));
-    addEvent(e.id, 'proof', 'Proof of service uploaded', 'Proof-of-Service-Moreno.pdf', true, ago(19));
     sampleFile(e.id, 'client_document', 'Summons-and-Complaint.pdf', ago(120));
-    sampleFile(e.id, 'proof', 'Proof-of-Service-Moreno.pdf', ago(19));
+    const proof = sampleFile(e.id, 'proof', 'Proof-of-Service-Moreno.pdf', ago(19));
+    addEvent(e.id, 'proof', 'Proof of service uploaded', `${proof.filename} (SHA-256: ${proof.sha256.slice(0, 12)}…)`, true, ago(19));
 })();

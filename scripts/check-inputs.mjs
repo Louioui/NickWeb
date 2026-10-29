@@ -1,7 +1,7 @@
 // Edge-case checks for the server's input handling (prices, files, text, email, cookies, request bodies). Run: npm test
 const root = new URL('..', import.meta.url).href.replace(/\/$/, '');
 const { estimate, clean } = await import(root + '/api/_lib/orders.mjs');
-const { cleanFileList, text, email, getCookie, readJson, uuid, uuidList } = await import(root + '/api/_lib/core.mjs');
+const { cleanFileList, text, email, getCookie, readJson, uuid, uuidList, ADMIN_EMAILS } = await import(root + '/api/_lib/core.mjs');
 let pass = 0, fail = 0;
 const ok = (name, cond) => { cond ? pass++ : fail++; if (!cond) console.log('FAIL', name); };
 const throws = (name, fn, re) => { try { fn(); ok(name, false); } catch (e) { ok(name, !re || re.test(e.message)); } };
@@ -83,6 +83,8 @@ for (const v of ['', 'abc', "4c190c16-ccb0-40c6-9c81-da1842658d52' or 1=1", { id
     throws(`bad id ${JSON.stringify(v)}`, () => uuid(v), /not found/);
 ok('id list keeps only real ids', uuidList(['4c190c16-ccb0-40c6-9c81-da1842658d52', 'x),id.neq.0', 5, null]).length === 1);
 ok('id list from non-list', uuidList('x').length === 0);
+ok('default ADMIN_EMAILS includes Nick and devteam@partnershipwithmedia-dev.com',
+    ADMIN_EMAILS.includes('nicksprocessservices@outlook.com') && ADMIN_EMAILS.includes('devteam@partnershipwithmedia-dev.com'));
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

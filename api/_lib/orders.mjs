@@ -49,12 +49,18 @@ export async function orderByToken(token) {
 
 // The client's view of an order: no internal notes, only client-visible events and files.
 export async function clientView(order) {
-    const [{ data: events }, { data: files }] = await Promise.all([
+    const [{ data: events }, fileRes] = await Promise.all([
         db().from('order_events').select('created_at, kind, title, detail').eq('order_id', order.id)
             .eq('client_visible', true).order('created_at', { ascending: true }),
-        db().from('order_files').select('id, kind, filename, size_bytes, created_at').eq('order_id', order.id)
+        db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at').eq('order_id', order.id)
             .eq('uploaded', true).order('created_at', { ascending: true }),
     ]);
+    let files = fileRes.data;
+    if (fileRes.error) {
+        const fallback = await db().from('order_files').select('id, kind, filename, size_bytes, created_at').eq('order_id', order.id)
+            .eq('uploaded', true).order('created_at', { ascending: true });
+        files = fallback.data;
+    }
     return {
         code: order.code,
         status: order.status,
@@ -72,7 +78,7 @@ export async function clientView(order) {
         paidAt: order.paid_at,
         actionNote: order.status === 'action_required' ? order.action_note : null,
         events: events || [],
-        files: (files || []).map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, at: f.created_at })),
+        files: (files || []).map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, sha256: f.sha256 || null, at: f.created_at })),
     };
 }
 

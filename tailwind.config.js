@@ -2,7 +2,7 @@
 // Token names are kept from the original build so classes written in the page's JS (text-primary, ring-primaryLight...) keep working.
 module.exports = {
   content: {
-    files: ['./index.html', './track.html', './admin.html', './assets/js/*.js'],
+    files: ['./index.html', './track.html', './admin.html', './account.html', './assets/js/*.js'],
     // Ignore the CSS that is inlined into the page, so deleting a class from the markup really removes its styles.
     transform: { html: (content) => content.replace(/<!-- site-css:start[\s\S]*?site-css:end -->/, '') },
   },

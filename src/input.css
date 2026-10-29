@@ -682,7 +682,33 @@
     .hp-field { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
 
     /* Tracking page + Nick's dashboard (track.html, admin.html) */
+    .client-request { display: block; padding: 1.4rem; border-bottom: 1px solid var(--hair-ink); overflow-wrap: anywhere; transition: background-color .2s; }
+    .client-request:hover { background: var(--pine-mist); }
+    .client-request:last-child { border-bottom: 0; }
     .app-shell { min-height: 100vh; display: flex; flex-direction: column; }
+    .app-shell #detail-pane, .app-shell #detail, .app-shell #list-pane, .app-shell .panel { min-width: 0; }
+    .app-shell #job-title { overflow-wrap: anywhere; }
+    .desk-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 1.5rem; margin-bottom: 1.75rem; }
+    .desk-sync { display: grid; justify-items: end; gap: .65rem; flex-shrink: 0; }
+    .desk-feedback { position: fixed; z-index: 60; bottom: 1.25rem; right: 1.25rem; max-width: min(34rem, calc(100vw - 2.5rem)); box-shadow: 0 8px 30px rgba(8,43,30,.16); font-size: .875rem; }
+    .app-shell .tab-btn { min-height: 44px; }
+    .app-shell .job-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .app-shell .job-row > .status-pill { max-width: 10rem; white-space: normal; text-align: right; }
+    .tracking-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; }
+    .tracking-progress { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .tracking-progress .wizard-step { flex-direction: column; text-align: center; cursor: default; padding-inline: .2rem; }
+    .tracking-progress .wizard-step > span:last-child { display: block; font-size: .6875rem; line-height: 1.45; }
+    @media (max-width: 639px) {
+        .desk-heading { flex-direction: column; align-items: flex-start; gap: .85rem; margin-bottom: 1.25rem; }
+        .desk-heading .eyebrow { display: none; }
+        .desk-sync { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; }
+        .app-shell .stat-tile { padding: .85rem 1rem; }
+        .app-shell .stat-tile .stat-label { letter-spacing: .025em; }
+        #filters, #detail [aria-label="Actions for this request"] { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; }
+        #filters .tab-btn, #detail .tab-btn { flex: none; white-space: nowrap; }
+        .app-shell .review-recap { grid-template-columns: minmax(0, 1fr); gap: .25rem; }
+        .app-shell .review-recap dd { margin-bottom: .65rem; }
+    }
     .timeline { position: relative; list-style: none; padding: 0; margin: 0; }
     .timeline > li { position: relative; padding: 0 0 1.5rem 2rem; }
     .timeline > li::before { content: ""; position: absolute; left: 0.45rem; top: 1.1rem; bottom: 0; width: 1px; background: var(--hair-ink); }
