@@ -20,6 +20,7 @@ const clients = new Map();
 const clientSessions = new Map();
 const clientCodes = new Map();
 const clientSecurity = new Map(); // email -> { pin_hash, failed_tries, locked_until }
+const trackPinFails = new Map();  // order id -> { window, count } (wrong PINs on the tracking page)
 const trackUnlockCodes = new Map(); // order_id -> { code, tries, expires }
 const sessions = new Set();
 const sessionEmails = new Map();
@@ -165,7 +166,7 @@ function maskMockAddress(o) {
     return street + (o.city ? `, ${o.city}` : '') + (o.zip ? ` ${o.zip}` : '');
 }
 
-function clientView(o, { unlocked = true } = {}) {
+function clientView(o, { unlocked = false } = {}) {
     const visibleEvents = events.filter(e => e.order_id === o.id && e.client_visible).sort((a, b) => a.created_at.localeCompare(b.created_at))
         .map(({ created_at, kind, title, detail }) => ({ created_at, kind, title, detail }));
     const uploadedFiles = [...files.values()].filter(f => f.order_id === o.id && f.uploaded);
@@ -182,13 +183,15 @@ function clientView(o, { unlocked = true } = {}) {
         estimate: money(o.estimated_total_cents),
         amountDue: o.amount_due_cents != null ? money(o.amount_due_cents) : null,
         payUrl: (o.status === 'awaiting_payment' || (o.legal_hold && !o.paid_at)) ? o.payment_url : null,
-        paidAt: o.paid_at, actionNote: o.status === 'action_required' ? o.action_note : null,
+        // Same as api/_lib/orders.mjs: a locked view keeps status and dates, not what was said or sent.
+        paidAt: o.paid_at, actionNote: o.status === 'action_required' && !isLocked ? o.action_note : null,
         docLock: !!o.doc_lock,
         unlocked: !isLocked,
         legalHold: !!o.legal_hold,
         integritySeal: seal,
-        events: visibleEvents,
-        files: uploadedFiles.map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, sha256: f.sha256 || null, at: f.created_at, locked: isLocked })),
+        events: visibleEvents.map(e => (isLocked ? { ...e, detail: null } : e)),
+        files: uploadedFiles.map(f => ({ id: f.id, kind: f.kind, name: isLocked ? (f.kind === 'proof' ? 'Proof of service (locked)' : 'Document (locked)') : f.filename,
+            size: f.size_bytes, sha256: isLocked ? null : f.sha256 || null, at: f.created_at, locked: isLocked })),
     };
 }
 
@@ -358,32 +361,28 @@ const handlers = {
             const addr = cleanEmail(body.email);
             const code = String(body.code || '').trim();
             if (!/^\d{6,8}$/.test(code)) fail(400, 'Enter the verification code from your email.');
+            // Same order as api/client.mjs: ask for the PIN first, check the email code, and only then the PIN.
             const sec = clientSecurity.get(addr);
-            if (sec?.locked_until && sec.locked_until > Date.now()) {
-                fail(429, 'Account temporarily locked after repeated failed 2FA attempts. Please wait 15 minutes.');
-            }
+            const pin = String(body.pin || '').trim();
+            if (sec?.pin_hash && !pin) return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
+            if (sec?.pin_hash && sec.locked_until > Date.now()) fail(429, 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.');
             const pending = clientCodes.get(addr);
             if (!pending || pending.expires < Date.now() || pending.attempts >= 5) fail(401, 'That code is invalid or expired. Request another email.');
-            if (sec?.pin_hash) {
-                const pin = String(body.pin || '').trim();
-                if (!pin) {
-                    return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
-                }
-                if (!verifyPin(pin, sec.pin_hash)) {
-                    sec.failed_tries = (sec.failed_tries || 0) + 1;
-                    if (sec.failed_tries >= 5) {
-                        sec.locked_until = Date.now() + 15 * 60 * 1000;
-                        clientCodes.delete(addr);
-                    }
-                    fail(401, 'Invalid 6-digit Security PIN.');
-                }
-                sec.failed_tries = 0;
-                sec.locked_until = 0;
-            }
             pending.attempts++;
             if (code !== '123456') {
                 if (pending.attempts >= 5) clientCodes.delete(addr);
                 fail(401, 'That code is invalid or expired. Request another email.');
+            }
+            if (sec?.pin_hash) {
+                if (!verifyPin(pin, sec.pin_hash)) {
+                    if (sec.locked_until && sec.locked_until <= Date.now()) { sec.failed_tries = 0; sec.locked_until = 0; }
+                    sec.failed_tries = (sec.failed_tries || 0) + 1;
+                    if (sec.failed_tries >= 5) sec.locked_until = Date.now() + 15 * 60 * 1000;
+                    clientCodes.delete(addr);   // the code is spent
+                    fail(401, 'Wrong Security PIN. Request a new code and try again.');
+                }
+                sec.failed_tries = 0;
+                sec.locked_until = 0;
             }
             if (!clients.has(addr)) {
                 if (pending.intent !== 'signup') fail(401, 'That code is invalid or expired. Create an account first.');
@@ -514,22 +513,20 @@ const handlers = {
         if (body.action === 'verify-unlock-code') {
             const code = String(body.code || '').trim();
             if (!/^\d{6}$/.test(code)) fail(400, 'Please enter a 6-digit verification code or Security PIN.');
-            let verified = false;
+            // Same as api/track.mjs: wrong PINs here count on this order's own 15-minute counter, never the portal's lockout.
             const sec = clientSecurity.get(o.client_email.toLowerCase());
-            const pinLocked = sec?.locked_until && sec.locked_until > Date.now();
-            if (sec?.pin_hash && !pinLocked && verifyPin(code, sec.pin_hash)) { verified = true; sec.failed_tries = 0; }
+            const window = Math.floor(Date.now() / 900e3);
+            const fails = trackPinFails.get(o.id);
+            const pinFails = fails?.window === window ? fails.count : 0;
+            const pinUsable = !!sec?.pin_hash && !(sec.locked_until > Date.now()) && pinFails < 5;
+            let verified = pinUsable && verifyPin(code, sec.pin_hash);
             if (!verified) {
                 const row = trackUnlockCodes.get(o.id);
-                if (!row || row.expires < Date.now() || row.tries >= 5) fail(401, 'That unlock code is invalid or expired. Request a new code.');
-                if (code !== row.code) {
-                    // Same as api/track.mjs: a wrong entry also counts against the client's PIN lockout.
-                    if (sec?.pin_hash && !pinLocked) {
-                        sec.failed_tries = (sec.failed_tries || 0) + 1;
-                        if (sec.failed_tries >= 5) sec.locked_until = Date.now() + 15 * 60e3;
-                    }
-                    row.tries++;
-                    if (row.tries >= 5) trackUnlockCodes.delete(o.id);
-                    fail(401, 'That unlock code is invalid or expired.');
+                const codeOk = !!row && row.expires >= Date.now() && row.tries < 5 && code === row.code;
+                if (!codeOk) {
+                    if (pinUsable) trackPinFails.set(o.id, { window, count: pinFails + 1 });
+                    if (row) { row.tries++; if (row.tries >= 5) trackUnlockCodes.delete(o.id); }
+                    fail(401, 'That code or PIN is invalid or expired. Request a new code.');
                 }
                 trackUnlockCodes.delete(o.id);
                 verified = true;

@@ -14,10 +14,10 @@ const signup = async addr => {
 check('unverified identities are refused', () => assert.throws(() => verifiedClient({id:'a', email:'x@example.com'}), /verify/));
 check('anonymous identities are refused', () => assert.throws(() => verifiedClient({id:'a', email_confirmed_at:'now'}), /verify/));
 check('profile email cannot come from editable metadata', () => assert.equal(clientProfile({email:'right@example.com',user_metadata:{email:'wrong@example.com',role:'admin'}}).email,'right@example.com'));
-const cookie = clientCookie(new Request('https://example.com/api/client'), {access_token:'access-test',refresh_token:'refresh-test'});
+const cookie = clientCookie(new Request('https://example.com/api/client'), {access_token:'access-test',refresh_token:'refresh-test'}, 'user-test');
 check('HTTPS client cookie is HttpOnly, Secure, strict and scoped', () => { for(const flag of ['HttpOnly','Secure','SameSite=Strict','Path=/api/client'])assert.ok(cookie.includes(flag)); });
-check('server can parse its session cookie', () => assert.deepEqual(savedClientSession(new Request('https://example.com/api/client',{headers:{cookie:cookie.split(';')[0]}})),{access:'access-test',refresh:'refresh-test'}));
-check('oversized session cookies are rejected', () => assert.throws(() => clientCookie(new Request('https://example.com'),{access_token:'x'.repeat(5000),refresh_token:'y'}),/completed/));
+check('server can parse its session cookie (with its signed proof)', () => { const s = savedClientSession(new Request('https://example.com/api/client',{headers:{cookie:cookie.split(';')[0]}})); assert.equal(s.access,'access-test'); assert.equal(s.refresh,'refresh-test'); assert.match(s.proof,/^\d{10}\.[A-Za-z0-9_-]{43}$/); });
+check('oversized session cookies are rejected', () => assert.throws(() => clientCookie(new Request('https://example.com'),{access_token:'x'.repeat(5000),refresh_token:'y'},'user-test'),/completed/));
 check('malformed cookies fail closed', () => assert.equal(savedClientSession(new Request('https://example.com',{headers:{cookie:'nps_client=%7Binvalid'}})),null));
 assert.equal((await call({action:'list'})).status,401);passed++;
 await call({action:'send-code',intent:'signup',email:'fresh@example.com',name:'Fresh'});

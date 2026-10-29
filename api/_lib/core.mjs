@@ -5,9 +5,12 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, ran
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
 export const BUCKET = 'case-files';
-export const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'nicksprocessservices@outlook.com,devteam@partnershipwithmedia-dev.com')
+// Who can sign into the dashboard and gets new-request emails. Without the env var it is Nick alone; anyone else
+// (such as the developers) must be listed in ADMIN_EMAILS on purpose, per environment.
+export const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'nicksprocessservices@outlook.com')
     .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 export const IS_PROD = process.env.VERCEL_ENV === 'production';
+if (IS_PROD && !process.env.ADMIN_EMAILS) console.warn('ADMIN_EMAILS is not set in production; only the built-in owner address can sign in.');
 
 let client = null;
 // Service-role client: bypasses row-level security, so it must only ever run on the server.
@@ -232,11 +235,25 @@ export function verifyTotp(secret, inputCode, timeMs = Date.now()) {
     return matched;
 }
 
-// Throws 429 once a bucket passes `max` hits in its window (counted atomically in the database).
-export async function rateLimit(bucket, max, windowSeconds) {
+// Counts one hit in a bucket's fixed window (atomically in the database) and returns the window's total.
+export async function hitRateLimit(bucket, windowSeconds) {
     const { data, error } = await db().rpc('hit_rate_limit', { p_bucket: bucket, p_window_seconds: windowSeconds });
     if (error) throw error;
-    if (data > max) throw new HttpError(429, 'Too many attempts. Please wait a few minutes and try again.');
+    return data;
+}
+
+// Throws 429 once a bucket passes `max` hits in its window.
+export async function rateLimit(bucket, max, windowSeconds) {
+    if (await hitRateLimit(bucket, windowSeconds) > max) throw new HttpError(429, 'Too many attempts. Please wait a few minutes and try again.');
+}
+
+// Reads a bucket's hits in the current window without adding one (same window start as hit_rate_limit in SQL).
+// ">= start" rather than "= start", so the match never depends on how the timestamp is formatted.
+export async function peekRateLimit(bucket, windowSeconds) {
+    const windowStart = new Date(Math.floor(Date.now() / 1000 / windowSeconds) * windowSeconds * 1000).toISOString();
+    const { data, error } = await db().from('rate_limits').select('hits').eq('bucket', bucket).gte('window_start', windowStart);
+    if (error) throw error;
+    return (data || []).reduce((n, r) => n + (r.hits || 0), 0);
 }
 
 // --- Input cleaning ---
@@ -407,7 +424,25 @@ export function verifyFileMagic(bytes, filename) {
     return false;
 }
 
-// Marks files uploaded only if the object really exists in storage, passes magic-byte inspection, and records a SHA-256 fingerprint.
+// Reads a stored upload and checks it. Returns { state: 'ok', sha256 }, 'bad' (the bytes are not what the name claims),
+// or 'unknown' (storage couldn't be reached). Like the rest of supabase-js, these calls report failures as { error }
+// instead of throwing, so each one is checked: nothing is ever accepted without being inspected.
+export async function inspectStoredFile(path, filename) {
+    try {
+        const { data: exists, error: xErr } = await db().storage.from(BUCKET).exists(path);
+        if (xErr) return { state: 'unknown' };
+        if (!exists) return { state: 'missing' };
+        const { data: blob, error: dErr } = await db().storage.from(BUCKET).download(path);
+        if (dErr || !blob) return { state: 'unknown' };
+        const buf = Buffer.from(await blob.arrayBuffer());
+        return verifyFileMagic(buf, filename) ? { state: 'ok', sha256: sha256(buf) } : { state: 'bad' };
+    } catch {
+        return { state: 'unknown' };
+    }
+}
+
+// Marks files uploaded only if the object really exists in storage, passes magic-byte inspection, and records a SHA-256
+// fingerprint. A disguised file is deleted; one that couldn't be read stays unconfirmed for the daily job to retry.
 export async function confirmUploads(orderId, fileIds) {
     const ids = uuidList(fileIds).slice(0, MAX_FILES);
     if (!ids.length) return [];
@@ -416,28 +451,16 @@ export async function confirmUploads(orderId, fileIds) {
     if (error) throw error;
     const done = [];
     for (const r of rows) {
-        const { data: exists } = await db().storage.from(BUCKET).exists(r.storage_path);
-        if (exists) {
-            let fileHash = null;
-            let validMagic = true;
-            try {
-                const { data: blob } = await db().storage.from(BUCKET).download(r.storage_path);
-                if (blob) {
-                    const buf = Buffer.from(await blob.arrayBuffer());
-                    if (!verifyFileMagic(buf, r.filename)) validMagic = false;
-                    else fileHash = sha256(buf);
-                }
-            } catch { /* non-fatal if storage download cannot compute hash */ }
-            if (!validMagic) {
-                await db().storage.from(BUCKET).remove([r.storage_path]).catch(() => {});
-                await db().from('order_files').delete().eq('id', r.id);
-                continue;
-            }
-            const patch = fileHash ? { uploaded: true, sha256: fileHash } : { uploaded: true };
-            const { error: uErr } = await db().from('order_files').update(patch).eq('id', r.id);
-            if (uErr && fileHash) await db().from('order_files').update({ uploaded: true }).eq('id', r.id);
-            done.push({ ...r, sha256: fileHash });
+        const check = await inspectStoredFile(r.storage_path, r.filename);
+        if (check.state === 'bad') {
+            await db().storage.from(BUCKET).remove([r.storage_path]).catch(() => {});
+            await db().from('order_files').delete().eq('id', r.id);
+            continue;
         }
+        if (check.state !== 'ok') continue;
+        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id);
+        if (uErr) throw uErr;
+        done.push({ ...r, sha256: check.sha256 });
     }
     return done;
 }

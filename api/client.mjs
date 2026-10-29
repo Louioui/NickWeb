@@ -1,13 +1,22 @@
 // Passwordless client accounts. No admin actions and no client-supplied ownership filters.
 import { db, handle, json, readJson, rateLimit, clientIp, siteOrigin, email, text, cleanOrderCode, randomToken, addEvent, sha256, hashPin, verifyPin, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
-import { clientAuth, clientCookie, savedClientSession, requireClient, verifiedClient, clientProfile } from './_lib/clients.mjs';
+import { clientAuth, clientCookie, savedClientSession, requireClient, verifiedClient, clientProfile,
+         getClientSecurity, pinLocked, recordPinFailure, clearPinFailures } from './_lib/clients.mjs';
 import { STATUSES, TIERS, money, sendEmail } from './_lib/orders.mjs';
 
-// A client's PIN settings. Fails closed: if this lookup errors, sign-in stops instead of skipping the PIN.
-async function getClientSecurity(emailAddr) {
-    const { data, error } = await db().from('client_security_settings').select('pin_hash, failed_tries, locked_until').eq('email', emailAddr).maybeSingle();
-    if (error) throw new HttpError(503, 'Sign-in is temporarily unavailable. Please try again in a minute.');
-    return data || null;
+const PIN_LOCKED_MESSAGE = 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.';
+const ASK_FOR_PIN = { ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' };
+
+// The PIN step of both sign-in paths. It runs only after the email address has been proven (a valid code or sign-in
+// link), so nobody can test PINs or lock an account with just an email address. Wrong PINs count toward the lockout.
+async function checkPin(addr, sec, pin) {
+    if (!sec?.pin_hash) return true;
+    if (verifyPin(String(pin || '').trim(), sec.pin_hash)) {
+        await clearPinFailures(addr, sec);
+        return true;
+    }
+    await recordPinFailure(addr);
+    return false;
 }
 
 export const POST = handle(async request => {
@@ -32,37 +41,29 @@ export const POST = handle(async request => {
         await rateLimit(`client-verify:${clientIp(request)}`, 10, 900);
         const auth = clientAuth();
         let session;
+        let userId;
         if (action === 'verify-code') {
             const addr = email(body.email);
             const code = String(body.code || '').trim();
             if (!/^\d{6,8}$/.test(code)) throw new HttpError(400, 'Enter the verification code from your email.');
             await rateLimit(`client-verify-email:${sha256(addr)}`, 5, 900);
 
+            // Asked for before the code is used, so the code is still good once the PIN is typed. This does tell someone
+            // who knows the address that it has a PIN; the PIN itself is only checked after a valid code.
             const sec = await getClientSecurity(addr);
-            if (sec?.locked_until && sec.locked_until > new Date().toISOString()) {
-                throw new HttpError(429, 'Account temporarily locked after repeated failed 2FA attempts. Please wait 15 minutes.');
-            }
-            if (sec?.pin_hash) {
-                const pin = String(body.pin || '').trim();
-                if (!pin) {
-                    return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
-                }
-                if (!verifyPin(pin, sec.pin_hash)) {
-                    const tries = (sec.failed_tries || 0) + 1;
-                    const patch = { failed_tries: tries, updated_at: new Date().toISOString() };
-                    if (tries >= 5) patch.locked_until = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-                    await db().from('client_security_settings').update(patch).eq('email', addr);
-                    throw new HttpError(401, 'Invalid 6-digit Security PIN.');
-                }
-                if (sec.failed_tries > 0) {
-                    await db().from('client_security_settings').update({ failed_tries: 0, locked_until: null }).eq('email', addr);
-                }
-            }
+            if (sec?.pin_hash && !String(body.pin || '').trim()) return json(ASK_FOR_PIN);
+            if (sec?.pin_hash && pinLocked(sec)) throw new HttpError(429, PIN_LOCKED_MESSAGE);
 
             const { data, error } = await auth.auth.verifyOtp({ email: addr, token: code, type: 'email' });
             if (error || !data.session) throw new HttpError(401, 'That code is invalid or expired. Please request a new email.');
             verifiedClient(data.user);
+            if (!(await checkPin(addr, sec, body.pin))) {
+                // The code is spent; drop the session Supabase just created so it can't be used without the PIN.
+                await auth.auth.admin.signOut(data.session.access_token, 'local').catch(() => {});
+                throw new HttpError(401, 'Wrong Security PIN. Request a new code and try again.');
+            }
             session = data.session;
+            userId = data.user.id;
         } else {
             if (typeof body.access !== 'string' || !body.access || body.access.length > 4096 || /[\u0000-\u001F\u007F]/.test(body.access) ||
                 typeof body.refresh !== 'string' || !body.refresh || body.refresh.length > 1024 || /[\u0000-\u001F\u007F]/.test(body.refresh)) {
@@ -70,10 +71,20 @@ export const POST = handle(async request => {
             }
             const { data, error } = await auth.auth.getUser(body.access);
             if (error) throw new HttpError(401, 'This sign-in link is invalid or expired. Please request a new email.');
-            verifiedClient(data.user);
+            const user = verifiedClient(data.user);
+            // A sign-in link proves the email just like a code, and gets the same PIN step (the browser keeps the link's
+            // tokens in memory and sends them again with the PIN).
+            const addr = user.email.toLowerCase();
+            const sec = await getClientSecurity(addr);
+            if (sec?.pin_hash) {
+                if (pinLocked(sec)) throw new HttpError(429, PIN_LOCKED_MESSAGE);
+                if (!String(body.pin || '').trim()) return json(ASK_FOR_PIN);
+                if (!(await checkPin(addr, sec, body.pin))) throw new HttpError(401, 'Wrong Security PIN. Please try again.');
+            }
             session = { access_token: body.access, refresh_token: body.refresh };
+            userId = user.id;
         }
-        return json({ ok: true }, 200, { 'set-cookie': clientCookie(request, session) });
+        return json({ ok: true }, 200, { 'set-cookie': clientCookie(request, session, userId) });
     }
     if (action === 'logout') {
         const saved = savedClientSession(request);
@@ -86,7 +97,7 @@ export const POST = handle(async request => {
         return json({ ok: true }, 200, { 'set-cookie': clientCookie(request, null) });
     }
     const { user, renewed } = await requireClient(request);
-    const headers = renewed ? { 'set-cookie': clientCookie(request, renewed) } : {};
+    const headers = renewed ? { 'set-cookie': clientCookie(request, renewed, user.id) } : {};
     const clientEmail = user.email.toLowerCase();
 
     if (action === 'me') {
@@ -97,6 +108,12 @@ export const POST = handle(async request => {
         await rateLimit(`client-pin:${user.id}`, 10, 900);
         const pin = String(body.pin || '').trim();
         if (!/^\d{6}$/.test(pin)) throw new HttpError(400, 'Please enter a 6-digit numeric Security PIN.');
+        // Replacing a PIN needs the current one, so a session left open on a shared computer can't change it.
+        const current = await getClientSecurity(clientEmail);
+        if (current?.pin_hash) {
+            if (pinLocked(current)) throw new HttpError(429, PIN_LOCKED_MESSAGE);
+            if (!(await checkPin(clientEmail, current, body.currentPin))) throw new HttpError(403, 'Enter your current 6-digit Security PIN to change it.');
+        }
         const { error } = await db().from('client_security_settings').upsert({
             email: clientEmail,
             pin_hash: hashPin(pin),
@@ -111,8 +128,8 @@ export const POST = handle(async request => {
         await rateLimit(`client-pin:${user.id}`, 10, 900);
         const sec = await getClientSecurity(clientEmail);
         if (sec?.pin_hash) {
-            const pin = String(body.pin || '').trim();
-            if (!verifyPin(pin, sec.pin_hash)) {
+            if (pinLocked(sec)) throw new HttpError(429, PIN_LOCKED_MESSAGE);
+            if (!(await checkPin(clientEmail, sec, body.pin))) {
                 throw new HttpError(403, 'Enter your current 6-digit Security PIN to disable it.');
             }
             await db().from('client_security_settings').update({ pin_hash: null, updated_at: new Date().toISOString() }).eq('email', clientEmail);

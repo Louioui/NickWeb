@@ -3,6 +3,9 @@
     const $ = id => document.getElementById(id), { esc } = NPS;
     let mode = location.hash === '#signup' ? 'signup' : 'signin', pendingEmail = '', sending = false, cooldownUntil = 0;
     let orders = [], filter = 'all', signedIn = false;
+    // Set while the server is waiting for the Security PIN: after a code ({ kind: 'code' }) or a sign-in link, whose
+    // tokens stay in memory only until the PIN is sent ({ kind: 'link', access, refresh }).
+    let pinFor = null;
     const post = (action, data = {}) => NPS.post('/api/client', { action, ...data }, { notify: ['verify-code', 'session', 'logout'].includes(action) });
     function showError(message) { $('account-error').textContent = message || ''; $('account-error').classList.toggle('hidden', !message); }
     function setMode(next) {
@@ -14,6 +17,20 @@
         $('send-client-email').textContent = mode === 'signup' ? 'Create account & verify email' : 'Send sign-in email';
         for (const name of ['signin', 'signup']) { $('mode-' + name).classList.toggle('is-active', mode === name); $('mode-' + name).setAttribute('aria-pressed', String(mode === name)); }
         $('account-email-form').classList.remove('hidden'); $('account-code-form').classList.add('hidden'); showError('');
+        pinFor = null; $('account-pin').value = ''; $('account-pin').required = false; $('account-pin-wrap').classList.add('hidden');
+        $('account-code-wrap').classList.remove('hidden'); $('account-code').required = true; showEmailHints(true);
+    }
+    // The "email is on its way" note and the Resend / Change email buttons only make sense after a code was sent.
+    function showEmailHints(on) {
+        $('verification-email').closest('.result-box').classList.toggle('hidden', !on);
+        $('resend-client-email').parentElement.classList.toggle('hidden', !on);
+    }
+    function showPinStep(next) {
+        pinFor = next;
+        $('account-email-form').classList.add('hidden'); $('account-code-form').classList.remove('hidden');
+        $('account-code-wrap').classList.toggle('hidden', next.kind === 'link'); $('account-code').required = next.kind !== 'link';
+        showEmailHints(next.kind !== 'link');
+        $('account-pin-wrap').classList.remove('hidden'); $('account-pin').required = true; $('account-pin').value = ''; $('account-pin').focus();
     }
     function scrubClientState() {
         try { sessionStorage.clear(); } catch {}
@@ -49,8 +66,15 @@
     $('account-code-form').onsubmit = async e => {
         e.preventDefault(); if (sending) return; sending = true; showError('');
         const btn = e.target.querySelector('button[type="submit"]'); btn.disabled = true; btn.textContent = 'Verifying…';
-        try { await post('verify-code', { email: pendingEmail, code: $('account-code').value.trim() }); $('account-code').value = ''; await load(); }
-        catch (err) { showError(err.message); }
+        try {
+            const pin = pinFor ? $('account-pin').value.trim() : '';
+            const result = pinFor?.kind === 'link'
+                ? await post('session', { access: pinFor.access, refresh: pinFor.refresh, pin })
+                : await post('verify-code', { email: pendingEmail, code: $('account-code').value.trim(), ...(pin ? { pin } : {}) });
+            if (result.requiresPin) { showPinStep(pinFor || { kind: 'code' }); return; }
+            pinFor = null; $('account-code').value = ''; $('account-pin').value = ''; await load();
+        }
+        catch (err) { showError(err.message); if (pinFor) $('account-pin').value = ''; }   // a wrong PIN is never resent
         finally { sending = false; btn.disabled = false; btn.textContent = 'Verify & sign in'; }
     };
     function renderOrders() {
@@ -92,7 +116,11 @@
     async function start() {
         const callback = window.NPS_AUTH_CALLBACK; delete window.NPS_AUTH_CALLBACK;
         if (callback) {
-            try { if (callback.error) throw new Error('This sign-in link has expired. Please request a new email.'); await post('session', { access: callback.access, refresh: callback.refresh }); }
+            try {
+                if (callback.error) throw new Error('This sign-in link has expired. Please request a new email.');
+                const result = await post('session', { access: callback.access, refresh: callback.refresh });
+                if (result.requiresPin) { showAuth(); showPinStep({ kind: 'link', access: callback.access, refresh: callback.refresh }); return; }
+            }
             catch (err) { showAuth(); showError(err.message); return; }
             finally { callback.access = null; callback.refresh = null; }
         }

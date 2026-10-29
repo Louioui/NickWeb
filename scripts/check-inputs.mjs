@@ -83,8 +83,8 @@ for (const v of ['', 'abc', "4c190c16-ccb0-40c6-9c81-da1842658d52' or 1=1", { id
     throws(`bad id ${JSON.stringify(v)}`, () => uuid(v), /not found/);
 ok('id list keeps only real ids', uuidList(['4c190c16-ccb0-40c6-9c81-da1842658d52', 'x),id.neq.0', 5, null]).length === 1);
 ok('id list from non-list', uuidList('x').length === 0);
-ok('default ADMIN_EMAILS includes Nick and devteam@partnershipwithmedia-dev.com',
-    ADMIN_EMAILS.includes('nicksprocessservices@outlook.com') && ADMIN_EMAILS.includes('devteam@partnershipwithmedia-dev.com'));
+ok('default ADMIN_EMAILS is Nick only (anyone else must be listed in the ADMIN_EMAILS env var)',
+    ADMIN_EMAILS.length === 1 && ADMIN_EMAILS[0] === 'nicksprocessservices@outlook.com');
 
 // Hardened SQLi / PostgREST / control-char / prototype-pollution checks
 for (const badEmail of [

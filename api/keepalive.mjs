@@ -1,6 +1,6 @@
 // GET /api/keepalive — run daily by Vercel Cron (vercel.json). A real query keeps the free Supabase project
 // from pausing after 7 quiet days, and clears out expired login codes and sessions.
-import { db, handle, json, HttpError, BUCKET, addEvent, rateLimit, timingSafeMatch, verifyFileMagic, sha256 } from './_lib/core.mjs';
+import { db, handle, json, HttpError, BUCKET, addEvent, rateLimit, timingSafeMatch, inspectStoredFile } from './_lib/core.mjs';
 
 export const GET = handle(async (request) => {
     // With CRON_SECRET set (recommended), only Vercel Cron can run this. Without it, anyone could, so it is throttled.
@@ -17,36 +17,26 @@ export const GET = handle(async (request) => {
     await db().from('rate_limits').delete().lt('window_start', dayAgo);
 
     // Files still marked "not uploaded" a day later: if the file did reach storage (the browser lost its connection before
-    // confirming), verify its magic bytes, keep it and show it; if it never arrived or is disguised, remove it.
-    const { data: stale } = await db().from('order_files').select('id, order_id, storage_path, filename').eq('uploaded', false).lt('created_at', dayAgo).limit(100);
+    // confirming), verify its magic bytes, keep it and show it; if it never arrived or is disguised, remove it. If storage
+    // can't be reached, leave the row alone and try again tomorrow, so a stored upload is never lost or accepted unchecked.
+    const { data: stale, error: sErr } = await db().from('order_files').select('id, order_id, storage_path, filename').eq('uploaded', false).lt('created_at', dayAgo).limit(100);
+    if (sErr) throw sErr;
     let recovered = 0;
+    let retryLater = 0;
     const missing = [];
     for (const f of stale || []) {
-        const { data: exists } = await db().storage.from(BUCKET).exists(f.storage_path);
-        if (exists) {
-            let fileHash = null;
-            let validMagic = true;
-            try {
-                const { data: blob } = await db().storage.from(BUCKET).download(f.storage_path);
-                if (blob) {
-                    const buf = Buffer.from(await blob.arrayBuffer());
-                    if (!verifyFileMagic(buf, f.filename)) validMagic = false;
-                    else fileHash = sha256(buf);
-                }
-            } catch { /* non-fatal */ }
-            if (!validMagic) {
-                await db().storage.from(BUCKET).remove([f.storage_path]).catch(() => {});
-                missing.push(f.id);
-                continue;
-            }
-            const patch = fileHash ? { uploaded: true, sha256: fileHash } : { uploaded: true };
-            await db().from('order_files').update(patch).eq('id', f.id);
-            await addEvent(f.order_id, 'note', 'Document received', f.filename);
-            recovered++;
-        } else {
+        const check = await inspectStoredFile(f.storage_path, f.filename);
+        if (check.state === 'unknown') { retryLater++; continue; }
+        if (check.state !== 'ok') {
+            if (check.state === 'bad') await db().storage.from(BUCKET).remove([f.storage_path]).catch(() => {});
             missing.push(f.id);
+            continue;
         }
+        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', f.id);
+        if (uErr) throw uErr;
+        await addEvent(f.order_id, 'note', 'Document received', f.filename);
+        recovered++;
     }
     if (missing.length) await db().from('order_files').delete().in('id', missing);
-    return json({ ok: true, orders: count, uploadsRecovered: recovered, emptyUploadsRemoved: missing.length });
+    return json({ ok: true, orders: count, uploadsRecovered: recovered, emptyUploadsRemoved: missing.length, uploadsToRetry: retryLater });
 });

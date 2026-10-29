@@ -48,7 +48,8 @@
             <form id="account-code-form" class="hidden space-y-5">
                 <div class="result-box result-ok text-sm" role="status">If the email can be used for this account, a verification email is on its way to <strong id="verification-email"></strong>. Open its sign-in link or enter the code below.</div>
                 <p id="demo-client-code" class="hidden result-box result-warn text-sm">Demo only: enter <strong>123456</strong>. No verification email is sent. Do not use real personal information.</p>
-                <div><label for="account-code" class="field-label">Email verification code</label><input id="account-code" class="field text-center text-2xl tracking-widest" required inputmode="numeric" pattern="[0-9]{6,8}" minlength="6" maxlength="8" autocomplete="one-time-code"></div>
+                <div id="account-code-wrap"><label for="account-code" class="field-label">Email verification code</label><input id="account-code" class="field text-center text-2xl tracking-widest" required inputmode="numeric" pattern="[0-9]{6,8}" minlength="6" maxlength="8" autocomplete="one-time-code"></div>
+                <div id="account-pin-wrap" class="hidden"><label for="account-pin" class="field-label">Security PIN</label><input id="account-pin" class="field text-center text-2xl tracking-widest" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="off"><p class="text-xs text-muted mt-2">Your account has a 6-digit Security PIN. Enter it to finish signing in.</p></div>
                 <button class="btn btn-pine w-full" type="submit">Verify & sign in</button>
                 <div class="flex flex-wrap gap-4"><button id="resend-client-email" type="button" class="text-sm text-primary underline underline-offset-2">Resend email</button><button id="change-client-email" type="button" class="text-sm text-primary underline underline-offset-2">Change email</button></div>
             </form>

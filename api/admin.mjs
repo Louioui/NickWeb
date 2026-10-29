@@ -127,22 +127,25 @@ async function verifyCode(request, body) {
     let ok = false;
     let method = 'email';
     if (isAdmin && isEmailCode) {
-        let secondOk = !totpRow?.enabled;
-        if (!secondOk && /^\d{6}$/.test(secondDigits)) {
-            secondOk = await checkTotp(addr, totpRow.secret_enc, secondDigits, 'admin-login-totp');
-            method = 'email+authenticator';
-        } else if (!secondOk && secondRecovery.length === 8) {
-            // Lost phone: email code + one single-use recovery code.
-            const { data, error } = await db().rpc('use_admin_recovery_code', { p_email: addr, p_hash: recoveryHash(addr, secondRecovery) });
-            if (error) throw error;
-            secondOk = !!data;
-            method = 'email+recovery';
-        }
-        if (secondOk) {
-            // Checked and counted in one locked database step (use_admin_code): at most 5 tries per code, 25 per hour.
-            const { data, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${digits}`) });
-            if (error) throw error;
-            ok = !!data;
+        // The email code is checked first (in one locked database step, use_admin_code: at most 5 tries per code, 25 per
+        // hour), so a mistyped email code never uses up a single-use recovery code. A correct email code is spent either
+        // way; after a wrong second step Nick requests a new one. Both failures give the same answer.
+        const { data: emailOk, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${digits}`) });
+        if (error) throw error;
+        ok = !!emailOk;
+        if (ok && totpRow?.enabled) {
+            if (/^\d{6}$/.test(secondDigits)) {
+                ok = await checkTotp(addr, totpRow.secret_enc, secondDigits, 'admin-login-totp');
+                method = 'email+authenticator';
+            } else if (secondRecovery.length === 8) {
+                // Lost phone: email code + one single-use recovery code.
+                const { data, error: rErr } = await db().rpc('use_admin_recovery_code', { p_email: addr, p_hash: recoveryHash(addr, secondRecovery) });
+                if (rErr) throw rErr;
+                ok = !!data;
+                method = 'email+recovery';
+            } else {
+                ok = false;
+            }
         }
     } else if (isAdmin && !totpRow?.enabled && raw.replace(/[^A-Z0-9]/g, '').length === 8 && !isEmailCode) {
         // Without an authenticator, a recovery code can stand in for the email code (for example if Outlook is down).

@@ -152,8 +152,26 @@
     }
   ],
   "functions": {
-    "api/*.mjs": {
+    "api/client.mjs": {
       "maxDuration": 10
+    },
+    "api/lookup.mjs": {
+      "maxDuration": 10
+    },
+    "api/stripe-webhook.mjs": {
+      "maxDuration": 10
+    },
+    "api/request.mjs": {
+      "maxDuration": 30
+    },
+    "api/track.mjs": {
+      "maxDuration": 30
+    },
+    "api/admin.mjs": {
+      "maxDuration": 30
+    },
+    "api/keepalive.mjs": {
+      "maxDuration": 30
     }
   }
 }

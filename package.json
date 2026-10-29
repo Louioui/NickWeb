@@ -4,7 +4,7 @@
   "description": "Nick's Process Services: hand-written pages (index, track, admin) plus Vercel functions in api/. The CSS inside each page is compiled from src/input.css (npm run build).",
   "scripts": {
     "build": "tailwindcss -c tailwind.config.js -i src/input.css -o build/site.css --minify && node scripts/inline-css.js",
-    "test": "node scripts/check-inputs.mjs && node scripts/check-client-accounts.mjs && node scripts/check-security-stress.mjs && node scripts/check-2fa-legal-hold.mjs"
+    "test": "node scripts/check-inputs.mjs && node scripts/check-client-accounts.mjs && node scripts/check-security-stress.mjs && node scripts/check-2fa-legal-hold.mjs && node --experimental-test-module-mocks --no-warnings=ExperimentalWarning scripts/check-real-handlers.mjs"
   },
   "devDependencies": {
     "tailwindcss": "3.4.17"
