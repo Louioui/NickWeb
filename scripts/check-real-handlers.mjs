@@ -251,6 +251,24 @@ await check('F-04 a proof file that fails the file check stops the order being m
     expect(res.status === 400 && o.status === 'attempting' && !emails.some(e => e.to.includes(CLIENT)), `status ${res.status}, order ${o.status}`);
     expect(!fileRow(fake.id), 'the disguised file was kept');
 });
+await check('P27 Nick sees his signed-in devices and can sign out another one, but not the one he is using', async () => {
+    reset();
+    const mine = adminCookie();
+    const other = 'B'.repeat(43);
+    tables().admin_sessions.push({ token_hash: core.sha256(other), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(),
+        last_seen_at: new Date().toISOString(), user_agent: 'Mozilla/5.0 (iPhone) Safari/604.1' });
+    tables().admin_sessions.push({ token_hash: core.sha256('C'.repeat(43)), email: 'someone@else.test', expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString() });
+    const list = await (await adminPOST(post('/api/admin', { action: 'sessions' }, { cookie: mine }))).json();
+    expect(list.sessions.length === 2 && list.sessions.filter(s => s.current).length === 1, `got ${JSON.stringify(list.sessions)}`);
+    const otherId = list.sessions.find(s => !s.current).id;
+    const self = await adminPOST(post('/api/admin', { action: 'revoke-session', sessionId: list.sessions.find(s => s.current).id }, { cookie: mine }));
+    expect(self.status === 400, `signing out the current device via the list was allowed (${self.status})`);
+    const ok = await (await adminPOST(post('/api/admin', { action: 'revoke-session', sessionId: otherId }, { cookie: mine }))).json();
+    expect(ok.sessions.length === 1 && ok.sessions[0].current, 'other device still listed');
+    const gone = await adminPOST(post('/api/admin', { action: 'me' }, { cookie: `nps_admin=${other}` }));
+    expect(gone.status === 401, `revoked device still signed in (${gone.status})`);
+    expect(tables().admin_sessions.some(s => s.email === 'someone@else.test'), "another admin's session was touched");
+});
 await check('F-04 the tracking page is told when a reply file is still being checked', async () => {
     reset(); const o = seedOrder({ status: 'received' }); const slow = seedFile(o, { kind: 'action_upload' });
     db.__state.failDownload.add(slow.storage_path);

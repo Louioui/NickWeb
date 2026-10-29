@@ -19,6 +19,8 @@ export const POST = handle(async (request) => {
     if (a === 'me') return me(admin);
     if (a === 'logout') return logout(request, admin);
     if (a === 'logout-all') return logoutAll(request, admin);
+    if (a === 'sessions') return sessions(request, admin);
+    if (a === 'revoke-session') return revokeSession(request, body, admin);
     if (a === 'generate-recovery-codes') return generateRecoveryCodes(request, body, admin);
     if (a === 'totp-setup') return totpSetup(request, body, admin);
     if (a === 'totp-enable') return totpEnable(request, body, admin);
@@ -180,8 +182,12 @@ async function verifyCode(request, body) {
         await db().from('admin_sessions').delete().in('token_hash', activeSessions.slice(4).map(s => s.token_hash));
     }
     const token = randomToken(32);
-    await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, last_seen_at: nowIso,
+    const { error: sErr } = await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, last_seen_at: nowIso,
         expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
+    if (sErr) throw sErr;
+    // The browser name is saved separately so sign-in still works before the user_agent column exists.
+    const agent = text(request.headers.get('user-agent'), { max: 200 });
+    if (agent) await db().from('admin_sessions').update({ user_agent: agent }).eq('token_hash', sha256(token)).then(() => {}, () => {});
     await auditAdmin(request, addr, method.includes('recovery') ? 'login_recovery_code' : 'login_success', null, `Signed in with ${method}`);
     await sendSecurityAlert(addr, method.includes('recovery') ? 'Recovery code used to sign in' : 'New sign-in to your dashboard', [
         `Your dashboard was just signed into (${method === 'email' ? 'email code' : method.replace('+', ' + ').replace('email', 'email code')}).`,
@@ -227,6 +233,41 @@ async function logoutAll(request, admin) {
     await auditAdmin(request, admin, 'logout_all');
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';
     return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=0` });
+}
+
+// Nick's signed-in devices. Each is identified by the start of its stored token hash (never the token itself).
+const currentHash = (request) => {
+    const token = getCookie(request, COOKIE);
+    return typeof token === 'string' && /^[A-Za-z0-9_-]{40,64}$/.test(token) ? sha256(token) : '';
+};
+async function sessions(request, admin) {
+    let { data, error } = await db().from('admin_sessions').select('token_hash, created_at, last_seen_at, expires_at, user_agent')
+        .eq('email', admin).order('last_seen_at', { ascending: false });
+    if (error) {   // before the user_agent migration
+        ({ data, error } = await db().from('admin_sessions').select('token_hash, created_at, last_seen_at, expires_at')
+            .eq('email', admin).order('last_seen_at', { ascending: false }));
+        if (error) throw error;
+    }
+    const now = new Date().toISOString();
+    const mine = currentHash(request);
+    return json({ sessions: (data || []).filter(s => s.expires_at > now).map(s => ({
+        id: s.token_hash.slice(0, 16), current: s.token_hash === mine, browser: s.user_agent || null,
+        signedIn: s.created_at, lastSeen: s.last_seen_at,
+    })) });
+}
+async function revokeSession(request, body, admin) {
+    await rateLimit(`admin-revoke:${sha256(admin)}`, 20, 900);
+    const id = String(body.sessionId || '');
+    if (!/^[0-9a-f]{16}$/.test(id)) throw new HttpError(400, 'Choose a session.');
+    const { data, error } = await db().from('admin_sessions').select('token_hash').eq('email', admin);
+    if (error) throw error;
+    const target = (data || []).find(s => s.token_hash.startsWith(id));
+    if (!target) throw new HttpError(404, 'That session has already ended.');
+    if (target.token_hash === currentHash(request)) throw new HttpError(400, 'This is the device you are using. Use Log out instead.');
+    const { error: dErr } = await db().from('admin_sessions').delete().eq('token_hash', target.token_hash);
+    if (dErr) throw dErr;
+    await auditAdmin(request, admin, 'session_revoked', null, `Signed out device ${id.slice(0, 6)}`);
+    return sessions(request, admin);
 }
 
 const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';

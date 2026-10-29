@@ -160,7 +160,8 @@
             <!-- 3. Active Sessions -->
             <section class="space-y-3">
                 <h3 class="font-serif text-lg text-primary"><i class="fa-solid fa-user-lock text-bronze mr-1.5" aria-hidden="true"></i> Active Sessions</h3>
-                <p class="text-xs text-muted leading-relaxed">Signed in as <strong id="security-modal-email" class="text-ink"></strong>. If you signed in on a shared or lost device, sign out every device at once.</p>
+                <p class="text-xs text-muted leading-relaxed">Signed in as <strong id="security-modal-email" class="text-ink"></strong>. If you signed in on a shared or lost device, sign it out below, or sign out every device at once.</p>
+                <ul id="session-list" class="space-y-2" aria-label="Signed-in devices"></ul>
                 <button id="logout-all-btn" type="button" onclick="logoutAllDevices()" class="btn btn-sm border-[#9c2a26] text-[#7a1f1c] hover:bg-[#fbeceb]"><i class="fa-solid fa-right-from-bracket" aria-hidden="true"></i> Log Out All Devices</button>
             </section>
             <p id="security-modal-msg" class="hidden result-box text-xs" role="status"></p>
@@ -223,7 +224,7 @@
         $('draft-status').classList.remove('hidden');
     }
 
-    const READ_ONLY = new Set(['me', 'list', 'get', 'file-url', 'export', 'send-code', 'verify-code']);
+    const READ_ONLY = new Set(['me', 'list', 'get', 'file-url', 'export', 'send-code', 'verify-code', 'sessions']);
     async function api(action, data = {}) {
         try {
             return await NPS.post('/api/admin', { action, ...data }, { notify: !READ_ONLY.has(action) });
@@ -787,7 +788,35 @@
         badge.textContent = `${count} unused`;
         badge.className = `status-pill ${count > 0 ? 'status-done' : 'status-muted'}`;
     }
+    // Signed-in devices: newest activity first; any device but this one can be signed out here.
+    const deviceName = (ua) => {
+        if (!ua) return 'Browser not recorded';
+        const browser = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+        const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Mac OS X/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : '';
+        return os ? `${browser} on ${os}` : browser;
+    };
+    function renderSessions(list) {
+        $('session-list').innerHTML = list.map(s => `
+            <li class="flex flex-wrap items-center justify-between gap-2 p-3 border border-[color:var(--hair-ink)] rounded-sm">
+                <div class="text-xs"><p class="font-semibold text-ink">${esc(deviceName(s.browser))}${s.current ? ' <span class="status-pill status-done ml-1">This device</span>' : ''}</p>
+                    <p class="text-muted">Signed in ${esc(NPS.fmtDate(s.signedIn))} · last active ${esc(NPS.fmtDate(s.lastSeen))}</p></div>
+                ${s.current ? '' : `<button type="button" class="btn btn-outline btn-sm" data-revoke-session="${esc(s.id)}">Sign out</button>`}
+            </li>`).join('') || '<li class="text-xs text-muted">No other devices are signed in.</li>';
+    }
+    async function loadSessions() {
+        try { renderSessions((await api('sessions')).sessions); }
+        catch { $('session-list').innerHTML = '<li class="text-xs text-muted">Signed-in devices could not be loaded.</li>'; }
+    }
+    $('session-list').addEventListener('click', async (e) => {
+        const btn = e.target.closest('[data-revoke-session]');
+        if (!btn) return;
+        btn.disabled = true;
+        try { renderSessions((await api('revoke-session', { sessionId: btn.dataset.revokeSession })).sessions); }
+        catch (err) { const msg = $('security-modal-msg'); msg.textContent = err.message; msg.className = 'result-box result-err text-xs'; btn.disabled = false; }
+    });
+
     function openSecurityModal() {
+        loadSessions();
         $('security-modal-msg').classList.add('hidden');
         $('recovery-codes-box').classList.add('hidden');
         $('copy-recovery-btn').classList.add('hidden');

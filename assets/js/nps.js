@@ -62,48 +62,139 @@ const NPS = (() => {
         return '';
     }
 
-    // Item 24: Strip JPEG APP1 (EXIF/GPS/XMP) and COM metadata segments in the browser before uploading.
-    async function stripJpegExif(file) {
-        if (typeFor(file) !== 'image/jpeg' || typeof file.arrayBuffer !== 'function') return file;
+    // Photos are cleaned in the browser before upload, so camera location (GPS) and other hidden metadata never reach
+    // storage: JPEG and PNG/WebP metadata blocks are dropped; HEIC/HEIF (iPhone) GPS and XMP data are blanked in place.
+    const join = (chunks) => {
+        const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+        let offset = 0;
+        for (const c of chunks) { out.set(c, offset); offset += c.length; }
+        return out;
+    };
+    const ascii = (buf, at, len) => String.fromCharCode(...buf.subarray(at, at + len));
+
+    // PNG: drop the eXIf, tEXt, iTXt, zTXt and tIME chunks; image chunks are copied unchanged.
+    function stripPng(buf) {
+        if (buf.length < 8 || buf[0] !== 0x89 || ascii(buf, 1, 3) !== 'PNG') return null;
+        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        const chunks = [buf.subarray(0, 8)];
+        let pos = 8;
+        while (pos + 12 <= buf.length) {
+            const len = view.getUint32(pos);
+            const end = pos + 12 + len;
+            if (end > buf.length) return null;
+            if (!['eXIf', 'tEXt', 'iTXt', 'zTXt', 'tIME'].includes(ascii(buf, pos + 4, 4))) chunks.push(buf.subarray(pos, end));
+            pos = end;
+        }
+        return join(chunks);
+    }
+
+    // WebP: drop the EXIF and XMP chunks, clear their flags in the VP8X header and fix the RIFF size.
+    function stripWebp(buf) {
+        if (buf.length < 12 || ascii(buf, 0, 4) !== 'RIFF' || ascii(buf, 8, 4) !== 'WEBP') return null;
+        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        const chunks = [buf.slice(0, 12)];
+        let pos = 12;
+        while (pos + 8 <= buf.length) {
+            const id = ascii(buf, pos, 4);
+            const end = pos + 8 + view.getUint32(pos + 4, true) + (view.getUint32(pos + 4, true) & 1);
+            if (end > buf.length) return null;
+            if (id === 'VP8X') { const c = buf.slice(pos, end); c[8] &= ~0x0C; chunks.push(c); }   // 0x08 EXIF, 0x04 XMP
+            else if (id !== 'EXIF' && id !== 'XMP ') chunks.push(buf.subarray(pos, end));
+            pos = end;
+        }
+        const out = join(chunks);
+        new DataView(out.buffer).setUint32(4, out.length - 8, true);
+        return out;
+    }
+
+    // HEIC/HEIF: the container is hard to rebuild in a browser, so the GPS section inside the embedded EXIF block (and
+    // any XMP packet) is overwritten with zeros or spaces in place. Nothing moves, so the image itself is untouched.
+    function wipeIsoGps(buf) {
+        const out = buf.slice();
+        const SIZES = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 };
+        for (let i = 0; i + 14 < out.length; i++) {
+            if (out[i] !== 0x45 || out[i + 1] !== 0x78 || out[i + 4] !== 0 || ascii(out, i, 6) !== 'Exif\0\0') continue;
+            const t = i + 6;
+            const little = ascii(out, t, 2) === 'II';
+            if (!little && ascii(out, t, 2) !== 'MM') continue;
+            const view = new DataView(out.buffer);
+            const u16 = (at) => view.getUint16(at, little), u32 = (at) => view.getUint32(at, little);
+            try {
+                const ifd0 = t + u32(t + 4);
+                for (let e = 0, n = u16(ifd0); e < n; e++) {
+                    const entry = ifd0 + 2 + e * 12;
+                    if (u16(entry) !== 0x8825) continue;   // GPSInfo
+                    const gps = t + u32(entry + 8);
+                    const count = u16(gps);
+                    for (let g = 0; g < count; g++) {
+                        const ge = gps + 2 + g * 12;
+                        const bytes = (SIZES[u16(ge + 2)] || 1) * u32(ge + 4);
+                        if (bytes > 4) out.fill(0, t + u32(ge + 8), Math.min(out.length, t + u32(ge + 8) + bytes));
+                    }
+                    out.fill(0, gps, gps + 2 + count * 12);
+                }
+            } catch { /* malformed EXIF: leave it */ }
+        }
+        const xmp = new TextDecoder('latin1').decode(out);
+        for (let at = xmp.indexOf('<x:xmpmeta'); at !== -1; at = xmp.indexOf('<x:xmpmeta', at + 1)) {
+            const end = xmp.indexOf('</x:xmpmeta>', at);
+            if (end !== -1) out.fill(0x20, at, end + 12);
+        }
+        return out;
+    }
+
+    // Returns cleaned bytes for a photo type, or null to upload the original (unknown type or unexpected structure).
+    function stripPhotoBytes(buf, type) {
+        if (type === 'image/png') return stripPng(buf);
+        if (type === 'image/webp') return stripWebp(buf);
+        if (type === 'image/heic' || type === 'image/heif') return wipeIsoGps(buf);
+        if (type === 'image/jpeg') return stripJpeg(buf);
+        return null;
+    }
+
+    async function stripPhotoMetadata(file) {
+        const type = typeFor(file);
+        if (!type.startsWith('image/') || typeof file.arrayBuffer !== 'function') return file;
         try {
-            const buf = new Uint8Array(await file.arrayBuffer());
-            if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) return file;
-            const chunks = [buf.subarray(0, 2)];
-            let pos = 2;
-            while (pos + 4 <= buf.length && buf[pos] === 0xFF) {
-                const marker = buf[pos + 1];
-                if (marker === 0xDA || marker === 0xD9) {
-                    chunks.push(buf.subarray(pos));
-                    break;
-                }
-                if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
-                    chunks.push(buf.subarray(pos, pos + 2));
-                    pos += 2;
-                    continue;
-                }
-                const segLen = (buf[pos + 2] << 8) | buf[pos + 3];
-                if (segLen < 2 || pos + 2 + segLen > buf.length) {
-                    chunks.push(buf.subarray(pos));
-                    break;
-                }
-                // Drop APP1 (0xE1: EXIF/GPS/XMP) and COM (0xFE: comments)
-                if (marker !== 0xE1 && marker !== 0xFE) {
-                    chunks.push(buf.subarray(pos, pos + 2 + segLen));
-                }
-                pos += 2 + segLen;
-            }
-            const total = chunks.reduce((n, c) => n + c.length, 0);
-            const clean = new Uint8Array(total);
-            let offset = 0;
-            for (const c of chunks) { clean.set(c, offset); offset += c.length; }
-            return new File([clean], file.name, { type: 'image/jpeg' });
+            const clean = stripPhotoBytes(new Uint8Array(await file.arrayBuffer()), type);
+            return clean ? new File([clean], file.name, { type }) : file;
         } catch {
             return file;
         }
     }
 
+    // JPEG: drop APP1 (EXIF/GPS/XMP) and COM (comment) segments.
+    function stripJpeg(buf) {
+        if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) return null;
+        const chunks = [buf.subarray(0, 2)];
+        let pos = 2;
+        while (pos + 4 <= buf.length && buf[pos] === 0xFF) {
+            const marker = buf[pos + 1];
+            if (marker === 0xDA || marker === 0xD9) {
+                chunks.push(buf.subarray(pos));
+                break;
+            }
+            if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+                chunks.push(buf.subarray(pos, pos + 2));
+                pos += 2;
+                continue;
+            }
+            const segLen = (buf[pos + 2] << 8) | buf[pos + 3];
+            if (segLen < 2 || pos + 2 + segLen > buf.length) {
+                chunks.push(buf.subarray(pos));
+                break;
+            }
+            // Drop APP1 (0xE1: EXIF/GPS/XMP) and COM (0xFE: comments)
+            if (marker !== 0xE1 && marker !== 0xFE) {
+                chunks.push(buf.subarray(pos, pos + 2 + segLen));
+            }
+            pos += 2 + segLen;
+        }
+        return join(chunks);
+    }
+
     async function uploadOne(upload, file) {
-        const safeFile = await stripJpegExif(file);
+        const safeFile = await stripPhotoMetadata(file);
         const body = new FormData();
         body.append('cacheControl', '3600');
         body.append('', new File([safeFile], file.name, { type: typeFor(file) }));
@@ -189,7 +280,7 @@ const NPS = (() => {
     }
 
     return {
-        esc, post, get, onChange, fileMeta, checkFiles, uploadAll,
+        esc, post, get, onChange, fileMeta, checkFiles, uploadAll, stripPhotoBytes,
         verifyFileSha256, printChainOfCustody,
         money, fmtDate, fmtSize,
     };

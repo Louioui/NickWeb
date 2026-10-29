@@ -1,7 +1,7 @@
 // Local-only stand-in for the real API. scripts/dev-server.mjs uses it when SUPABASE_SERVICE_ROLE_KEY is not set, so the request
 // form, tracking page and dashboard can be clicked through before any keys exist. Orders live in memory and reset on restart.
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
-import { randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken } from '../api/_lib/orders.mjs';
 import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
 
@@ -707,6 +707,21 @@ const handlers = {
             sessions.delete(cookie);
             auditAdmin(adminEmail, 'logout_all');
             return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' });
+        }
+        // Same shape as api/admin.mjs: Nick's signed-in devices, any but this one can be signed out.
+        const mockSessionList = () => json({ sessions: [...sessionEmails.entries()].filter(([, em]) => em === adminEmail).map(([tok]) => ({
+            id: createHash('sha256').update(tok).digest('hex').slice(0, 16), current: tok === cookie,
+            browser: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/141.0 Safari/537.36',
+            signedIn: new Date().toISOString(), lastSeen: new Date().toISOString(),
+        })) });
+        if (a === 'sessions') return mockSessionList();
+        if (a === 'revoke-session') {
+            const target = [...sessionEmails.entries()].find(([tok, em]) => em === adminEmail && createHash('sha256').update(tok).digest('hex').startsWith(String(body.sessionId || '')));
+            if (!target || !/^[0-9a-f]{16}$/.test(String(body.sessionId || ''))) fail(404, 'That session has already ended.');
+            if (target[0] === cookie) fail(400, 'This is the device you are using. Use Log out instead.');
+            sessions.delete(target[0]); sessionEmails.delete(target[0]);
+            auditAdmin(adminEmail, 'session_revoked');
+            return mockSessionList();
         }
         if (a === 'totp-setup') {
             // While one is on, changing it needs the current code, and the new secret waits as pending until confirmed.
