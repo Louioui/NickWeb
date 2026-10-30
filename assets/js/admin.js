@@ -21,6 +21,10 @@ const ATTEMPT_OUTCOMES = ['No answer', 'Served', 'Wrong address / moved', 'Refus
     'Subject not home', 'Spoke with resident, subject not there', 'Gated, no access', 'Business closed', 'Other'];
 const ATTEMPT_PRESETS = [['No answer', 'No answer'], ['Served', 'Served'], ['Wrong address', 'Wrong address / moved'],
     ['Refused', 'Refused / evading'], ['Left with co-resident', 'Left with co-resident (Substituted Service)']];
+const MESSAGE_TEMPLATES = {
+    action: ['Please confirm the unit or gate code.', 'No answer on the first attempt. Is there a best time window to try again?', 'Please confirm the current service address.'],
+    note: ['Client confirmed the unit or gate code.', 'No answer on the first attempt. Follow up with the client about a better time window.', 'Served. Preparing Proof of Service now.'],
+};
 
 let orders = [];
 let statuses = {};
@@ -311,7 +315,7 @@ function renderDetail() {
             ${['standard', 'expedited'].includes(o.tier) ? `<div class="mt-5"><p class="field-label">Attempt windows</p><div class="flex flex-wrap gap-2">${['Morning', 'Afternoon / evening', 'Night'].map(name => `<span class="status-pill ${attemptedWindows.has(name) ? 'status-done' : 'status-muted'}">${attemptedWindows.has(name) ? '✓' : 'Needed:'} ${name}</span>`).join('')}</div><p class="text-xs text-muted mt-2">Older attempts without a recorded attempt time use the time they were logged.</p></div>` : ''}
             <div class="grid sm:grid-cols-2 gap-x-8 gap-y-6 mt-6">
                 <dl class="review-recap content-start">
-                    ${row('Address', `<a href="${mapUrl}" target="_blank" rel="noopener noreferrer" class="text-primary font-semibold underline underline-offset-2">${esc(fullAddress)}</a>`)}
+                    ${row('Address', `<a href="${mapUrl}" target="_blank" rel="noopener noreferrer" class="text-primary font-semibold underline underline-offset-2">${esc(fullAddress)}</a><button type="button" class="btn btn-outline btn-sm mt-2" data-click="copyAddress">Copy Full Address</button>`)}
                     ${row('Access', esc(o.access_notes || ''))}
                     ${row('Description', esc(o.physical_notes || ''))}
                     ${row('Instructions', esc(o.instructions || ''))}
@@ -440,11 +444,13 @@ function actionForm(o) {
         ${check('f-notify', 'Email the client about it', false)}
         ${submitBtn('Update Status')}`;
     if (actionTab === 'note') return `
+        <div><label for="f-template" class="field-label">Saved note</label><select id="f-template" class="field"><option value="">Choose a template…</option>${MESSAGE_TEMPLATES.note.map((value, i) => `<option value="${i}">${esc(value)}</option>`).join('')}</select></div>
         <div><label for="f-note" class="field-label">Note</label><textarea id="f-note" class="field h-24 resize-none"></textarea></div>
         ${check('f-visible', 'Client can see this note (otherwise only you can)', false)}
         ${submitBtn('Save Note')}`;
     if (actionTab === 'action') return `
         <p class="text-sm text-muted">The client gets an email and a form on their tracking page to answer, fix the address, or upload a file.</p>
+        <div><label for="f-template" class="field-label">Saved reply request</label><select id="f-template" class="field"><option value="">Choose a template…</option>${MESSAGE_TEMPLATES.action.map((value, i) => `<option value="${i}">${esc(value)}</option>`).join('')}</select></div>
         <div><label for="f-note" class="field-label">What do you need?</label><textarea id="f-note" class="field h-24 resize-none" placeholder="e.g. The apartment number is missing. Which unit does the subject live in?"></textarea></div>
         ${submitBtn('Send to Client')}`;
     if (actionTab === 'payment') {
@@ -903,10 +909,25 @@ async function start() {
 }
 start();
 
+async function copyAddress() {
+    if (!current) return;
+    const o = current.order;
+    const address = `${o.address}${o.unit ? ', ' + o.unit : ''}, ${o.city} ${o.zip}`;
+    const feedback = $('save-feedback');
+    try {
+        await navigator.clipboard.writeText(address);
+        feedback.textContent = 'Full address copied.';
+        feedback.className = 'desk-feedback result-box result-ok';
+    } catch {
+        feedback.textContent = 'Could not copy the address. Select the address link and copy it manually.';
+        feedback.className = 'desk-feedback result-box result-err';
+    }
+}
+
 // Buttons say what they do with data-click (and data-arg) instead of inline onclick, so the page's Content Security
 // Policy can refuse inline scripts. Only the functions listed here can be triggered this way.
 const CLICK_ACTIONS = {
-    backToList, closeSecurityModal, refreshJobs, exportJob, showEmailStep, rotateLink, toggleDocLockJob, printRecord,
+    backToList, closeSecurityModal, refreshJobs, exportJob, showEmailStep, rotateLink, toggleDocLockJob, printRecord, copyAddress,
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes, sendStepUpCode,
     dismissSecuritySetup, openRecoverySetup,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
@@ -927,4 +948,12 @@ document.addEventListener('click', (e) => {
     }
     const el = e.target.closest('[data-click]');
     if (el && Object.hasOwn(CLICK_ACTIONS, el.dataset.click)) CLICK_ACTIONS[el.dataset.click](el.dataset.arg, el);
+});
+document.addEventListener('change', (e) => {
+    if (e.target.id !== 'f-template' || !['action', 'note'].includes(actionTab) || !e.target.value) return;
+    const message = MESSAGE_TEMPLATES[actionTab][Number(e.target.value)];
+    if (!message || !$('f-note')) return;
+    $('f-note').value = message;
+    $('f-note').dispatchEvent(new Event('input', { bubbles: true }));
+    $('f-note').focus();
 });
