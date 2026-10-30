@@ -557,11 +557,21 @@ await check('F-10 PDF actions buried in the middle of a 3 MB file are refused', 
     }
     expect(core.verifyFileMagic(bigPdf('<< /S /URI /URI (https://example.com) >> /OpenAction << /S /GoTo >>'), 'a.pdf') === true, 'ordinary link/open action refused');
 });
-await check('F-10 hidden HTML in the middle of an image (not only its start or end) is refused', async () => {
-    const png = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
-    const filler = new Uint8Array(1_000_000);
-    const evil = new TextEncoder().encode('<script>alert(1)</script>');
-    expect(core.verifyFileMagic(new Uint8Array([...png, ...filler, ...evil, ...filler]), 'a.png') === false, 'mid-file script accepted');
+const pngChunk = (type, data) => { const d = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    return [(d.length >>> 24) & 255, (d.length >>> 16) & 255, (d.length >>> 8) & 255, d.length & 255, ...new TextEncoder().encode(type), ...d, 0, 0, 0, 0]; };
+await check('F-10 a script hidden in a PNG text chunk in the middle of the file is refused', async () => {
+    const sig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    const idat = pngChunk('IDAT', new Uint8Array(500_000));
+    const png = (text) => new Uint8Array([...sig, ...pngChunk('IHDR', new Uint8Array(13)), ...idat, ...pngChunk('tEXt', `Comment\0${text}`), ...idat, ...pngChunk('IEND', '')]);
+    expect(core.verifyFileMagic(png('<script>alert(1)</script>'), 'a.png') === false, 'script in tEXt accepted');
+    expect(core.verifyFileMagic(png('Taken at the front door'), 'a.png') === true, 'plain PNG text refused');
+});
+await check('F-10 real-looking PDFs with large compressed streams are never refused by chance (5 x 5 MB random data)', async () => {
+    const { randomBytes } = await import('node:crypto');
+    for (let i = 0; i < 5; i++) {
+        const pdf = Buffer.concat([Buffer.from('%PDF-1.7\n1 0 obj << /Length 5242880 /Filter /FlateDecode >>\nstream\n'), randomBytes(5 * 1024 * 1024), Buffer.from('\nendstream\nendobj\n%%EOF')]);
+        expect(core.verifyFileMagic(new Uint8Array(pdf), 'a.pdf') === true, `random stream data refused (try ${i + 1})`);
+    }
 });
 
 // --- F-11: photos are cleaned on the server too, for uploads that skipped the site's page ---
@@ -601,7 +611,7 @@ await check('P2 PDF pages are counted (page objects, or the page tree when pages
 });
 await check('P2 each attempt is labelled with its time window, in California time', async () => {
     reset(); const o = seedOrder(); const cookie = adminCookie();
-    const at = (h) => { const d = new Date(); d.setUTCHours(h + 8, 0, 0, 0); if (d > new Date()) d.setUTCDate(d.getUTCDate() - 1); return d.toISOString(); };   // PST = UTC-8 (PDT shifts it by 1h; 9am/9pm stay put)
+    const at = (h) => { const d = new Date(); d.setUTCHours(h + 8, 0, 0, 0); while (d > new Date()) d.setUTCDate(d.getUTCDate() - 1); return d.toISOString(); };   // PST = UTC-8 (PDT shifts it by 1h; 9am/9pm stay put)
     for (const [h, w] of [[9, 'morning'], [21, 'night']]) {
         const r = await adminAct({ action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', at: at(h) }, cookie);
         expect(r.status === 200, `attempt ${r.status}`);
@@ -654,6 +664,19 @@ await check('P2 the list shows when Nick last contacted the client', async () =>
     await adminAct({ action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer' }, adminCookie());
     l = await (await adminAct({ action: 'list' }, adminCookie())).json();
     expect(typeof l.orders[0].last_contact_at === 'string', 'visible attempt not counted');
+});
+await check('P2 only Nick\'s own entries count as contact, and his shared note clears "Client replied"', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' });
+    (tables().order_events ||= []).push({ id: randomUUID(), order_id: o.id, kind: 'note', title: '2 files added by you', client_visible: true, created_at: new Date().toISOString() });
+    let l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(l.orders[0].last_contact_at === null, 'a client upload counted as Nick contacting the client');
+    await track(o, { action: 'respond', reply: 'Any news?' });
+    l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(l.orders[0].client_replied === true, 'reply not flagged');
+    await new Promise(r => setTimeout(r, 5));
+    await adminAct({ action: 'update', id: o.id, kind: 'note', note: 'Trying again tonight.', clientVisible: true }, adminCookie());
+    l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(l.orders[0].client_replied === false && l.orders[0].last_contact_at, 'Nick\'s shared note did not clear the flag');
 });
 await check('P2 an expired, unpaid payment link can be renewed from the tracking page; a live one cannot', async () => {
     reset(); const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_oldsession1', payment_url: 'https://checkout.stripe.com/c/pay/cs_test_oldsession1' });

@@ -819,9 +819,13 @@ const handlers = {
             const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response'];
             const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(o => {
                 const last = events.filter(e => e.order_id === o.id && kinds.includes(e.kind)).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                const contact = events.filter(e => e.order_id === o.id && e.client_visible && e.kind !== 'action_response' && [...kinds, 'note'].includes(e.kind))
-                    .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                return { ...o, client_replied: last?.kind === 'action_response', last_contact_at: contact?.created_at || null };
+                // Same as byNick in api/admin.mjs: only Nick's own entries count as contacting the client or answering them.
+                const byNick = (e) => ['status', 'attempt', 'action', 'proof'].includes(e.kind) ||
+                    (e.kind === 'payment' && String(e.title || '').startsWith('Payment requested')) || (e.kind === 'note' && e.title === 'Update from Nick');
+                const mine = events.filter(e => e.order_id === o.id).sort((a, b) => b.created_at.localeCompare(a.created_at));
+                const newest = mine.find(e => byNick(e) || e.kind === 'action_response');
+                const contact = mine.find(e => byNick(e) && e.client_visible);
+                return { ...o, client_replied: newest?.kind === 'action_response', last_contact_at: contact?.created_at || null };
             });
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
         }

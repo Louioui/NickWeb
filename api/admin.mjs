@@ -523,21 +523,26 @@ async function list() {
 // A job "has a client reply" when the client's answer is newer than anything Nick has done on it since.
 // Only "received" jobs can be in that state (answering sets it), which keeps the id list short enough for one query.
 const NICK_KINDS = ['action', 'status', 'attempt', 'payment', 'proof'];
-// For each job still in play: did the client reply after Nick's last move, and when did Nick last contact the client
-// (the newest entry the client can see that came from Nick). Closed and cancelled jobs are skipped.
+// Entries Nick wrote to or for the client: status changes, attempts, questions, payment requests, proof, and notes he
+// chose to share. System entries ("files added by you", lock changes) and the client's own replies don't count.
+const byNick = (e) => ['status', 'attempt', 'action', 'proof'].includes(e.kind) ||
+    (e.kind === 'payment' && String(e.title || '').startsWith('Payment requested')) || (e.kind === 'note' && e.title === 'Update from Nick');
+// For each job still in play: did the client reply after Nick's last entry, and when did Nick last contact the client
+// (his newest entry the client can see). Closed and cancelled jobs are skipped.
 async function withClientReplied(list) {
     const ids = list.filter(o => !['closed', 'cancelled'].includes(o.status)).map(o => o.id).slice(0, 300);
     if (!ids.length) return list.map(o => ({ ...o, client_replied: false, last_contact_at: null }));
-    const { data: evs, error } = await db().from('order_events').select('order_id, kind, created_at, client_visible')
+    const { data: evs, error } = await db().from('order_events').select('order_id, kind, title, created_at, client_visible')
         .in('order_id', ids).in('kind', [...NICK_KINDS, 'note', 'action_response'])
         .order('created_at', { ascending: false }).limit(10000);
     if (error) throw error;
     const latest = new Map(), contact = new Map();
     for (const e of evs) {
-        if (e.kind !== 'note' && !latest.has(e.order_id)) latest.set(e.order_id, e.kind);
-        if (e.kind !== 'action_response' && e.client_visible && !contact.has(e.order_id)) contact.set(e.order_id, e.created_at);
+        const nick = byNick(e);
+        if ((nick || e.kind === 'action_response') && !latest.has(e.order_id)) latest.set(e.order_id, e.kind === 'action_response');
+        if (nick && e.client_visible && !contact.has(e.order_id)) contact.set(e.order_id, e.created_at);
     }
-    return list.map(o => ({ ...o, client_replied: latest.get(o.id) === 'action_response', last_contact_at: contact.get(o.id) || null }));
+    return list.map(o => ({ ...o, client_replied: latest.get(o.id) === true, last_contact_at: contact.get(o.id) || null }));
 }
 async function getOrder(id) {
     uuid(id, 'Order');
