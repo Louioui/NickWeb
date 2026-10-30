@@ -94,9 +94,16 @@ async function getAdminTotp(addr) {
 
 // Checks an authenticator code against a stored (encrypted) secret and consumes its 30-second step, so the same
 // code can never be used twice. Guesses are rate-limited per purpose.
+// The authenticator secret is encrypted with APP_SECRET. If it was set up under a different APP_SECRET (for example on a
+// Preview that shares this database), it can't be read here: say so plainly instead of failing with a server error.
+const TOTP_UNREADABLE = 'Your authenticator app was set up on a different copy of this site, so its codes can\'t be checked here. Ask your developer to reset two-step sign-in for your address, then set it up again here.';
+function readTotpSecret(secretEnc) {
+    try { return decryptSecret(secretEnc); }
+    catch { throw new HttpError(409, TOTP_UNREADABLE); }
+}
 async function checkTotp(addr, secretEnc, code, bucket) {
     await rateLimit(`${bucket}:${sha256(addr)}`, 10, 900);
-    const step = verifyTotp(decryptSecret(secretEnc), code);
+    const step = verifyTotp(readTotpSecret(secretEnc), code);
     if (!step) return false;
     const { data, error } = await db().rpc('use_admin_totp_step', { p_email: addr, p_step: step });
     if (error) throw error;
@@ -104,11 +111,21 @@ async function checkTotp(addr, secretEnc, code, bucket) {
 }
 
 // Step-up check before sensitive actions. With an authenticator on, a fresh code is required; returns whether one was checked.
+// A fresh authenticator code, or (phone lost) one single-use recovery code, confirms a sensitive action.
 async function requireStepUp(admin, code) {
     const row = await getAdminTotp(admin);
     if (!row?.enabled) return false;
-    if (!(await checkTotp(admin, row.secret_enc, code, 'admin-stepup'))) {
-        throw new HttpError(403, 'Enter the current 6-digit code from your authenticator app.');
+    const typed = String(code || '').trim().toUpperCase();
+    const recovery = typed.replace(/[^A-Z0-9]/g, '');
+    if (!/^\d{6}$/.test(typed.replace(/\s+/g, '')) && recovery.length === 8) {
+        await rateLimit(`admin-stepup:${sha256(admin)}`, 10, 900);
+        const { data, error } = await db().rpc('use_admin_recovery_code', { p_email: admin, p_hash: recoveryHash(admin, recovery) });
+        if (error) throw error;
+        if (!data) throw new HttpError(403, 'That recovery code is wrong or already used.');
+        return true;
+    }
+    if (!(await checkTotp(admin, row.secret_enc, typed, 'admin-stepup'))) {
+        throw new HttpError(403, 'Enter the current 6-digit code from your authenticator app, or one of your recovery codes.');
     }
     return true;
 }
