@@ -109,7 +109,8 @@ await check('C6 signed tokens: tampered, expired, other subject or other purpose
     expect(!core.checkToken('track-unlock-v1', 'order|other', t), 'other subject accepted');
     expect(!core.checkToken('client-session-v1', 'order|token', t), 'other purpose accepted');
     expect(!core.checkToken('track-unlock-v1', 'order|token', `${Number(exp) + 100}.${mac}`), 'extended expiry accepted');
-    expect(!core.checkToken('track-unlock-v1', 'order|token', `${exp}.${mac.slice(0, -1)}A`), 'changed signature accepted');
+    const other = mac.endsWith('A') ? 'B' : 'A';   // always a different last character
+    expect(!core.checkToken('track-unlock-v1', 'order|token', `${exp}.${mac.slice(0, -1)}${other}`), 'changed signature accepted');
     expect(!core.checkToken('track-unlock-v1', 'order|token', core.signToken('track-unlock-v1', 'order|token', -10)), 'expired token accepted');
 });
 await check('C7 an unlock from before the tracking link was replaced stops working at once', async () => {

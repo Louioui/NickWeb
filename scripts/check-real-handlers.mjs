@@ -44,6 +44,7 @@ const { POST: trackPOST } = await import('../api/track.mjs');
 const { POST: adminPOST } = await import('../api/admin.mjs');
 const { POST: webhookPOST } = await import('../api/stripe-webhook.mjs');
 const { GET: keepaliveGET } = await import('../api/keepalive.mjs');
+const { POST: feedbackPOST } = await import('../api/feedback.mjs');
 const clients = await import('../api/_lib/clients.mjs');
 
 let passed = 0;
@@ -775,6 +776,40 @@ await check('P3 removing a departing staff member ends their access and replaces
     expect(await firms.memberRole(firmId, CLIENT) === null, 'still a member');
     expect(emails.some(e => e.to.includes('boss@firm.example') && JSON.stringify(e).includes(open.track_token)), 'admin not sent the new link');
     await expectReject(() => firms.removeMember(post('/x', {}), firmId, 'boss@firm.example', 'boss@firm.example'), 'the last admin was removed');
+});
+
+// --- Surveys: client feedback and Nick's own answers ---
+const feedback = (body, ip = '9.9.9.9') => feedbackPOST(post('/api/feedback', body, { 'x-real-ip': ip }));
+const surveyRows = () => tables().survey_responses || [];
+await check('S1 a client\'s answers are saved only with permission, and only real questions are kept', async () => {
+    reset();
+    const no = await feedback({ answers: { c01: 'Landlord' }, consent: false });
+    expect(no.status === 400 && !surveyRows().length, `saved without permission (${no.status})`);
+    const ok = await feedback({ answers: { c01: 'Landlord', c19: 'Fast and clear', n01: 'sneaky', zz: 'x', c20: 42, c02: '  ' }, consent: true, name: 'Pat', email: 'PAT@example.com' });
+    expect(ok.status === 200 && surveyRows().length === 1, `not saved (${ok.status})`);
+    const row = surveyRows()[0];
+    expect(JSON.stringify(Object.keys(row.answers)) === '["c01","c19"]' && row.contact_email === 'pat@example.com' && /^[0-9a-f]{64}$/.test(row.ip_hash), JSON.stringify(row));
+    expect((await feedback({ answers: {}, consent: true })).status === 400, 'empty answers accepted');
+});
+await check('S2 the feedback form traps bots, is rate limited, and refuses other sites', async () => {
+    reset();
+    expect((await feedback({ answers: { c01: 'x' }, consent: true, website: 'spam' })).status === 200 && !surveyRows().length, 'bot answer saved');
+    let last; for (let i = 0; i < 6; i++) last = await feedback({ answers: { c30: `hi ${i}` }, consent: true }, '7.7.7.7');
+    expect(last.status === 429 && surveyRows().length === 5, `rate limit: ${last.status}, ${surveyRows().length} saved`);
+    const cross = await feedbackPOST(post('/api/feedback', { answers: { c01: 'x' }, consent: true }, { origin: 'https://evil.example' }));
+    expect(cross.status === 403, `cross-site post accepted (${cross.status})`);
+});
+await check('S3 Nick has one set of answers he can update; reading answers needs his login', async () => {
+    reset(); const cookie = adminCookie();
+    await adminAct({ action: 'survey-save', answers: { n01: 'Up at 6', c01: 'no' }, consent: true }, cookie);
+    await adminAct({ action: 'survey-save', answers: { n01: 'Up at 6, coffee first', n25: 'Route planning' }, consent: true }, cookie);
+    const mine = surveyRows().filter(r => r.form === 'nick-v1');
+    expect(mine.length === 1 && mine[0].answers.n25 === 'Route planning' && !mine[0].answers.c01, JSON.stringify(mine));
+    expect((await adminAct({ action: 'survey-save', answers: { n01: 'x' }, consent: false }, cookie)).status === 400, 'saved without permission');
+    await feedback({ answers: { c19: 'Great' }, consent: true });
+    const list = await (await adminAct({ action: 'survey-list' }, cookie)).json();
+    expect(list.responses.length === 2, `list has ${list.responses.length}`);
+    expect((await adminPOST(post('/api/admin', { action: 'survey-list' }))).status === 401, 'answers readable without login');
 });
 
 // --- F-09: with two-step off, sensitive actions need an emailed step-up code, not just the session cookie ---

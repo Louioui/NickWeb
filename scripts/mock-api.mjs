@@ -370,7 +370,21 @@ function requireMockStepUp(adminEmail, totpInput) {
     return true;
 }
 
+// Survey answers (feedback.html and Nick's Survey window), kept in memory like everything else in the demo.
+const mockSurveys = [];
+const cleanMockAnswers = (re, raw) => Object.fromEntries(Object.entries(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {})
+    .filter(([k, v]) => re.test(k) && typeof v === 'string' && v.trim()).slice(0, 60).map(([k, v]) => [k, v.trim().slice(0, 4000)]));
 const handlers = {
+    async feedback(req, body) {
+        // Same rules as api/feedback.mjs and api/_lib/surveys.mjs.
+        if (body.website) return json({ ok: true });
+        if (body.consent !== true) fail(400, 'Please tick the box to give permission to use your answers.');
+        const answers = cleanMockAnswers(/^c\d{2}$/, body.answers);
+        if (!Object.keys(answers).length) fail(400, 'Please answer at least one question.');
+        mockSurveys.unshift({ id: randomUUID(), form: 'client-v1', contact_name: cleanText(body.name, 120, false, 'Name') || null,
+            contact_email: body.email ? cleanEmail(body.email) : null, answers, created_at: now(), updated_at: now() });
+        return json({ ok: true });
+    },
     async client(req, body) {
         const action = body.action;
         if (String(action).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
@@ -833,6 +847,16 @@ const handlers = {
             });
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
         }
+        if (a === 'survey-save') {
+            if (body.consent !== true) fail(400, 'Please tick the box to give permission to use your answers.');
+            const answers = cleanMockAnswers(/^n\d{2}$/, body.answers);
+            if (!Object.keys(answers).length) fail(400, 'Please answer at least one question.');
+            const mine = mockSurveys.find(r => r.form === 'nick-v1' && r.respondent === adminEmail);
+            if (mine) Object.assign(mine, { answers, updated_at: now() });
+            else mockSurveys.push({ id: randomUUID(), form: 'nick-v1', respondent: adminEmail, answers, created_at: now(), updated_at: now() });
+            return json({ ok: true });
+        }
+        if (a === 'survey-list') return json({ ok: true, responses: mockSurveys });
         if (a === 'bulk-close') {
             const ids = (Array.isArray(body.ids) ? body.ids : []).slice(0, 50);
             const closed = [];
