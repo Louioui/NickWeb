@@ -3,7 +3,7 @@
 // Like supabase-js, every call resolves to { data, error } and never throws.
 import { randomUUID } from 'node:crypto';
 
-const PRIMARY_KEY = { client_security_settings: 'email', track_unlock_codes: 'order_id', admin_totp: 'email', admin_sessions: 'token_hash', client_trusted_devices: 'token_hash', webauthn_credentials: 'credential_id' };
+const PRIMARY_KEY = { admin_settings: 'email', client_preferences: 'email', client_security_settings: 'email', track_unlock_codes: 'order_id', admin_totp: 'email', admin_sessions: 'token_hash', client_trusted_devices: 'token_hash', webauthn_credentials: 'credential_id' };
 
 export function createFakeSupabase() {
     const state = {
@@ -115,6 +115,21 @@ export function createFakeSupabase() {
             r.used = true;
             return true;
         },
+        // Same steps as public.firm_remove_member (supabase/migrations/20261031120000_field_ops_prefs_firms.sql).
+        firm_remove_member: ({ p_firm, p_email, p_actor }) => {
+            const members = rows('firm_members').filter(m => m.firm_id === p_firm && !m.removed_at);
+            const email = String(p_email).toLowerCase().trim();
+            if (!members.some(m => m.email === String(p_actor).toLowerCase().trim() && m.role === 'admin')) throw new Error('Only an admin of this firm can remove staff.');
+            const target = members.find(m => m.email === email);
+            if (target?.role === 'admin' && members.filter(m => m.role === 'admin').length <= 1) throw new Error('The last admin of a firm cannot be removed.');
+            if (!target) throw new Error('That person is not a current member of this firm.');
+            target.removed_at = new Date().toISOString();
+            state.tables.client_trusted_devices = rows('client_trusted_devices').filter(d => d.email !== email);
+            state.tables.webauthn_credentials = rows('webauthn_credentials').filter(c => !(c.owner_kind === 'client' && c.owner_email === email));
+            for (const [access, e] of [...state.sessions]) if (e === email) { state.sessions.delete(access); state.refreshTokens.delete(state.pairs.get(access)); }
+            return rows('orders').filter(o => o.firm_id === p_firm && o.client_email === email && !['served', 'closed', 'cancelled'].includes(o.status))
+                .map(o => { o.track_token = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '').slice(0, 11); return { order_id: o.id, code: o.code, track_token: o.track_token }; });
+        },
         use_admin_totp_step: ({ p_email, p_step }) => {
             const r = rows('admin_totp').find(t => t.email === p_email);
             if (!r || (r.last_used_step || 0) >= p_step) return false;
@@ -147,7 +162,7 @@ export function createFakeSupabase() {
     const authError = (message, code) => ({ message, code, status: 401 });
     const client = {
         from: (t) => new Query(t),
-        rpc: async (name, args) => ({ data: rpcs[name](args), error: null }),
+        rpc: async (name, args) => { try { return { data: rpcs[name](args), error: null }; } catch (e) { return { data: null, error: { message: e.message } }; } },
         storage: { from: () => bucket },
         auth: {
             signInWithOtp: async () => ({ data: {}, error: null }),

@@ -208,6 +208,18 @@ export const POST = handle(async request => {
         await sendSecurityAlert(clientEmail, 'A passkey was removed from your account', ['That passkey can no longer be used to sign in.']);
         return json({ ok: true, passkeys: await listPasskeys('client', clientEmail) }, 200, headers);
     }
+    if (action === 'get-notify' || action === 'set-notify') {
+        // "Instant" (an email per update, the default) or "daily" (one summary email a day instead of status updates).
+        // Questions from Nick, payment links and proof of service are always sent at once either way.
+        if (action === 'set-notify') {
+            await rateLimit(`client-notify:${user.id}`, 20, 900);
+            if (!['instant', 'daily'].includes(body.mode)) throw new HttpError(400, 'Choose instant or daily.');
+            const { error } = await db().from('client_preferences').upsert({ email: clientEmail, notify_mode: body.mode, updated_at: new Date().toISOString() });
+            if (error) throw new HttpError(503, 'Email preferences are not set up yet.');
+        }
+        const { data, error } = await db().from('client_preferences').select('notify_mode').eq('email', clientEmail).maybeSingle();
+        return json({ ok: true, mode: error ? null : data?.notify_mode || 'instant' }, 200, headers);
+    }
     if (action === 'set-pin') {
         await rateLimit(`client-pin:${user.id}`, 10, 900);
         const pin = String(body.pin || '').trim();
@@ -293,7 +305,7 @@ export const POST = handle(async request => {
         await rateLimit(`client-list:${user.id}`, 90, 60);
         const sec = await getClientSecurity(clientEmail);
         // Exact equality, not ilike: '+' addresses and wildcard characters cannot widen the query.
-        let { data, error } = await db().from('orders').select('code,status,recipient_name,doc_type,tier,created_at,estimated_total_cents,amount_due_cents,paid_at,track_token,doc_lock,legal_hold')
+        let { data, error } = await db().from('orders').select('code,status,recipient_name,doc_type,tier,created_at,estimated_total_cents,amount_due_cents,paid_at,track_token,doc_lock,legal_hold,client_reference,case_number')
             .eq('client_email', clientEmail).order('created_at', { ascending: false }).limit(100);
         if (error) {
             const fallback = await db().from('orders').select('code,status,recipient_name,doc_type,tier,created_at,estimated_total_cents,amount_due_cents,paid_at,track_token')
@@ -313,6 +325,9 @@ export const POST = handle(async request => {
                 created: o.created_at,
                 amount: money(o.amount_due_cents ?? o.estimated_total_cents),
                 paid: !!o.paid_at,
+                paidAt: o.paid_at || null,
+                reference: o.client_reference || null,
+                caseNumber: o.case_number || null,
                 docLock: !!o.doc_lock,
                 legalHold: o.status === 'served' || !!o.legal_hold,
                 trackUrl: `/track.html#t=${encodeURIComponent(o.track_token)}`,

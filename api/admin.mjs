@@ -1,10 +1,11 @@
 // POST /api/admin { action, ... } — Nick's dashboard. Everything except the two login steps needs his session cookie.
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
-         sha256, randomToken, cleanFileList, uuidList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
+         sha256, randomToken, cleanFileList, uuidList, cleanDate, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
-import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal } from './_lib/orders.mjs';
+import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal, prefersDigest } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
+import { getContact, setContact, activeWalk, startWalk, checkIn, alertOverdueWalks } from './_lib/safewalk.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 
 const COOKIE = 'nps_admin';
@@ -46,6 +47,12 @@ export const POST = handle(async (request) => {
     if (a === 'export') return exportOrder(request, body, admin);
     if (a === 'evidence-pack') return evidencePack(request, body, admin);
     if (a === 'bulk-close') return bulkClose(request, body, admin);
+    if (a === 'expense-add') return addExpense(request, body, admin);
+    if (a === 'safewalk-status') return safeWalkStatus(admin);
+    if (a === 'safewalk-start') return json({ ok: true, walk: await startWalk(admin, body.minutes, body.id ? await getOrder(body.id) : null) });
+    if (a === 'safewalk-safe') { await checkIn(admin); return json({ ok: true, walk: null }); }
+    if (a === 'safewalk-contact') return safeWalkContact(request, body, admin);
+    if (a === 'expenses-csv') return expensesCsv(request, body, admin);
     if (a === 'delete') return deleteOrder(request, body, admin);
     throw new HttpError(400, 'Unknown action.');
 });
@@ -374,6 +381,64 @@ async function evidencePack(request, body, admin) {
     });
 }
 
+// Miles driven and fees paid (parking, filing, postage) per job, for Nick's taxes. Kept in their own table, so they
+// never appear on the client's timeline.
+const EXPENSES_UNAVAILABLE = 'Expense logging is not set up yet (its database table needs to be added).';
+async function addExpense(request, body, admin) {
+    await rateLimit(`admin-expense:${sha256(admin)}`, 60, 900);
+    const order = await getOrder(body.id);
+    const miles = body.miles === '' || body.miles == null ? 0 : Number(body.miles);
+    const fees = body.fees === '' || body.fees == null ? 0 : Math.round(Number(body.fees) * 100);
+    if (!Number.isFinite(miles) || miles < 0 || miles > 2000 || !Number.isFinite(fees) || fees < 0 || fees > 1000000 || (!miles && !fees)) {
+        throw new HttpError(400, 'Enter the miles driven and/or a fee amount.');
+    }
+    const label = text(body.label, { max: 120 });
+    const { error } = await db().from('order_expenses').insert({ order_id: order.id, miles: Math.round(miles * 10) / 10, fees_cents: fees, label });
+    if (error) throw error.code === '42P01' || /schema cache|does not exist/i.test(error.message || '') ? new HttpError(503, EXPENSES_UNAVAILABLE) : error;
+    return json({ ok: true, ...(await expenseTotals(order.id)) });
+}
+async function expenseTotals(orderId) {
+    const { data, error } = await db().from('order_expenses').select('miles, fees_cents').eq('order_id', orderId);
+    if (error) return { miles: null, feesCents: null };
+    return { miles: Math.round((data || []).reduce((n, r) => n + Number(r.miles || 0), 0) * 10) / 10, feesCents: (data || []).reduce((n, r) => n + (r.fees_cents || 0), 0) };
+}
+const csvCell = (v) => { const t = String(v ?? ''); return /^[=+\-@\t\r]/.test(t) ? `"'${t.replace(/"/g, '""')}"` : /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+async function expensesCsv(request, body, admin) {
+    await rateLimit(`admin-export:${sha256(admin)}`, 15, 900);
+    const from = cleanDate(body.from, { label: 'From' }) || `${new Date().getFullYear()}-01-01`;
+    const to = cleanDate(body.to, { label: 'To' }) || new Date().toISOString().slice(0, 10);
+    const { data, error } = await db().from('order_expenses').select('created_at, miles, fees_cents, label, order_id')
+        .gte('created_at', `${from}T00:00:00Z`).lt('created_at', `${to}T23:59:59.999Z`).order('created_at', { ascending: true }).limit(5000);
+    if (error) throw new HttpError(503, EXPENSES_UNAVAILABLE);
+    const ids = [...new Set((data || []).map(r => r.order_id))];
+    const { data: ords } = ids.length ? await db().from('orders').select('id, code, city').in('id', ids) : { data: [] };
+    const byId = new Map((ords || []).map(o => [o.id, o]));
+    const lines = [['Date', 'Reference', 'City', 'Miles', 'Fees (USD)', 'Note'].join(',')];
+    let miles = 0, fees = 0;
+    for (const r of data || []) {
+        miles += Number(r.miles || 0); fees += r.fees_cents || 0;
+        const o = byId.get(r.order_id) || {};
+        lines.push([r.created_at.slice(0, 10), o.code || '', o.city || '', Number(r.miles || 0).toFixed(1), (r.fees_cents / 100).toFixed(2), r.label || ''].map(csvCell).join(','));
+    }
+    lines.push(['Total', '', '', miles.toFixed(1), (fees / 100).toFixed(2), ''].map(csvCell).join(','));
+    await auditAdmin(request, admin, 'expenses_export', null, `${from} to ${to}`);
+    return json({ ok: true, csv: lines.join('\n'), from, to, rows: (data || []).length });
+}
+
+async function safeWalkStatus(admin) {
+    await alertOverdueWalks().catch(err => console.error('Safe-Walk check failed:', err?.message));   // also checked whenever the dashboard is open
+    return json({ ok: true, contact: await getContact(admin), walk: await activeWalk(admin) });
+}
+// Changing who gets the alert is a security change: it needs the same fresh step-up as other sensitive actions.
+async function safeWalkContact(request, body, admin) {
+    await rateLimit(`admin-safewalk:${sha256(admin)}`, 10, 900);
+    await requireStepUp(admin, body.totp);
+    const contact = await setContact(admin, body.contact);
+    await auditAdmin(request, admin, 'safewalk_contact', null, contact ? 'Emergency contact set' : 'Emergency contact removed');
+    await sendSecurityAlert(admin, 'Safe-Walk emergency contact changed', [contact ? `Safe-Walk alerts now go to ${contact}.` : 'Safe-Walk alerts are now off (no emergency contact).']);
+    return json({ ok: true, contact });
+}
+
 async function requireAdmin(request) {
     const token = getCookie(request, COOKIE);
     if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{40,64}$/.test(token)) throw new HttpError(401, 'Please log in.');
@@ -514,7 +579,7 @@ async function totpDisable(request, body, admin) {
 // --- Jobs ---
 async function list() {
     const { data, error } = await db().from('orders')
-        .select('id, code, status, created_at, updated_at, client_name, client_firm, client_email, recipient_name, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
+        .select('id, code, status, created_at, updated_at, client_name, client_firm, client_email, recipient_name, address, unit, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
         .order('created_at', { ascending: false }).limit(500);
     if (error) throw error;
     return json({ orders: await withClientReplied(data), statuses: STATUSES, tiers: TIERS });
@@ -579,6 +644,7 @@ async function detail(id) {
         events,
         files: uploadedFiles,
         integritySeal,
+        expenses: await expenseTotals(order.id),
         statuses: STATUSES,
     };
 }
@@ -601,7 +667,7 @@ async function update(request, body, admin) {
         const { error: uErr } = await db().from('orders').update(patch).eq('id', order.id);
         if (uErr) throw uErr;
         await addEvent(order.id, 'status', STATUSES[body.status].label, note, body.clientVisible !== false);
-        if (body.notify) await sendEmail({
+        if (body.notify && !(await prefersDigest(order.client_email))) await sendEmail({
             to: order.client_email, subject: `${order.code}: ${STATUSES[body.status].label}`,
             heading: STATUSES[body.status].label,
             lines: [STATUSES[body.status].client, ...(note ? [note] : [])],
@@ -627,6 +693,22 @@ async function update(request, body, admin) {
             lines: [note, 'Open your tracking page to send the missing details or upload a file.'],
             button: { label: 'Send the information', url: trackUrl },
         });
+    } else if (kind === 'mailing') {
+        // Substituted service (CCP § 415.20) is followed by a first-class mailing; Nick records when and from where.
+        const date = cleanDate(body.date, { label: 'Mailing date' });
+        if (!date) throw new HttpError(400, 'Enter the mailing date.');
+        const city = text(body.city, { max: 80, required: true, label: 'City mailed from' });
+        await addEvent(order.id, 'note', 'Substituted service: follow-up mailing sent', `Mailed by first-class mail on ${date} from ${city}.${note ? ` ${note}` : ''}`, true);
+    } else if (kind === 'stakeout') {
+        // A stakeout timed on Nick's phone: start, end and minutes, plus any time past the first included hour.
+        const start = Date.parse(body.start), end = Date.parse(body.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end > Date.now() + 60e3 || start < Date.now() - 2 * 864e5 || end - start > 12 * 3600e3) {
+            throw new HttpError(400, 'Check the stakeout start and end times.');
+        }
+        const minutes = Math.round((end - start) / 60e3);
+        const pt = (t) => new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' }).format(t);
+        const over = Math.max(0, minutes - 60);
+        await addEvent(order.id, 'note', `Stakeout: ${minutes} min`, `${pt(start)} to ${pt(end)} (California time).${over ? ` ${over} min past the first hour.` : ''}${note ? ` ${note}` : ''}`, body.clientVisible !== false);
     } else {
         throw new HttpError(400, 'Unknown update.');
     }

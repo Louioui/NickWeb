@@ -694,6 +694,89 @@ await check('P2 the receipt appears once paid, and never on a locked page', asyn
     expect((await (await track(locked, { action: 'view' })).json()).receipt === null, 'receipt shown on a locked page');
 });
 
+async function expectReject(fn, msg) { let threw = false; try { await fn(); } catch { threw = true; } if (!threw) throw new Error(msg); }
+// --- Phase 3: field tools, Safe-Walk, digest, firms ---
+const firms = await import('../api/_lib/firms.mjs');
+const safewalkMod = await import('../api/_lib/safewalk.mjs');
+await check('P3 a substituted-service mailing and a stakeout are recorded on the timeline', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' }); const cookie = adminCookie();
+    const m = await adminAct({ action: 'update', id: o.id, kind: 'mailing', date: new Date().toISOString().slice(0, 10), city: 'Stockton' }, cookie);
+    expect(m.status === 200 && evs(o).some(e => e.title === 'Substituted service: follow-up mailing sent' && /Stockton/.test(e.detail)), `mailing ${m.status}`);
+    const end = new Date(), start = new Date(end - 75 * 60e3);
+    const st = await adminAct({ action: 'update', id: o.id, kind: 'stakeout', start: start.toISOString(), end: end.toISOString() }, cookie);
+    expect(st.status === 200 && evs(o).some(e => e.title === 'Stakeout: 75 min' && /15 min past the first hour/.test(e.detail)), `stakeout ${st.status}`);
+    const bad = await adminAct({ action: 'update', id: o.id, kind: 'stakeout', start: end.toISOString(), end: start.toISOString() }, cookie);
+    expect(bad.status === 400, 'backwards stakeout accepted');
+});
+await check('P3 expenses are private, totalled per job, and exported as CSV that spreadsheets cannot run', async () => {
+    reset(); const o = seedOrder(); const cookie = adminCookie();
+    await adminAct({ action: 'expense-add', id: o.id, miles: '12.4', fees: '8', label: 'Parking' }, cookie);
+    const r = await (await adminAct({ action: 'expense-add', id: o.id, miles: 3, fees: '', label: '=HYPERLINK("x")' }, cookie)).json();
+    expect(r.miles === 15.4 && r.feesCents === 800, JSON.stringify(r));
+    expect(!evs(o).some(e => /Parking/.test(e.detail || '')), 'expense leaked onto the timeline');
+    const csv = (await (await adminAct({ action: 'expenses-csv' }, cookie)).json()).csv;
+    expect(/NP-123456/.test(csv) && /Total,,,15\.4,8\.00/.test(csv) && csv.includes(`"'=HYPERLINK`), csv);
+    expect((await adminAct({ action: 'expense-add', id: o.id, miles: 0, fees: 0 }, cookie)).status === 400, 'empty expense accepted');
+});
+await check('P3 Safe-Walk alerts the emergency contact once when the timer runs out, and not after "I\'m safe"', async () => {
+    reset(); seedAdmin2fa(); const o = seedOrder(); const cookie = adminCookie();
+    (tables().admin_settings ||= []).push({ email: ADMIN, emergency_email: 'family@example.com' });
+    const st = await adminAct({ action: 'safewalk-start', minutes: 15, id: o.id }, cookie);
+    expect(st.status === 200, `start ${st.status}`);
+    tables().safe_walks[0].due_at = new Date(Date.now() - 1000).toISOString();
+    emails.length = 0;
+    const [a, b] = await Promise.all([safewalkMod.alertOverdueWalks(), safewalkMod.alertOverdueWalks()]);
+    const toContact = emails.filter(e => e.to.includes('family@example.com'));
+    expect(a + b === 1 && toContact.length === 1 && /12 Main St/.test(JSON.stringify(toContact[0])), `alerts: ${a}+${b}, contact emails ${toContact.length}`);
+    expect(await safewalkMod.alertOverdueWalks() === 0, 'alerted twice');
+    reset(); seedAdmin2fa(); const c2 = adminCookie();
+    (tables().admin_settings ||= []).push({ email: ADMIN, emergency_email: 'family@example.com' });
+    await adminAct({ action: 'safewalk-start', minutes: 15 }, c2);
+    await adminAct({ action: 'safewalk-safe' }, c2);
+    tables().safe_walks[0].due_at = new Date(Date.now() - 1000).toISOString();
+    expect(await safewalkMod.alertOverdueWalks() === 0, 'alerted after check-in');
+});
+await check('P3 Safe-Walk retries when the alert email fails, and changing the contact needs a step-up', async () => {
+    reset(); const cookie = adminCookie();
+    (tables().admin_settings ||= []).push({ email: ADMIN, emergency_email: 'family@example.com' });
+    await adminAct({ action: 'safewalk-start', minutes: 5 }, cookie);
+    tables().safe_walks[0].due_at = new Date(Date.now() - 1000).toISOString();
+    resendUp = false;
+    expect(await safewalkMod.alertOverdueWalks() === 0 && tables().safe_walks[0].alerted_at === null, 'a failed alert was marked as sent');
+    resendUp = true;
+    expect(await safewalkMod.alertOverdueWalks() === 1, 'no retry after the email came back');
+    const change = await adminAct({ action: 'safewalk-contact', contact: 'attacker@example.com' }, cookie);
+    expect(change.status === 403 && tables().admin_settings[0].emergency_email === 'family@example.com', `contact changed without step-up (${change.status})`);
+});
+await check('P3 a client on the daily summary gets no status emails, then one digest', async () => {
+    reset(); const o = seedOrder(); const cookie = adminCookie();
+    (tables().client_preferences ||= []).push({ email: CLIENT, notify_mode: 'daily' });
+    emails.length = 0;
+    await adminAct({ action: 'update', id: o.id, kind: 'status', status: 'attempting', notify: true }, cookie);
+    expect(!emails.some(e => e.to.includes(CLIENT)), 'status email sent to a daily-summary client');
+    const sent = await orders.sendDailyDigests('https://site.test');
+    expect(sent === 1 && emails.some(e => e.to.includes(CLIENT) && /daily update/i.test(e.subject)), `digests ${sent}`);
+});
+await check('P3 removing a departing staff member ends their access and replaces their open links, in one step', async () => {
+    reset();
+    const firmId = await firms.createFirm('Vance & Ortiz LLP', 'boss@firm.example');
+    await firms.addMember(firmId, 'boss@firm.example', CLIENT, 'paralegal');
+    const open = seedOrder({ firm_id: firmId, status: 'attempting' }), done = seedOrder({ firm_id: firmId, status: 'served', code: 'NP-222222', track_token: 'S'.repeat(32) });
+    (tables().client_trusted_devices ||= []).push({ token_hash: 'a'.repeat(64), email: CLIENT });
+    (tables().webauthn_credentials ||= []).push({ credential_id: 'cred-xxxxxxxxxxxxxxxx', owner_kind: 'client', owner_email: CLIENT });
+    const access = db.__sessionFor(CLIENT);
+    const oldToken = open.track_token;
+    await expectReject(() => firms.removeMember(post('/x', {}), firmId, CLIENT, 'boss@firm.example'), 'a paralegal removed the admin');
+    emails.length = 0;
+    const r = await firms.removeMember(post('/x', {}), firmId, 'boss@firm.example', CLIENT);
+    expect(r.linksReplaced.join() === 'NP-123456', JSON.stringify(r));
+    expect(open.track_token !== oldToken && done.track_token === 'S'.repeat(32), 'wrong links replaced');
+    expect(!tables().client_trusted_devices.length && !tables().webauthn_credentials.length && !db.__state.sessions.has(access), 'devices, passkeys or sessions survived');
+    expect(await firms.memberRole(firmId, CLIENT) === null, 'still a member');
+    expect(emails.some(e => e.to.includes('boss@firm.example') && JSON.stringify(e).includes(open.track_token)), 'admin not sent the new link');
+    await expectReject(() => firms.removeMember(post('/x', {}), firmId, 'boss@firm.example', 'boss@firm.example'), 'the last admin was removed');
+});
+
 // --- F-09: with two-step off, sensitive actions need an emailed step-up code, not just the session cookie ---
 async function emailedStepUp(cookie) {
     emails.length = 0;

@@ -350,7 +350,7 @@ const NPS = (() => {
 
     return {
         esc, post, get, onChange, fileMeta, checkFiles, uploadAll, stripPhotoBytes,
-        verifyFileSha256, printChainOfCustody, printReceipt, printEvidencePack,
+        verifyFileSha256, printChainOfCustody, printReceipt, printEvidencePack, printPage,
         money, fmtDate, fmtSize,
     };
 })();

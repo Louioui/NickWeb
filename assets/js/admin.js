@@ -39,6 +39,7 @@ let current = null;           // { order, events, files } for the open job
 let actionTab = 'attempt';
 let openJobVersion = 0;
 let actionBusy = false;
+let routeStops = [];          // jobs on today's route
 let bulkIds = [];             // served/cancelled jobs shown under "Done", for one-tap closing
 const drafts = new Map();
 const draftKey = () => current ? `${current.order.id}:${actionTab}` : '';
@@ -191,6 +192,10 @@ function renderList() {
         [o.code, o.client_name, o.client_firm, o.client_email, o.recipient_name, o.city, o.zip].some(v => (v || '').toLowerCase().includes(q)));
     // "Due today": overdue first, then soonest deadline, Same-Day Rush jobs without a date at the top of the rest.
     if (filter === 'today') shown.sort((a, b) => (a.deadline ? daysUntil(a.deadline) : -0.5) - (b.deadline ? daysUntil(b.deadline) : -0.5));
+    // Today's route: every unserved job on the "Due today" board, in list order (Google Maps takes up to 9 stops in between).
+    routeStops = filter === 'today' ? shown.filter(o => o.address && !['served', 'closed', 'cancelled'].includes(o.status)).slice(0, 10) : [];
+    $('route-bar').classList.toggle('hidden', !routeStops.length);
+    $('route-text').textContent = routeStops.length ? `${routeStops.length} stop${routeStops.length === 1 ? '' : 's'}${shown.length > routeStops.length ? ` (first ${routeStops.length})` : ''}, starting from where you are.` : '';
     const closable = filter === 'done' ? shown.filter(o => ['served', 'cancelled'].includes(o.status)) : [];
     bulkIds = closable.map(o => o.id);
     $('bulk-bar').classList.toggle('hidden', !closable.length);
@@ -227,7 +232,7 @@ async function refreshJobs() {
     const btn = $('refresh-jobs');
     btn.disabled = true;
     $('sync-status').textContent = 'Checking for updates…';
-    try { await loadList(); }
+    try { await loadList(); refreshSafeWalk(); }
     catch (err) {
         if (err.status !== 401) {
             $('dashboard-error').textContent = `${err.message} Your current list is still shown. Use Refresh jobs to try again.`;
@@ -311,6 +316,7 @@ function renderDetail() {
             </div>
             ${o.action_note ? `<div class="result-box result-warn mt-5 text-sm"><strong>You asked the client:</strong> ${esc(o.action_note)}</div>` : ''}
             ${attemptWindowsHtml(o, events)}
+            ${substitutedService(events).attempted && !substitutedService(events).mailed ? '<p class="result-box result-warn text-sm mt-4"><i class="fa-solid fa-envelope mr-1" aria-hidden="true"></i> Substituted service: the follow-up first-class mailing isn\'t logged yet. Log it in the <strong>Field &amp; court</strong> tab.</p>' : ''}
             <div class="grid sm:grid-cols-2 gap-x-8 gap-y-6 mt-6">
                 <dl class="review-recap content-start">
                     ${row('Address', `<a href="${mapUrl}" target="_blank" rel="noopener noreferrer" class="text-primary font-semibold underline underline-offset-2">${esc(fullAddress)}</a> <button type="button" class="text-xs text-primary font-semibold ml-1" data-click="copyAddress"><i class="fa-regular fa-copy" aria-hidden="true"></i> Copy</button>`)}
@@ -337,7 +343,7 @@ function renderDetail() {
 
         <div class="panel">
             <div class="flex flex-wrap gap-1 px-4 pt-3 rule-b" role="group" aria-label="Actions for this request">
-                ${[['attempt', 'Log attempt'], ['status', 'Status'], ['note', 'Note'], ['action', 'Ask client'], ['payment', 'Payment link'], ['proof', 'Proof of service'], ['privacy', 'Privacy']]
+                ${[['attempt', 'Log attempt'], ['status', 'Status'], ['note', 'Note'], ['action', 'Ask client'], ['payment', 'Payment link'], ['proof', 'Proof of service'], ['field', 'Field & court'], ['privacy', 'Privacy']]
                     .map(([k, l]) => `<button type="button" aria-pressed="${k === actionTab}" class="tab-btn ${k === actionTab ? 'is-active' : ''}" data-click="setActionTab" data-arg="${k}">${l}</button>`).join('')}
             </div>
             <div id="draft-status" class="hidden text-xs text-bronze px-6 pt-4"><p role="status">Unsaved changes · kept while you switch jobs or actions in this tab.</p><button type="button" data-click="discardDraft" class="underline underline-offset-2 mt-2 py-2">Discard this draft</button></div>
@@ -430,6 +436,48 @@ function actionForm(o) {
             <button type="submit" class="btn btn-sm border-[#9c2a26] text-[#7a1f1c] hover:bg-[#fbeceb]">Delete this request forever</button>`}
         </div>`;
     }
+    if (actionTab === 'field') {
+        const sub = substitutedService(current.events);
+        const started = stakeoutStart(o.id);
+        const today = new Date().toLocaleDateString('en-CA');
+        return `
+        <div class="space-y-3 pb-5 rule-b">
+            <p class="text-sm font-semibold text-primary"><i class="fa-solid fa-stopwatch text-bronze mr-1" aria-hidden="true"></i> Stakeout timer</p>
+            <p class="text-xs text-muted">${started ? `Running since ${esc(new Date(started).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }))}. Stop it to save the time on the timeline.` : 'Start it when you begin waiting. The first hour is included in the $100 stakeout; time past it is noted.'}</p>
+            <div class="flex flex-wrap gap-2">${started
+                ? '<button type="button" class="btn btn-pine btn-sm" data-click="stopStakeout">Stop and save</button><button type="button" class="btn btn-outline btn-sm" data-click="cancelStakeout">Cancel timer</button>'
+                : '<button type="button" class="btn btn-pine btn-sm" data-click="startStakeout">Start stakeout</button>'}</div>
+        </div>
+        ${sub.attempted ? `<div class="space-y-3 pb-5 rule-b">
+            <p class="text-sm font-semibold text-primary"><i class="fa-solid fa-envelope text-bronze mr-1" aria-hidden="true"></i> Substituted service follow-up mailing</p>
+            <p class="text-xs text-muted">${sub.mailed ? 'A mailing is already logged. Log another if you sent a second one.' : 'You left the papers with a co-resident. Log the first-class mailing that follows (CCP § 415.20).'}</p>
+            <div class="grid sm:grid-cols-2 gap-4">
+                <div><label for="f-mail-date" class="field-label">Date mailed</label><input id="f-mail-date" type="date" class="field" value="${today}" max="${today}"></div>
+                <div><label for="f-mail-city" class="field-label">City mailed from</label><input id="f-mail-city" class="field" maxlength="80"></div>
+            </div>
+            ${submitBtn('Log mailing')}
+        </div>` : '<p id="action-error" class="result-box result-err hidden" role="alert"></p>'}
+        ${safeWalkSection()}
+        <div class="space-y-3 pb-5 rule-b">
+            <p class="text-sm font-semibold text-primary"><i class="fa-solid fa-car text-bronze mr-1" aria-hidden="true"></i> Mileage and expenses</p>
+            <p class="text-xs text-muted">${current.expenses?.miles == null ? 'Not set up yet.' : `This job so far: ${current.expenses.miles} mi, ${NPS.money(current.expenses.feesCents)} in fees. Only you see these.`}</p>
+            <div class="grid sm:grid-cols-3 gap-3">
+                <div><label for="f-miles" class="field-label">Miles</label><input id="f-miles" type="number" min="0" step="0.1" class="field" inputmode="decimal"></div>
+                <div><label for="f-fees" class="field-label">Fees ($)</label><input id="f-fees" type="number" min="0" step="0.01" class="field" inputmode="decimal"></div>
+                <div><label for="f-exp-label" class="field-label">What for</label><input id="f-exp-label" class="field" maxlength="120" placeholder="Parking"></div>
+            </div>
+            <div class="flex flex-wrap gap-2"><button type="button" class="btn btn-outline btn-sm" data-click="addExpense">Add</button>
+            <button type="button" class="btn btn-outline btn-sm" data-click="downloadExpenses"><i class="fa-solid fa-file-csv"></i> This year's expenses (CSV)</button></div>
+        </div>
+        <div class="space-y-3">
+            <p class="text-sm font-semibold text-primary"><i class="fa-solid fa-gavel text-bronze mr-1" aria-hidden="true"></i> Court paperwork drafts</p>
+            <p class="text-xs text-muted">Printable drafts from this job's record, for you to check and sign yourself. They are not filed or signed by the site.</p>
+            <div class="flex flex-wrap gap-2">
+                <button type="button" class="btn btn-outline btn-sm" data-click="printDiligenceLog"><i class="fa-solid fa-list-check"></i> Diligence log</button>
+                <button type="button" class="btn btn-outline btn-sm" data-click="printPosSheet"><i class="fa-solid fa-file-signature"></i> POS-010 data sheet</button>
+            </div>
+        </div>`;
+    }
     if (actionTab === 'attempt') return `
         <div class="flex flex-wrap gap-2" role="group" aria-label="Quick outcome">${QUICK_OUTCOMES.map(x =>
             `<button type="button" class="tab-btn" data-click="quickOutcome" data-arg="${esc(x)}">${esc(x.replace(' (substituted service)', ''))}</button>`).join('')}</div>
@@ -517,6 +565,8 @@ async function submitAction(e) {
             $('detail-pane').classList.remove('hidden');
             $('detail-empty').innerHTML = `<p class="result-box result-ok text-left">${esc(code)} and its documents were permanently deleted.</p>`;
             return;
+        } else if (actionTab === 'field') {
+            current = await api('update', { id, kind: 'mailing', date: v('f-mail-date'), city: v('f-mail-city') });
         } else if (actionTab === 'payment') {
             current = await api('payment-link', { id, amount: v('f-amount'), description: v('f-desc') });
         } else {
@@ -532,7 +582,7 @@ async function submitAction(e) {
         drafts.delete(savedKey);
         formDirty = false;
         renderDetail();
-        const messages = { attempt: 'Attempt logged.', status: 'Status updated.', note: 'Note saved.', action: 'Request for information sent to the client.', payment: 'Payment link sent to the client.', proof: 'Proof of service uploaded.' };
+        const messages = { field: 'Mailing logged on the timeline.', attempt: 'Attempt logged.', status: 'Status updated.', note: 'Note saved.', action: 'Request for information sent to the client.', payment: 'Payment link sent to the client.', proof: 'Proof of service uploaded.' };
         const feedback = $('save-feedback');
         feedback.textContent = (messages[savedAction] || 'Saved.') + partialUpload;
         feedback.className = `desk-feedback result-box ${partialUpload ? 'result-warn' : 'result-ok'}`;
@@ -670,6 +720,155 @@ async function renderSecurityNudges(me) {
 function hideSetupCard() {
     $('setup-card').classList.add('hidden');
     try { sessionStorage.setItem('nps_setup_card_hidden', '1'); } catch { /* storage off */ }
+}
+
+// --- Field & court tab ---
+const SUBSTITUTED = 'Left with co-resident';
+function substitutedService(events) {
+    return {
+        attempted: events.some(e => e.kind === 'attempt' && e.title.includes(SUBSTITUTED)),
+        mailed: events.some(e => e.title === 'Substituted service: follow-up mailing sent'),
+    };
+}
+// The stakeout start time lives on this device only, so a timer survives switching jobs or reloading the page.
+const stakeoutKey = (id) => `nps_stakeout_${id}`;
+function stakeoutStart(id) { try { return localStorage.getItem(stakeoutKey(id)); } catch { return null; } }
+function startStakeout() {
+    try { localStorage.setItem(stakeoutKey(current.order.id), new Date().toISOString()); } catch { alert('This browser cannot keep a timer. Note the start time yourself.'); }
+    renderDetail();
+}
+function cancelStakeout() {
+    if (!confirm('Cancel this stakeout timer without saving it?')) return;
+    try { localStorage.removeItem(stakeoutKey(current.order.id)); } catch { /* storage off */ }
+    renderDetail();
+}
+async function stopStakeout() {
+    const start = stakeoutStart(current.order.id);
+    if (!start) return renderDetail();
+    try {
+        current = await api('update', { id: current.order.id, kind: 'stakeout', start, end: new Date().toISOString(), clientVisible: true });
+        try { localStorage.removeItem(stakeoutKey(current.order.id)); } catch { /* storage off */ }
+        renderDetail();
+        await refreshJobs();
+    } catch (err) { if (err.status !== 401) alert(err.message); }
+}
+const caseAddress = (o) => `${o.address}${o.unit ? ', ' + o.unit : ''}, ${o.city} ${o.zip}`;
+const ptParts = (iso) => {
+    const d = new Date(iso);
+    return { date: d.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric', year: 'numeric' }),
+        time: d.toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' }) };
+};
+// A chronological table of every attempt, to attach to a declaration of due diligence.
+function printDiligenceLog() {
+    const o = current.order;
+    const attempts = current.events.filter(e => e.kind === 'attempt');
+    const rowsHtml = attempts.map(e => {
+        const { date, time } = ptParts(e.created_at);
+        const m = /^Attempt(?: \(([^)]+)\))?: (.*)$/.exec(e.title) || [];
+        return `<tr><td>${esc(date)}</td><td>${esc(time)}</td><td>${esc(m[1] || '')}</td><td>${esc(caseAddress(o))}</td><td>${esc(m[2] || e.title)}</td><td>${esc(e.detail || '')}</td></tr>`;
+    }).join('') || '<tr><td colspan="6">No attempts logged yet.</td></tr>';
+    NPS.printPage(`Diligence log ${o.code}`, `<h1>Log of service attempts</h1>
+        <p style="margin-top:0;color:#566860;font-size:13px">${esc(o.code)} · ${esc(o.recipient_name)} · ${esc(o.doc_type)}${o.case_number ? ` · Case ${esc(o.case_number)}` : ''}${o.court ? ` · ${esc(o.court)}` : ''}</p>
+        <table><thead><tr><th>Date</th><th>Time (California)</th><th>Window</th><th>Address</th><th>Outcome</th><th>Field notes</th></tr></thead><tbody>${rowsHtml}</tbody></table>
+        <p style="font-size:11px;color:#566860;margin-top:16px">Times are when each attempt was logged, unless the notes give a different time. The address shown is the service address on file today.
+        Draft for your review; attach it to your declaration of due diligence only after checking it.</p>`);
+}
+// The facts a POS-010 needs, gathered from the record so nothing is retyped. Nick checks, completes and signs the form.
+function printPosSheet() {
+    const o = current.order;
+    const sub = substitutedService(current.events);
+    const served = [...current.events].reverse().find(e => e.kind === 'attempt' && (/: Served/.test(e.title) || e.title.includes(SUBSTITUTED)));
+    const when = o.served_at || served?.created_at;
+    const mailing = current.events.find(e => e.title === 'Substituted service: follow-up mailing sent');
+    const blank = '<span style="display:inline-block;min-width:220px;border-bottom:1px solid #10221a">&nbsp;</span>';
+    const r = (k, v) => `<tr><th style="width:38%">${esc(k)}</th><td>${v}</td></tr>`;
+    NPS.printPage(`POS-010 data ${o.code}`, `<h1>Proof of service: data sheet</h1>
+        <p style="margin-top:0;color:#566860;font-size:13px">For Judicial Council form POS-010. Copy these facts onto the official form, check them, and sign it yourself.</p>
+        <table><tbody>
+        ${r('Case number', esc(o.case_number || '') || blank)}${r('Court', esc(o.court || '') || blank)}
+        ${r('Documents served', esc(o.doc_type || '') || blank)}${r('Party served', esc(o.recipient_name || '') || blank)}
+        ${r('Address where served', esc(caseAddress(o)))}
+        ${r('Date of service', when ? esc(ptParts(when).date) : blank)}${r('Time of service', when ? esc(ptParts(when).time) : blank)}
+        ${r('Manner of service', sub.attempted ? 'Substituted service (left with a co-resident), CCP § 415.20' : served ? 'Personal service' : blank)}
+        ${sub.attempted ? r('Follow-up mailing', mailing ? esc(mailing.detail || '') : '<strong>Not logged yet</strong>') : ''}
+        ${r('Person who served (name)', blank)}${r('Registered process server: county', blank)}${r('Registration number', blank)}
+        ${r('Fee for service', o.amount_due_cents != null ? esc(NPS.money(o.amount_due_cents)) : blank)}
+        </tbody></table>
+        <p style="font-size:11px;color:#566860;margin-top:16px">Blank lines are details this site doesn't hold. This sheet is not a court form and is not filed by the site.</p>`);
+}
+
+function openRoute() {
+    if (!routeStops.length) return;
+    const addr = (o) => `${o.address}${o.unit ? ' ' + o.unit : ''}, ${o.city} ${o.zip}`;
+    const stops = routeStops.map(addr);
+    const url = 'https://www.google.com/maps/dir/?api=1&travelmode=driving&destination=' + encodeURIComponent(stops.at(-1)) +
+        (stops.length > 1 ? '&waypoints=' + encodeURIComponent(stops.slice(0, -1).join('|')) : '');
+    window.open(url, '_blank', 'noopener');
+}
+async function addExpense(_, btn) {
+    btn.disabled = true;
+    try {
+        const r = await api('expense-add', { id: current.order.id, miles: $('f-miles').value, fees: $('f-fees').value, label: $('f-exp-label').value.trim() });
+        current.expenses = { miles: r.miles, feesCents: r.feesCents };
+        renderDetail();
+    } catch (err) { if (err.status !== 401) alert(err.message); btn.disabled = false; }
+}
+async function downloadExpenses() {
+    try {
+        const r = await api('expenses-csv', {});
+        const url = URL.createObjectURL(new Blob([r.csv], { type: 'text/csv' }));
+        const a = Object.assign(document.createElement('a'), { href: url, download: `expenses-${r.from}-to-${r.to}.csv` });
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) { if (err.status !== 401) alert(err.message); }
+}
+
+// --- Safe-Walk ---
+let safeWalk = { contact: null, walk: null, unavailable: false };
+async function refreshSafeWalk() {
+    try { Object.assign(safeWalk, await api('safewalk-status'), { unavailable: false }); }
+    catch (err) { if (err.status === 503) safeWalk.unavailable = true; }
+    const w = safeWalk.walk, banner = $('safewalk-banner');
+    banner.classList.toggle('hidden', !w);
+    if (w) {
+        const late = new Date(w.due_at) < new Date();
+        banner.innerHTML = `<div class="flex flex-wrap items-center justify-between gap-3"><span><i class="fa-solid fa-person-walking mr-1" aria-hidden="true"></i>
+            Safe-Walk ${late ? `<strong>ran out at ${esc(new Date(w.due_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }))}</strong>${w.alerted_at ? ': your emergency contact was emailed.' : ': alerting your emergency contact.'}`
+            : `is on until ${esc(new Date(w.due_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }))}`}${w.order_code ? ` (${esc(w.order_code)})` : ''}.</span>
+            <button type="button" class="btn btn-pine btn-sm" data-click="safeWalkSafe">I'm safe</button></div>`;
+    }
+}
+function safeWalkSection() {
+    if (safeWalk.unavailable) return '<div class="pb-5 rule-b"><p class="text-sm font-semibold text-primary">Safe-Walk</p><p class="text-xs text-muted">Not set up yet.</p></div>';
+    return `<div class="space-y-3 pb-5 rule-b">
+        <p class="text-sm font-semibold text-primary"><i class="fa-solid fa-person-walking text-bronze mr-1" aria-hidden="true"></i> Safe-Walk check-in</p>
+        <p class="text-xs text-muted">Before a risky serve, start a timer. If you don't tap "I'm safe" in time, ${safeWalk.contact ? `<strong>${esc(safeWalk.contact)}</strong>` : 'your emergency contact'} is emailed this job's address. Test it once before you rely on it. It needs signal to check in, and it is not a substitute for calling 911.</p>
+        ${safeWalk.walk ? '<button type="button" class="btn btn-pine btn-sm" data-click="safeWalkSafe">I\'m safe</button>'
+            : safeWalk.contact ? `<div class="flex flex-wrap gap-2">${[15, 30, 60].map(m => `<button type="button" class="btn btn-outline btn-sm" data-click="safeWalkStart" data-arg="${m}">${m} min</button>`).join('')}</div>` : ''}
+        <details class="text-xs"><summary class="cursor-pointer text-primary font-semibold">${safeWalk.contact ? 'Change emergency contact' : 'Add an emergency contact'}</summary>
+            <div class="grid sm:grid-cols-2 gap-3 mt-3">
+                <div><label for="f-sw-contact" class="field-label">Their email</label><input id="f-sw-contact" type="email" class="field" value="${esc(safeWalk.contact || '')}"></div>
+                <div><label for="f-sw-code" class="field-label">${totpEnabled ? 'Authenticator or recovery code' : 'Step-up code from your email'}</label>
+                <div class="flex flex-wrap gap-2"><input id="f-sw-code" class="field font-mono max-w-[10rem]" maxlength="9" autocomplete="one-time-code">
+                ${totpEnabled ? '' : '<button type="button" class="btn btn-outline btn-sm" data-click="emailStepUp" data-arg="f-sw-code">Email me a code</button>'}</div></div>
+            </div>
+            <button type="button" class="btn btn-outline btn-sm mt-3" data-click="safeWalkContact">Save contact</button></details>
+    </div>`;
+}
+async function safeWalkStart(minutes) {
+    try { Object.assign(safeWalk, await api('safewalk-start', { minutes: Number(minutes), id: current?.order.id })); await refreshSafeWalk(); renderDetail(); }
+    catch (err) { if (err.status !== 401) alert(err.message); }
+}
+async function safeWalkSafe() {
+    try { await api('safewalk-safe'); safeWalk.walk = null; await refreshSafeWalk(); if (current) renderDetail(); }
+    catch (err) { if (err.status !== 401) alert(`${err.message} If you can't check in, call your emergency contact.`); }
+}
+async function safeWalkContact() {
+    try {
+        const r = await api('safewalk-contact', { contact: $('f-sw-contact').value.trim(), totp: $('f-sw-code').value.trim() });
+        safeWalk.contact = r.contact;
+        renderDetail();
+    } catch (err) { if (err.status !== 401) alert(err.message); }
 }
 
 function printRecord() {
@@ -978,6 +1177,7 @@ async function start() {
         updateRecoveryBadge(me.recoveryRemaining);
         updateSecurityState(me.totpEnabled);
         renderSecurityNudges(me);
+        refreshSafeWalk();
         await refreshJobs();
         const hashId = location.hash.slice(1);
         if (hashId) openJob(hashId);
@@ -997,6 +1197,9 @@ const CLICK_ACTIONS = {
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
     emailStepUp: (arg, el) => emailStepUp(arg, el),
+    safeWalkStart: (arg) => safeWalkStart(arg), safeWalkSafe, safeWalkContact,
+    openRoute, addExpense: (arg, el) => addExpense(arg, el), downloadExpenses,
+    startStakeout, stopStakeout, cancelStakeout, printDiligenceLog, printPosSheet,
     quickOutcome: (arg) => quickOutcome(arg), copyAddress: (arg, el) => copyAddress(arg, el), bulkCloseShown, evidencePack, printReceiptJob, hideSetupCard,
     setLegalHold: (arg) => setLegalHold(arg === 'true'),
     setActionTab: (arg) => setActionTab(arg),

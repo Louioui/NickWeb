@@ -3,6 +3,10 @@
     {
       "path": "/api/keepalive",
       "schedule": "0 15 * * *"
+    },
+    {
+      "path": "/api/safewalk",
+      "schedule": "* * * * *"
     }
   ],
   "redirects": [
@@ -183,6 +187,9 @@
     },
     "api/keepalive.mjs": {
       "maxDuration": 30
+    },
+    "api/safewalk.mjs": {
+      "maxDuration": 10
     }
   }
 }
