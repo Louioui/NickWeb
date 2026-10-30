@@ -129,18 +129,35 @@
         $('guide-next').textContent = index === LESSONS.length - 1 ? 'Finish' : 'Next';
     }
 
+    // Focus moves into the guide when it opens, stays inside it while open (Tab and Shift+Tab wrap around), and goes back
+    // to whatever opened it when it closes, so keyboard and screen-reader users never lose their place.
+    let returnFocus = null;
     function open(at = 0) {
+        if ($('guide-modal').classList.contains('hidden')) returnFocus = document.activeElement;
         index = at;
         render();
         $('guide-modal').classList.remove('hidden');
         $('guide-title').focus();
     }
-    function close() { $('guide-modal').classList.add('hidden'); }
+    function close({ restore = true } = {}) {
+        $('guide-modal').classList.add('hidden');
+        if (restore && returnFocus?.isConnected) returnFocus.focus();
+        returnFocus = null;
+    }
+    function trapTab(e) {
+        const focusable = [...$('guide-modal').querySelectorAll('button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+            .filter(el => el.offsetParent !== null);
+        if (!focusable.length) return;
+        const first = focusable[0], last = focusable[focusable.length - 1];
+        if (e.shiftKey && (document.activeElement === first || document.activeElement === $('guide-title'))) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        else if (!$('guide-modal').contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+    }
 
     // "Show me": close the guide and point at the real thing. Lessons about a job's tabs need a job open.
     function showMe() {
         const s = LESSONS[index].show;
-        close();
+        close({ restore: false });   // focus goes to the control being shown instead
         if (s.modal) { openSecurityModal(); return; }
         if (s.tab) {
             if (typeof current === 'undefined' || !current) {
@@ -159,6 +176,8 @@
     function spotlight(el, say) {
         if (!el) return toast(say);
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        const target = el.matches('button, [href], input, select, textarea') ? el : el.querySelector('button, [href], input, select, textarea');
+        target?.focus({ preventScroll: true });
         const before = el.style.boxShadow;
         el.style.boxShadow = '0 0 0 4px #b08d57, 0 0 0 9px rgba(176,141,87,.25)';
         el.style.transition = 'box-shadow .3s';
@@ -179,7 +198,7 @@
         if (!$('guide-modal') || $('guide-modal').classList.contains('hidden')) return;
         if (e.target === $('guide-modal') || e.target.closest('[data-guide-close]')) return close();
         const go = e.target.closest('[data-guide-go]');
-        if (go) { index = Number(go.dataset.guideGo); return render(); }
+        if (go) { index = Number(go.dataset.guideGo); render(); return document.querySelector(`[data-guide-go="${index}"]`)?.focus(); }
         if (e.target.closest('[data-guide-show]')) return showMe();
         const ans = e.target.closest('[data-guide-answer]');
         if (ans) {
@@ -190,13 +209,15 @@
             if (ok) { done.add(LESSONS[index].id); saveDone(done); $('guide-progress').textContent = `${done.size} of ${LESSONS.length} learned`; $('guide-bar').style.width = `${Math.round((done.size / LESSONS.length) * 100)}%`; }
             return;
         }
-        if (e.target.closest('#guide-back')) { if (index > 0) { index--; render(); } return; }
+        if (e.target.closest('#guide-back')) { if (index > 0) { index--; render(); $('guide-title').focus(); } return; }
         if (e.target.closest('#guide-next')) {
-            if (index < LESSONS.length - 1) { index++; render(); }
+            if (index < LESSONS.length - 1) { index++; render(); $('guide-title').focus(); }
             else { close(); toast(done.size === LESSONS.length ? 'You finished the guide. Open it any time from the Guide button.' : `You've learned ${done.size} of ${LESSONS.length}. Come back to finish the rest.`); }
         }
     });
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && $('guide-modal') && !$('guide-modal').classList.contains('hidden')) close();
+        if (!$('guide-modal') || $('guide-modal').classList.contains('hidden')) return;
+        if (e.key === 'Escape') close();
+        else if (e.key === 'Tab') trapTab(e);
     });
 })();
