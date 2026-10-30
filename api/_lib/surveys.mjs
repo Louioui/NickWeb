@@ -10,6 +10,8 @@ const MAX_ANSWER_BYTES = 140000;
 // saves long answers in batches instead.
 export const SURVEY_BODY_BYTES = 200 * 1024;
 const PAGE = 100;
+// Vercel refuses responses over 4.5 MB; a page stops at about 3 MB even if that's fewer than 100 rows.
+const PAGE_BYTES = 3 * 1024 * 1024;
 const UNAVAILABLE = 'Saving answers is not set up yet. Please try again later.';
 const missing = (e) => e && (e.code === '42P01' || e.code === 'PGRST205' || /schema cache|does not exist/i.test(e.message || ''));
 
@@ -68,7 +70,14 @@ export async function listAnswers(before) {
     if (missing(error)) throw new HttpError(503, UNAVAILABLE);
     if (error) throw error;
     const rows = data || [];
-    return { responses: rows.slice(0, PAGE), more: rows.length > PAGE };
+    const page = [];
+    let bytes = 0;
+    for (const r of rows.slice(0, PAGE)) {
+        const size = Buffer.byteLength(JSON.stringify(r), 'utf8');
+        if (page.length && bytes + size > PAGE_BYTES) break;   // always at least one row, so paging moves on
+        page.push(r); bytes += size;
+    }
+    return { responses: page, more: rows.length > page.length };
 }
 // Nick's own answers, wherever they fall in the list.
 export async function ownAnswers(admin) {
