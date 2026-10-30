@@ -603,6 +603,30 @@ document.addEventListener('visibilitychange', refresh);
 // --- Security & Field App Modal + PWA ---
 let deferredInstallPrompt = null;
 let lastGeneratedCodes = [];
+let recoveryRemaining = 0;
+let passkeyCount = null;
+let securitySetupDismissed = false;
+try { securitySetupDismissed = sessionStorage.getItem('nps-security-setup-dismissed') === '1'; } catch { /* storage disabled */ }
+function updateSecuritySetup() {
+    const needsSetup = !totpEnabled || passkeyCount === 0;
+    $('security-setup-card').classList.toggle('hidden', !needsSetup || securitySetupDismissed);
+    $('security-setup-steps').innerHTML = [
+        `${totpEnabled ? '✓' : '1.'} Turn on your authenticator app`,
+        `${recoveryRemaining > 3 ? '✓' : '2.'} Save a fresh set of recovery codes`,
+        `${passkeyCount > 0 ? '✓' : '3.'} Add Face ID, Touch ID, or a device passkey`,
+    ].map(step => `<li>${step}</li>`).join('');
+    $('recovery-warning').classList.toggle('hidden', recoveryRemaining > 3);
+    $('recovery-warning-text').textContent = `${recoveryRemaining} unused recovery codes remain. Generate a new set and save it somewhere private.`;
+}
+function dismissSecuritySetup() {
+    securitySetupDismissed = true;
+    try { sessionStorage.setItem('nps-security-setup-dismissed', '1'); } catch { /* storage disabled */ }
+    updateSecuritySetup();
+}
+function openRecoverySetup() {
+    openSecurityModal();
+    $('totp-current-input').focus();
+}
 window.addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();
     deferredInstallPrompt = e;
@@ -610,10 +634,12 @@ window.addEventListener('beforeinstallprompt', (e) => {
 });
 function updateRecoveryBadge(n) {
     const count = Number(n) || 0;
+    recoveryRemaining = count;
     const badge = $('recovery-remaining-badge');
     if (!badge) return;
     badge.textContent = `${count} unused`;
     badge.className = `status-pill ${count > 0 ? 'status-done' : 'status-muted'}`;
+    updateSecuritySetup();
 }
 // Signed-in devices: newest activity first; any device but this one can be signed out here.
 const deviceName = (ua) => {
@@ -659,6 +685,8 @@ async function passkeyLogin() {
     } catch (err) { loginError(passkeyError(err)); }
 }
 function renderAdminPasskeys(list) {
+    passkeyCount = list.length;
+    updateSecuritySetup();
     $('admin-passkey-list').innerHTML = list.map(k => `
         <li class="flex flex-wrap items-center justify-between gap-2 p-3 border border-[color:var(--hair-ink)] rounded-sm">
             <div><p class="font-semibold text-ink">${esc(k.label)}</p><p class="text-muted">Added ${esc(NPS.fmtDate(k.createdAt, false))}${k.lastUsedAt ? ` · last used ${esc(NPS.fmtDate(k.lastUsedAt))}` : ''}</p></div>
@@ -767,6 +795,7 @@ function securityMessage(text, kind = 'ok') {
 }
 function updateSecurityState(enabled) {
     totpEnabled = !!enabled;
+    updateSecuritySetup();
     $('totp-status-badge').textContent = totpEnabled ? 'On' : 'Off';
     $('totp-status-badge').className = `status-pill ${totpEnabled ? 'status-done' : 'status-muted'}`;
     $('totp-setup-label').textContent = totpEnabled ? 'Move to a New Phone' : 'Turn On Two-Step Sign-In';
@@ -841,6 +870,7 @@ async function start() {
         $('security-modal-email').textContent = me.email;
         updateRecoveryBadge(me.recoveryRemaining);
         updateSecurityState(me.totpEnabled);
+        await loadAdminPasskeys();
         await refreshJobs();
         const hashId = location.hash.slice(1);
         if (hashId) openJob(hashId);
@@ -858,6 +888,7 @@ start();
 const CLICK_ACTIONS = {
     backToList, closeSecurityModal, refreshJobs, exportJob, showEmailStep, rotateLink, toggleDocLockJob, printRecord,
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes, sendStepUpCode,
+    dismissSecuritySetup, openRecoverySetup,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
     setLegalHold: (arg) => setLegalHold(arg === 'true'),
     setActionTab: (arg) => setActionTab(arg),
