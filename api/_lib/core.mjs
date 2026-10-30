@@ -364,7 +364,7 @@ export async function prepareUploads(orderId, kind, files) {
 // Verifies that actual uploaded file bytes match the expected binary signature (magic bytes) of the file extension
 // and rejects polyglot files that embed HTML/script tags, executable PDF actions, or macro-enabled/disguised ZIPs.
 const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
-const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
+const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch|OpenAction|AA|SubmitForm|EmbeddedFiles|RichMedia|XFA)\b/i;
 const DOCX_MACRO_OR_EXEC_RE = /(?:vbaProject\.bin|vbaData\.xml|activeX\/activeX|\.(?:exe|dll|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|msi|com|hta|jar|sh)(?:[\x00-\x20"'<>\/\\]|$))/i;
 
 export function verifyFileMagic(bytes, filename) {
@@ -378,9 +378,10 @@ export function verifyFileMagic(bytes, filename) {
     if (bytes.length > 4096 && POLYGLOT_SCRIPT_RE.test(Buffer.from(bytes.subarray(bytes.length - 4096)).toString('latin1'))) return false;
 
     if (ext === 'pdf') {
-        // %PDF- and no Acrobat JavaScript / Launch actions anywhere in the file (not just its first 4 KB). Actions hidden
+        // Inspect the entire PDF, including objects between the header and trailer. Actions hidden
         // inside compressed object streams can't be seen this way; this is a filter, not a full PDF parser.
-        if (PDF_DANGEROUS_ACTION_RE.test(Buffer.from(bytes).toString('latin1'))) return false;
+        const pdfText = Buffer.from(bytes).toString('latin1');
+        if (PDF_DANGEROUS_ACTION_RE.test(pdfText) || POLYGLOT_SCRIPT_RE.test(pdfText)) return false;
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {

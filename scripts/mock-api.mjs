@@ -229,7 +229,7 @@ function prepareUploads(orderId, kind, list) {
     });
 }
 const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
-const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
+const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch|OpenAction|AA|SubmitForm|EmbeddedFiles|RichMedia|XFA)\b/i;
 const DOCX_MACRO_OR_EXEC_RE = /(?:vbaProject\.bin|vbaData\.xml|activeX\/activeX|\.(?:exe|dll|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|msi|com|hta|jar|sh)(?:[\x00-\x20"'<>\/\\]|$))/i;
 function verifyFileMagic(bytes, filename) {
     if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > 25 * 1024 * 1024) return false;
@@ -239,7 +239,8 @@ function verifyFileMagic(bytes, filename) {
     for (let i = 0; i < headLen; i++) head += String.fromCharCode(bytes[i]);
     if (POLYGLOT_SCRIPT_RE.test(head)) return false;
     if (ext === 'pdf') {
-        if (PDF_DANGEROUS_ACTION_RE.test(head)) return false;
+        const pdfText = Buffer.from(bytes).toString('latin1');
+        if (PDF_DANGEROUS_ACTION_RE.test(pdfText) || POLYGLOT_SCRIPT_RE.test(pdfText)) return false;
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {

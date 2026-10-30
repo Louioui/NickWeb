@@ -355,6 +355,15 @@ await check('F-10 a PDF with a script action deep inside (past 4 KB) is refused'
     expect(core.verifyFileMagic(pdf, 'a.pdf') === false, 'deep /JavaScript action accepted');
     expect(core.verifyFileMagic(new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n%%EOF`), 'a.pdf') === true, 'clean PDF refused');
 });
+await check('F-10 middle-of-file PDF actions and HTML are refused by the real upload path', async () => {
+    const middle = 'x'.repeat(500000);
+    for (const payload of ['<script>alert(1)</script>', '/OpenAction', '/AA', '/SubmitForm', '/EmbeddedFiles', '/RichMedia', '/XFA']) {
+        reset(); const o = seedOrder(); const f = seedFile(o);
+        db.__state.storage.set(f.storage_path, Buffer.from(`%PDF-1.7\n${middle}\n${payload}\n${middle}\n%%EOF`));
+        const result = await core.confirmUploads(o.id, [f.id]);
+        expect(result.rejected === 1 && !fileRow(f.id), `PDF payload accepted: ${payload}`);
+    }
+});
 await check('F-10 HTML appended to the end of a PNG is refused', async () => {
     const png = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, ...new Uint8Array(9000)]);
     const tail = new TextEncoder().encode('<script>alert(1)</script>');
