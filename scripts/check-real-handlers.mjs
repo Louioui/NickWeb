@@ -785,11 +785,31 @@ await check('S1 a client\'s answers are saved only with permission, and only rea
     reset();
     const no = await feedback({ answers: { c01: 'Landlord' }, consent: false });
     expect(no.status === 400 && !surveyRows().length, `saved without permission (${no.status})`);
-    const ok = await feedback({ answers: { c01: 'Landlord', c19: 'Fast and clear', n01: 'sneaky', zz: 'x', c20: 42, c02: '  ' }, consent: true, name: 'Pat', email: 'PAT@example.com' });
+    const ok = await feedback({ answers: { c01: 'Landlord', c19: 'Fast and clear', n01: 'sneaky', zz: 'x', c20: 42, c02: '  ', c99: 'no such question', c00: 'x' }, consent: true, name: 'Pat', email: 'PAT@example.com' });
     expect(ok.status === 200 && surveyRows().length === 1, `not saved (${ok.status})`);
     const row = surveyRows()[0];
-    expect(JSON.stringify(Object.keys(row.answers)) === '["c01","c19"]' && row.contact_email === 'pat@example.com' && /^[0-9a-f]{64}$/.test(row.ip_hash), JSON.stringify(row));
+    expect(JSON.stringify(Object.keys(row.answers)) === '["c01","c19"]' && row.contact_email === 'pat@example.com', JSON.stringify(row));
+    expect(row.ip_hash === core.keyedHash('survey-ip-v1', '9.9.9.9') && row.ip_hash !== core.sha256('9.9.9.9'), 'address not stored as a keyed hash');
     expect((await feedback({ answers: {}, consent: true })).status === 400, 'empty answers accepted');
+});
+await check('S4 thirty long answers fit in one request; oversized answers get a clear message, not a database error', async () => {
+    reset();
+    const long = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`c${String(i + 1).padStart(2, '0')}`, 'word '.repeat(700)]));
+    const r = await feedback({ answers: long, consent: true });
+    expect(r.status === 200 && Object.keys(surveyRows()[0].answers).length === 30, `long answers refused (${r.status})`);
+    const huge = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`c${String(i + 1).padStart(2, '0')}`, '€'.repeat(2000)]));
+    const big = await feedback({ answers: huge, consent: true }, '8.8.8.8');
+    expect(big.status === 400 && /too long/.test((await big.json()).error), `oversized answers: ${big.status}`);
+});
+await check('S5 client answers come back a page at a time, with Nick\'s own answers separate', async () => {
+    reset(); const cookie = adminCookie();
+    for (let i = 0; i < 105; i++) (tables().survey_responses ||= []).push({ id: randomUUID(), form: 'client-v1', answers: { c30: `#${i}` }, consent: true, created_at: new Date(Date.now() - i * 1000).toISOString() });
+    await adminAct({ action: 'survey-save', answers: { n01: 'mine' }, consent: true }, cookie);
+    const p1 = await (await adminAct({ action: 'survey-list' }, cookie)).json();
+    expect(p1.responses.length === 100 && p1.more === true && p1.mine?.answers.n01 === 'mine', `page 1: ${p1.responses.length}, more ${p1.more}`);
+    const p2 = await (await adminAct({ action: 'survey-list', before: p1.responses.at(-1).created_at }, cookie)).json();
+    const ids = new Set([...p1.responses, ...p2.responses].map(r => r.id));
+    expect(p2.more === false && ids.size === 106, `pages overlap or miss rows: ${ids.size}`);
 });
 await check('S2 the feedback form traps bots, is rate limited, and refuses other sites', async () => {
     reset();
@@ -808,7 +828,7 @@ await check('S3 Nick has one set of answers he can update; reading answers needs
     expect((await adminAct({ action: 'survey-save', answers: { n01: 'x' }, consent: false }, cookie)).status === 400, 'saved without permission');
     await feedback({ answers: { c19: 'Great' }, consent: true });
     const list = await (await adminAct({ action: 'survey-list' }, cookie)).json();
-    expect(list.responses.length === 2, `list has ${list.responses.length}`);
+    expect(list.responses.length === 2 && list.me === ADMIN, `list has ${list.responses.length}, me ${list.me}`);
     expect((await adminPOST(post('/api/admin', { action: 'survey-list' }))).status === 401, 'answers readable without login');
 });
 

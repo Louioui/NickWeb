@@ -5,6 +5,8 @@
     const { esc } = NPS;
     const form = NPS_SURVEYS.client;
     const DRAFT = 'nps_feedback_draft_v1';
+    // A draft on a shared or borrowed device shouldn't linger: it's dropped after 7 days, and the email is never kept in it.
+    const DRAFT_DAYS = 7;
 
     $('fb-title').textContent = form.title;
     $('fb-intro').textContent = form.intro;
@@ -23,13 +25,16 @@
     const fields = () => [...document.querySelectorAll('[data-q]')];
     const collect = () => Object.fromEntries(fields().map(el => [el.dataset.q, el.value.trim()]).filter(([, v]) => v));
     try {
-        const saved = JSON.parse(localStorage.getItem(DRAFT) || '{}');
-        fields().forEach(el => { if (saved.answers?.[el.dataset.q]) el.value = saved.answers[el.dataset.q]; });
-        if (saved.name) $('fb-name').value = saved.name;
-        if (saved.email) $('fb-email').value = saved.email;
-    } catch { /* no draft */ }
+        const saved = JSON.parse(localStorage.getItem(DRAFT) || 'null');
+        const fresh = saved && typeof saved === 'object' && Number.isFinite(saved.at) && Date.now() - saved.at < DRAFT_DAYS * 864e5;
+        if (!fresh) localStorage.removeItem(DRAFT);   // expired, or from an older version that also kept the email
+        else {
+            fields().forEach(el => { if (typeof saved.answers?.[el.dataset.q] === 'string') el.value = saved.answers[el.dataset.q]; });
+            if (typeof saved.name === 'string') $('fb-name').value = saved.name;
+        }
+    } catch { try { localStorage.removeItem(DRAFT); } catch { /* storage off */ } }
     $('feedback-form').addEventListener('input', () => {
-        try { localStorage.setItem(DRAFT, JSON.stringify({ answers: collect(), name: $('fb-name').value, email: $('fb-email').value })); } catch { /* storage off */ }
+        try { localStorage.setItem(DRAFT, JSON.stringify({ at: Date.now(), answers: collect(), name: $('fb-name').value })); } catch { /* storage off */ }
     });
 
     $('feedback-form').addEventListener('submit', async (e) => {

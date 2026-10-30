@@ -5,7 +5,7 @@ import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal, prefersDigest } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
-import { saveNickAnswers, listAnswers } from './_lib/surveys.mjs';
+import { saveNickAnswers, listAnswers, ownAnswers, SURVEY_BODY_BYTES } from './_lib/surveys.mjs';
 import { getContact, setContact, activeWalk, startWalk, checkIn, alertOverdueWalks } from './_lib/safewalk.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 
@@ -13,7 +13,7 @@ const COOKIE = 'nps_admin';
 const SESSION_DAYS = 14;
 
 export const POST = handle(async (request) => {
-    const body = await readJson(request);
+    const body = await readJson(request, SURVEY_BODY_BYTES);   // the largest request is Nick's 30 survey answers
     const a = body.action;
     if (a === 'send-code') return sendCode(request, body);
     if (a === 'verify-code') return verifyCode(request, body);
@@ -50,7 +50,7 @@ export const POST = handle(async (request) => {
     if (a === 'bulk-close') return bulkClose(request, body, admin);
     if (a === 'expense-add') return addExpense(request, body, admin);
     if (a === 'survey-save') { await rateLimit(`admin-survey:${sha256(admin)}`, 60, 900); await saveNickAnswers(admin, body); return json({ ok: true }); }
-    if (a === 'survey-list') { await auditAdmin(request, admin, 'survey_read'); return json({ ok: true, responses: await listAnswers() }); }
+    if (a === 'survey-list') { if (!body.before) await auditAdmin(request, admin, 'survey_read'); return json({ ok: true, me: admin, mine: await ownAnswers(admin), ...(await listAnswers(body.before)) }); }
     if (a === 'safewalk-status') return safeWalkStatus(admin);
     if (a === 'safewalk-start') return json({ ok: true, walk: await startWalk(admin, body.minutes, body.id ? await getOrder(body.id) : null) });
     if (a === 'safewalk-safe') { await checkIn(admin); return json({ ok: true, walk: null }); }

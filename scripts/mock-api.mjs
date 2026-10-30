@@ -379,7 +379,7 @@ const handlers = {
         // Same rules as api/feedback.mjs and api/_lib/surveys.mjs.
         if (body.website) return json({ ok: true });
         if (body.consent !== true) fail(400, 'Please tick the box to give permission to use your answers.');
-        const answers = cleanMockAnswers(/^c\d{2}$/, body.answers);
+        const answers = cleanMockAnswers(/^c(0[1-9]|[12]\d|30)$/, body.answers);
         if (!Object.keys(answers).length) fail(400, 'Please answer at least one question.');
         mockSurveys.unshift({ id: randomUUID(), form: 'client-v1', contact_name: cleanText(body.name, 120, false, 'Name') || null,
             contact_email: body.email ? cleanEmail(body.email) : null, answers, created_at: now(), updated_at: now() });
@@ -849,14 +849,20 @@ const handlers = {
         }
         if (a === 'survey-save') {
             if (body.consent !== true) fail(400, 'Please tick the box to give permission to use your answers.');
-            const answers = cleanMockAnswers(/^n\d{2}$/, body.answers);
+            const answers = cleanMockAnswers(/^n(0[1-9]|[12]\d|30)$/, body.answers);
             if (!Object.keys(answers).length) fail(400, 'Please answer at least one question.');
             const mine = mockSurveys.find(r => r.form === 'nick-v1' && r.respondent === adminEmail);
             if (mine) Object.assign(mine, { answers, updated_at: now() });
             else mockSurveys.push({ id: randomUUID(), form: 'nick-v1', respondent: adminEmail, answers, created_at: now(), updated_at: now() });
             return json({ ok: true });
         }
-        if (a === 'survey-list') return json({ ok: true, responses: mockSurveys });
+        if (a === 'survey-list') {
+            // Same shape as api/admin.mjs: pages of 100, newest first, plus the signed-in admin's own answers.
+            const all = mockSurveys.slice().sort((x, y) => y.created_at.localeCompare(x.created_at));
+            const from = body.before ? all.filter(r => r.created_at < body.before) : all;
+            return json({ ok: true, me: adminEmail, mine: mockSurveys.find(r => r.form === 'nick-v1' && r.respondent === adminEmail) || null,
+                responses: from.slice(0, 100), more: from.length > 100 });
+        }
         if (a === 'bulk-close') {
             const ids = (Array.isArray(body.ids) ? body.ids : []).slice(0, 50);
             const closed = [];

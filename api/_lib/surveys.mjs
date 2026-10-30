@@ -2,7 +2,12 @@
 // is saved without consent. The question wording lives in assets/js/surveys.js.
 import { db, HttpError, text, email as cleanEmail } from './core.mjs';
 
-export const FORMS = { 'nick-v1': /^n\d{2}$/, 'client-v1': /^c\d{2}$/ };
+// Only the questions that exist (01–30 in each set; keep in step with assets/js/surveys.js).
+export const FORMS = { 'nick-v1': /^n(0[1-9]|[12]\d|30)$/, 'client-v1': /^c(0[1-9]|[12]\d|30)$/ };
+// The database allows 150,000 bytes of answers; a little under that leaves room for the JSON around them.
+const MAX_ANSWER_BYTES = 140000;
+export const SURVEY_BODY_BYTES = 200 * 1024;
+const PAGE = 100;
 const UNAVAILABLE = 'Saving answers is not set up yet. Please try again later.';
 const missing = (e) => e && (e.code === '42P01' || e.code === 'PGRST205' || /schema cache|does not exist/i.test(e.message || ''));
 
@@ -18,6 +23,7 @@ export function cleanAnswers(form, raw) {
         if (s) out[k] = s;
     }
     if (!Object.keys(out).length) throw new HttpError(400, 'Please answer at least one question.');
+    if (Buffer.byteLength(JSON.stringify(out), 'utf8') > MAX_ANSWER_BYTES) throw new HttpError(400, 'Your answers are too long to send in one go. Please shorten the longest ones.');
     return out;
 }
 
@@ -44,10 +50,23 @@ export async function saveNickAnswers(admin, { answers, consent }) {
     if (error) throw error;
 }
 
-export async function listAnswers() {
-    const { data, error } = await db().from('survey_responses').select('id, form, respondent, contact_name, contact_email, answers, created_at, updated_at')
-        .order('created_at', { ascending: false }).limit(2000);
+// One page of answers, newest first. Pass the last row's created_at as `before` to get the next page, so a long list
+// never becomes one oversized response.
+export async function listAnswers(before) {
+    let q = db().from('survey_responses').select('id, form, respondent, contact_name, contact_email, answers, created_at, updated_at')
+        .order('created_at', { ascending: false }).order('id', { ascending: false }).limit(PAGE + 1);
+    if (typeof before === 'string' && !Number.isNaN(Date.parse(before))) q = q.lt('created_at', before);
+    const { data, error } = await q;
     if (missing(error)) throw new HttpError(503, UNAVAILABLE);
     if (error) throw error;
-    return data || [];
+    const rows = data || [];
+    return { responses: rows.slice(0, PAGE), more: rows.length > PAGE };
+}
+// Nick's own answers, wherever they fall in the list.
+export async function ownAnswers(admin) {
+    const { data, error } = await db().from('survey_responses').select('id, form, respondent, answers, created_at, updated_at')
+        .eq('form', 'nick-v1').eq('respondent', admin).maybeSingle();
+    if (missing(error)) throw new HttpError(503, UNAVAILABLE);
+    if (error) throw error;
+    return data || null;
 }
