@@ -811,6 +811,21 @@ await check('S5 client answers come back a page at a time, with Nick\'s own answ
     const ids = new Set([...p1.responses, ...p2.responses].map(r => r.id));
     expect(p2.more === false && ids.size === 106, `pages overlap or miss rows: ${ids.size}`);
 });
+await check('S6 a page of very long answers stays under Vercel\'s 4.5 MB response limit, and paging still reaches every row', async () => {
+    reset(); const cookie = adminCookie();
+    const big = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`c${String(i + 1).padStart(2, '0')}`, 'x'.repeat(4000)]));   // about 120 KB each
+    for (let i = 0; i < 60; i++) (tables().survey_responses ||= []).push({ id: randomUUID(), form: 'client-v1', answers: big, consent: true, created_at: new Date(Date.now() - i * 1000).toISOString() });
+    const seen = new Set(); let before, pages = 0, more = true;
+    while (more) {
+        const res = await adminAct({ action: 'survey-list', ...(before ? { before } : {}) }, cookie);
+        const text = await res.text();
+        expect(Buffer.byteLength(text) < 4.5 * 1024 * 1024, `page ${pages + 1} is ${Buffer.byteLength(text)} bytes`);
+        const r = JSON.parse(text);
+        r.responses.forEach(x => seen.add(x.id)); before = r.responses.at(-1)?.created_at; more = r.more; pages++;
+        expect(pages < 20, 'paging never ends');
+    }
+    expect(seen.size === 60 && pages > 1, `${seen.size} rows over ${pages} pages`);
+});
 await check('S2 the feedback form traps bots, is rate limited, and refuses other sites', async () => {
     reset();
     expect((await feedback({ answers: { c01: 'x' }, consent: true, website: 'spam' })).status === 200 && !surveyRows().length, 'bot answer saved');
