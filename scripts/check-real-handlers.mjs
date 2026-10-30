@@ -44,6 +44,7 @@ const { POST: trackPOST } = await import('../api/track.mjs');
 const { POST: adminPOST } = await import('../api/admin.mjs');
 const { POST: webhookPOST } = await import('../api/stripe-webhook.mjs');
 const { GET: keepaliveGET } = await import('../api/keepalive.mjs');
+const { POST: feedbackPOST } = await import('../api/feedback.mjs');
 const clients = await import('../api/_lib/clients.mjs');
 
 let passed = 0;
@@ -775,6 +776,61 @@ await check('P3 removing a departing staff member ends their access and replaces
     expect(await firms.memberRole(firmId, CLIENT) === null, 'still a member');
     expect(emails.some(e => e.to.includes('boss@firm.example') && JSON.stringify(e).includes(open.track_token)), 'admin not sent the new link');
     await expectReject(() => firms.removeMember(post('/x', {}), firmId, 'boss@firm.example', 'boss@firm.example'), 'the last admin was removed');
+});
+
+// --- Surveys: client feedback and Nick's own answers ---
+const feedback = (body, ip = '9.9.9.9') => feedbackPOST(post('/api/feedback', body, { 'x-real-ip': ip }));
+const surveyRows = () => tables().survey_responses || [];
+await check('S1 a client\'s answers are saved only with permission, and only real questions are kept', async () => {
+    reset();
+    const no = await feedback({ answers: { c01: 'Landlord' }, consent: false });
+    expect(no.status === 400 && !surveyRows().length, `saved without permission (${no.status})`);
+    const ok = await feedback({ answers: { c01: 'Landlord', c19: 'Fast and clear', n01: 'sneaky', zz: 'x', c20: 42, c02: '  ', c99: 'no such question', c00: 'x' }, consent: true, name: 'Pat', email: 'PAT@example.com' });
+    expect(ok.status === 200 && surveyRows().length === 1, `not saved (${ok.status})`);
+    const row = surveyRows()[0];
+    expect(JSON.stringify(Object.keys(row.answers)) === '["c01","c19"]' && row.contact_email === 'pat@example.com', JSON.stringify(row));
+    expect(row.ip_hash === core.keyedHash('survey-ip-v1', '9.9.9.9') && row.ip_hash !== core.sha256('9.9.9.9'), 'address not stored as a keyed hash');
+    expect((await feedback({ answers: {}, consent: true })).status === 400, 'empty answers accepted');
+});
+await check('S4 thirty long answers fit in one request; oversized answers get a clear message, not a database error', async () => {
+    reset();
+    const long = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`c${String(i + 1).padStart(2, '0')}`, 'word '.repeat(700)]));
+    const r = await feedback({ answers: long, consent: true });
+    expect(r.status === 200 && Object.keys(surveyRows()[0].answers).length === 30, `long answers refused (${r.status})`);
+    const huge = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`c${String(i + 1).padStart(2, '0')}`, '€'.repeat(2000)]));
+    const big = await feedback({ answers: huge, consent: true }, '8.8.8.8');
+    expect(big.status === 400 && /too long/.test((await big.json()).error), `oversized answers: ${big.status}`);
+});
+await check('S5 client answers come back a page at a time, with Nick\'s own answers separate', async () => {
+    reset(); const cookie = adminCookie();
+    for (let i = 0; i < 105; i++) (tables().survey_responses ||= []).push({ id: randomUUID(), form: 'client-v1', answers: { c30: `#${i}` }, consent: true, created_at: new Date(Date.now() - i * 1000).toISOString() });
+    await adminAct({ action: 'survey-save', answers: { n01: 'mine' }, consent: true }, cookie);
+    const p1 = await (await adminAct({ action: 'survey-list' }, cookie)).json();
+    expect(p1.responses.length === 100 && p1.more === true && p1.mine?.answers.n01 === 'mine', `page 1: ${p1.responses.length}, more ${p1.more}`);
+    const p2 = await (await adminAct({ action: 'survey-list', before: p1.responses.at(-1).created_at }, cookie)).json();
+    const ids = new Set([...p1.responses, ...p2.responses].map(r => r.id));
+    expect(p2.more === false && ids.size === 106, `pages overlap or miss rows: ${ids.size}`);
+});
+await check('S2 the feedback form traps bots, is rate limited, and refuses other sites', async () => {
+    reset();
+    expect((await feedback({ answers: { c01: 'x' }, consent: true, website: 'spam' })).status === 200 && !surveyRows().length, 'bot answer saved');
+    let last; for (let i = 0; i < 6; i++) last = await feedback({ answers: { c30: `hi ${i}` }, consent: true }, '7.7.7.7');
+    expect(last.status === 429 && surveyRows().length === 5, `rate limit: ${last.status}, ${surveyRows().length} saved`);
+    const cross = await feedbackPOST(post('/api/feedback', { answers: { c01: 'x' }, consent: true }, { origin: 'https://evil.example' }));
+    expect(cross.status === 403, `cross-site post accepted (${cross.status})`);
+});
+await check('S3 Nick has one set of answers he can update; reading answers needs his login', async () => {
+    reset(); const cookie = adminCookie();
+    await adminAct({ action: 'survey-save', answers: { n01: 'Up at 6', n02: 'Phone', c01: 'no' }, consent: true, replace: true }, cookie);
+    await adminAct({ action: 'survey-save', answers: { n01: 'Up at 6, coffee first', n25: 'Route planning' }, consent: true, replace: true, cleared: ['n02'] }, cookie);
+    await adminAct({ action: 'survey-save', answers: { n30: 'Second batch' }, consent: true }, cookie);   // a later batch adds to the set
+    const mine = surveyRows().filter(r => r.form === 'nick-v1');
+    expect(mine.length === 1 && mine[0].answers.n25 === 'Route planning' && mine[0].answers.n30 === 'Second batch' && !mine[0].answers.n02 && !mine[0].answers.c01, JSON.stringify(mine));
+    expect((await adminAct({ action: 'survey-save', answers: { n01: 'x' }, consent: false }, cookie)).status === 400, 'saved without permission');
+    await feedback({ answers: { c19: 'Great' }, consent: true });
+    const list = await (await adminAct({ action: 'survey-list' }, cookie)).json();
+    expect(list.responses.length === 2 && list.me === ADMIN, `list has ${list.responses.length}, me ${list.me}`);
+    expect((await adminPOST(post('/api/admin', { action: 'survey-list' }))).status === 401, 'answers readable without login');
 });
 
 // --- F-09: with two-step off, sensitive actions need an emailed step-up code, not just the session cookie ---

@@ -110,7 +110,7 @@
       ]
     },
     {
-      "source": "/(track|admin|account|demo)\\.html",
+      "source": "/(track|admin|account|demo|feedback)\\.html",
       "headers": [
         {
           "key": "Referrer-Policy",
@@ -189,6 +189,9 @@
       "maxDuration": 30
     },
     "api/safewalk.mjs": {
+      "maxDuration": 10
+    },
+    "api/feedback.mjs": {
       "maxDuration": 10
     }
   }

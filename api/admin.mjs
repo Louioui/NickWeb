@@ -5,6 +5,7 @@ import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal, prefersDigest } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
+import { saveNickAnswers, listAnswers, ownAnswers } from './_lib/surveys.mjs';
 import { getContact, setContact, activeWalk, startWalk, checkIn, alertOverdueWalks } from './_lib/safewalk.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 
@@ -48,6 +49,8 @@ export const POST = handle(async (request) => {
     if (a === 'evidence-pack') return evidencePack(request, body, admin);
     if (a === 'bulk-close') return bulkClose(request, body, admin);
     if (a === 'expense-add') return addExpense(request, body, admin);
+    if (a === 'survey-save') { await rateLimit(`admin-survey:${sha256(admin)}`, 60, 900); await saveNickAnswers(admin, body); return json({ ok: true }); }
+    if (a === 'survey-list') { if (!body.before) await auditAdmin(request, admin, 'survey_read'); return json({ ok: true, me: admin, mine: await ownAnswers(admin), ...(await listAnswers(body.before)) }); }
     if (a === 'safewalk-status') return safeWalkStatus(admin);
     if (a === 'safewalk-start') return json({ ok: true, walk: await startWalk(admin, body.minutes, body.id ? await getOrder(body.id) : null) });
     if (a === 'safewalk-safe') { await checkIn(admin); return json({ ok: true, walk: null }); }
