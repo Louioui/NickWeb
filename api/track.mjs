@@ -8,7 +8,7 @@
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, hitRateLimit, peekRateLimit, text, longText, cleanFileList,
          prepareUploads, confirmUploads, addEvent, auditClientAction, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
-import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, flagUnappliedPayment, sendEmail } from './_lib/orders.mjs';
+import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, flagUnappliedPayment, renewExpiredPaymentLink, sendEmail } from './_lib/orders.mjs';
 import { getClientSecurity, pinLocked } from './_lib/clients.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
 
@@ -157,6 +157,12 @@ export const POST = handle(async (request) => {
             await auditClientAction(request, order.id, 'payment_confirmation');
         }
         return json(await clientView(latest, { unlocked }));
+    }
+
+    if (body.action === 'renew-payment-link') {
+        await rateLimit(`track-renew:${sha256(body.t)}`, 3, 3600);
+        await renewExpiredPaymentLink(order, siteOrigin(request));
+        return json(await clientView(await orderByToken(body.t), { unlocked }));
     }
 
     if (body.action === 'respond') {

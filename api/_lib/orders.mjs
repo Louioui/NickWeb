@@ -1,5 +1,6 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
 import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS } from './core.mjs';
+import { createCheckout, checkoutExpiresAt, stripeClient } from './stripe.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -110,6 +111,7 @@ export async function clientView(order, { unlocked = false } = {}) {
         files = fallback.data;
     }
     const isLocked = !!order.doc_lock && !unlocked;
+    const paymentExpired = !!order.payment_expires_at && !order.paid_at && Date.parse(order.payment_expires_at) <= Date.now();
     const fullAddr = [order.address, order.unit].filter(Boolean).join(', ') + (order.city ? `, ${order.city}` : '') + ` ${order.zip}`;
     const seal = await orderSeal(order.id);
     return {
@@ -126,7 +128,10 @@ export async function clientView(order, { unlocked = false } = {}) {
         estimate: money(order.estimated_total_cents),
         amountDue: order.amount_due_cents != null ? money(order.amount_due_cents) : null,
         // Held (served) orders keep their status when billed afterwards, so an unpaid link alone shows the Pay button.
-        payUrl: (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
+        payUrl: !paymentExpired && (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
+        paymentExpired,
+        canRenewPayment: !order.paid_at && !!order.stripe_session_id && Number.isSafeInteger(order.amount_due_cents) && order.amount_due_cents > 0 &&
+            (paymentExpired || !order.payment_expires_at),
         paidAt: order.paid_at,
         receipt: isLocked ? null : receiptForOrder(order),
         actionNote: order.status === 'action_required' && !isLocked ? order.action_note : null,
@@ -175,6 +180,59 @@ export async function markPaid(orderId, amountCents, sessionId) {
     const { data, error } = await db().rpc('record_paid_order', { p_order: orderId, p_amount_cents: cents, p_session_id: sessionId });
     if (error) throw error;
     return !!data;
+}
+
+export async function renewExpiredPaymentLink(order, origin) {
+    if (order.paid_at) throw new HttpError(409, 'This order is already paid.');
+    if (!Number.isSafeInteger(order.amount_due_cents) || order.amount_due_cents < 100 ||
+        typeof order.stripe_session_id !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(order.stripe_session_id)) {
+        throw new HttpError(409, 'There is no payment link to renew. Contact Nick.');
+    }
+    let old;
+    try { old = await stripeClient().checkout.sessions.retrieve(order.stripe_session_id); }
+    catch { throw new HttpError(503, 'Stripe could not check the current payment link. Try again shortly.'); }
+    if (!old || old.id !== order.stripe_session_id || old.metadata?.order_id !== order.id ||
+        old.amount_total !== order.amount_due_cents) {
+        throw new HttpError(503, 'The current payment link could not be verified. Contact Nick.');
+    }
+    if (old.payment_status === 'paid') {
+        await markPaid(order.id, old.amount_total, old.id);
+        throw new HttpError(409, 'Your payment was already received. Refresh this page.');
+    }
+    if (old.status === 'open') {
+        if (!Number.isSafeInteger(old.expires_at) || old.expires_at * 1000 > Date.now()) {
+            throw new HttpError(409, 'The current payment link is still active.');
+        }
+        try { await stripeClient().checkout.sessions.expire(old.id); }
+        catch { throw new HttpError(503, 'Stripe could not close the expired link. Try again shortly.'); }
+    } else if (old.status !== 'expired') {
+        throw new HttpError(409, 'A payment is still processing. Check again shortly.');
+    }
+    const session = await createCheckout(order, order.amount_due_cents, `Process service ${order.code}`, origin);
+    let expiresAt;
+    try { expiresAt = checkoutExpiresAt(session); }
+    catch (err) { await stripeClient().checkout.sessions.expire(session.id).catch(() => {}); throw err; }
+    const { data: saved, error } = await db().from('orders').update({
+        stripe_session_id: session.id, payment_url: session.url, payment_expires_at: expiresAt,
+    }).eq('id', order.id).eq('stripe_session_id', order.stripe_session_id).eq('amount_due_cents', order.amount_due_cents)
+        .is('paid_at', null).select('id').maybeSingle();
+    if (error || !saved) {
+        await stripeClient().checkout.sessions.expire(session.id).catch(() => {});
+        if (error) throw error;
+        throw new HttpError(409, 'This payment link was already renewed. Refresh for the latest one.');
+    }
+    // The CAS above is the payment-link commit point. A later timeline or email failure must not make the caller
+    // think renewal failed and retry a link that is already live; the client can use the returned link immediately.
+    try { await addEvent(order.id, 'payment', `Payment link renewed: ${money(order.amount_due_cents)}`); }
+    catch { console.error('Payment renewal timeline event failed', order.id); }
+    try {
+        await sendEmail({ to: order.client_email, subject: `${order.code}: your renewed payment link`,
+            heading: 'Your payment link was renewed',
+            lines: [`The previous link expired. The amount due is still ${money(order.amount_due_cents)}.`,
+                'Use the new secure link below to pay. It expires in 24 hours.'],
+            button: { label: `Pay ${money(order.amount_due_cents)}`, url: session.url } });
+    } catch { console.error('Payment renewal email failed', order.id); }
+    return session;
 }
 
 // A paid Stripe session that markPaid would not apply: an older link Nick replaced, less than the amount due, or a

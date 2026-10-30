@@ -9,15 +9,17 @@ import { countPdfPages, printingSummary } from '../api/_lib/pdf-pages.mjs';
 
 const db = createFakeSupabase();
 const stripeSessions = new Map();
+const stripeIdempotency = new Map();
 class FakeStripe {
     constructor() {
         this.webhooks = { constructEventAsync: async (raw) => JSON.parse(raw) };
         this.checkout = { sessions: { retrieve: async (id) => { const row = stripeSessions.get(id); if (row instanceof Error) throw row; return row || { id, payment_status: 'unpaid', metadata: {} }; },
             expire: async (id) => { const row = stripeSessions.get(id); if (row?.expireError) throw new Error('Stripe expiry failed'); if (row) row.status = 'expired'; return row || {}; },
-            create: async (params) => { const id = `cs_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
-                const row = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid',
+            create: async (params, options) => { if (stripeIdempotency.has(options?.idempotencyKey)) return stripeIdempotency.get(options.idempotencyKey);
+                const id = `cs_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+                const row = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid', expires_at: params.expires_at,
                     metadata: params.metadata, amount_total: params.line_items[0].price_data.unit_amount };
-                stripeSessions.set(id, row); return row; } } };
+                stripeSessions.set(id, row); stripeIdempotency.set(options.idempotencyKey, row); return row; } } };
     }
 }
 mock.module('@supabase/supabase-js', { namedExports: { createClient: () => db } });
@@ -67,7 +69,7 @@ const post = (path, body, headers = {}) => new Request(`https://site.test${path}
     method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
 });
 const tables = () => db.__state.tables;
-const reset = () => { db.__reset(); stripeSessions.clear(); emails.length = 0; resendUp = true; };
+const reset = () => { db.__reset(); stripeSessions.clear(); stripeIdempotency.clear(); emails.length = 0; resendUp = true; };
 const ADMIN = 'nicksprocessservices@outlook.com';
 const CLIENT = 'client@example.com';
 const PIN = '246810';
@@ -399,12 +401,50 @@ await check('concurrent payment-link replacements keep only one new session paya
         payment_url: 'https://checkout.stripe.com/c/pay/old' });
     stripeSessions.set(id, { id, status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id } });
     const cookie = adminCookie();
-    const results = await Promise.all(['80.00', '90.00'].map(amount => adminPOST(post('/api/admin',
+    const results = await Promise.all(['80.00', '80.00'].map(amount => adminPOST(post('/api/admin',
         { action: 'payment-link', id: o.id, amount }, { cookie }))));
     expect(results.filter(r => r.status === 200).length === 1 && results.filter(r => r.status === 409).length === 1,
         `concurrent results ${results.map(r => r.status)}`);
     const open = [...stripeSessions.values()].filter(s => s.status === 'open');
     expect(open.length === 1 && open[0].id === o.stripe_session_id, 'orphaned session remained payable');
+});
+await check('client renews only an expired Stripe link for the original amount', async () => {
+    reset(); const id = 'cs_test_expired123';
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+        payment_url: 'https://checkout.stripe.com/c/pay/old', payment_expires_at: new Date(Date.now() - 60e3).toISOString() });
+    stripeSessions.set(id, { id, status: 'expired', payment_status: 'unpaid', amount_total: 7500, metadata: { order_id: o.id } });
+    const res = await trackPOST(post('/api/track', { action: 'renew-payment-link', t: o.track_token }));
+    const view = await res.json();
+    expect(res.status === 200 && view.amountDue === '$75.00' && view.payUrl === o.payment_url && !view.paymentExpired,
+        `renewal failed: ${res.status} ${JSON.stringify(view)}`);
+    expect(o.amount_due_cents === 7500 && o.stripe_session_id !== id && o.payment_expires_at > new Date().toISOString(), 'amount or expiry changed incorrectly');
+    expect(events(o.id).filter(e => e.title?.startsWith('Payment link renewed:')).length === 1, 'renewal event missing');
+    expect((await trackPOST(post('/api/track', { action: 'renew-payment-link', t: o.track_token }))).status === 409,
+        'active replacement renewed again');
+});
+await check('Nick can renew an expired link, while a still-open link is refused', async () => {
+    reset(); const id = 'cs_test_expired123';
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+        payment_url: 'https://checkout.stripe.com/c/pay/old', payment_expires_at: new Date(Date.now() - 60e3).toISOString() });
+    stripeSessions.set(id, { id, status: 'open', payment_status: 'unpaid', amount_total: 7500,
+        expires_at: Math.floor(Date.now() / 1000) + 1000, metadata: { order_id: o.id } });
+    const cookie = adminCookie();
+    expect((await adminPOST(post('/api/admin', { action: 'renew-payment-link', id: o.id }, { cookie }))).status === 409,
+        'Stripe-open link was renewed based only on the database clock');
+    stripeSessions.get(id).status = 'expired';
+    const res = await adminPOST(post('/api/admin', { action: 'renew-payment-link', id: o.id }, { cookie }));
+    expect(res.status === 200 && o.stripe_session_id !== id && o.amount_due_cents === 7500, `admin renewal failed (${res.status})`);
+});
+await check('parallel expired-link renewals produce one payable session and one renewal event', async () => {
+    reset(); const id = 'cs_test_expired123';
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+        payment_url: 'https://checkout.stripe.com/c/pay/old', payment_expires_at: new Date(Date.now() - 60e3).toISOString() });
+    stripeSessions.set(id, { id, status: 'expired', payment_status: 'unpaid', amount_total: 7500, metadata: { order_id: o.id } });
+    const results = await Promise.all(Array.from({ length: 3 }, () => trackPOST(post('/api/track',
+        { action: 'renew-payment-link', t: o.track_token }))));
+    expect(results.filter(r => r.status === 200).length === 1, `renewal statuses: ${results.map(r => r.status)}`);
+    expect([...stripeSessions.values()].filter(s => s.status === 'open').length === 1, 'multiple payable sessions remain');
+    expect(events(o.id).filter(e => e.title?.startsWith('Payment link renewed:')).length === 1, 'duplicate renewal events');
 });
 await check('dashboard last-contact date follows the latest client exchange', async () => {
     reset();

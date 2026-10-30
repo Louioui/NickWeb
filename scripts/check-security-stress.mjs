@@ -706,12 +706,12 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     // 11e. Stripe Checkout 24-hour hard expiry, 1-minute idempotency key, & strict canMarkPaid session/amount verification
     const fixedNow = 1730000000000;
     const sampleOrd = { id: '4c190c16-ccb0-40c6-9c81-da1842658d52', code: 'NP-649025', client_email: 'paralegal@example.com', track_token: 'AbCdEfGhIjKlMnOpQrStUvWxYz012345' };
-    const cp1 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow);
-    const cp2 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 15000);
-    const cpNextMin = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 65000);
+    const cp1 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow, 'operation-a');
+    const cp2 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 15000, 'operation-a');
+    const cpNextMin = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 15000, 'operation-b');
     assert.equal(cp1.params.expires_at, Math.floor(fixedNow / 1000) + 86340);
-    assert.equal(cp1.options.idempotencyKey, cp2.options.idempotencyKey, 'Double-click within same minute must produce identical Stripe idempotencyKey');
-    assert.notEqual(cp1.options.idempotencyKey, cpNextMin.options.idempotencyKey, 'Retry in next minute gets a fresh idempotencyKey');
+    assert.equal(cp1.options.idempotencyKey, cp2.options.idempotencyKey, 'A retry of one create attempt must reuse its Stripe idempotency key');
+    assert.notEqual(cp1.options.idempotencyKey, cpNextMin.options.idempotencyKey, 'Separate create attempts need different Stripe idempotency keys');
 
     const unpaidOrder = { id: sampleOrd.id, status: 'awaiting_payment', paid_at: null, stripe_session_id: 'cs_live_active123456', amount_due_cents: 12500 };
     assert.equal(canMarkPaid(unpaidOrder, 12500, 'cs_live_active123456'), true, 'Exact active session & amount must be accepted');

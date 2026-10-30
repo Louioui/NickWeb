@@ -180,6 +180,7 @@ function clientView(o, { unlocked = false } = {}) {
         .map(({ created_at, kind, title, detail }) => ({ created_at, kind, title, detail }));
     const uploadedFiles = [...files.values()].filter(f => f.order_id === o.id && f.uploaded);
     const isLocked = !!o.doc_lock && !unlocked;
+    const paymentExpired = !!o.payment_expires_at && !o.paid_at && Date.parse(o.payment_expires_at) <= Date.now();
     const fullAddr = [o.address, o.unit].filter(Boolean).join(', ') + `, ${o.city} ${o.zip}`;
     const seal = orderSeal(o.id);
     return {
@@ -191,7 +192,10 @@ function clientView(o, { unlocked = false } = {}) {
         tier: TIERS[o.tier]?.name, addons: o.addons.map(k => ADDONS[k]?.name).filter(Boolean),
         estimate: money(o.estimated_total_cents),
         amountDue: o.amount_due_cents != null ? money(o.amount_due_cents) : null,
-        payUrl: (o.status === 'awaiting_payment' || (o.legal_hold && !o.paid_at)) ? o.payment_url : null,
+        payUrl: !paymentExpired && (o.status === 'awaiting_payment' || (o.legal_hold && !o.paid_at)) ? o.payment_url : null,
+        paymentExpired,
+        canRenewPayment: !o.paid_at && !!o.stripe_session_id && Number.isSafeInteger(o.amount_due_cents) && o.amount_due_cents > 0 &&
+            (paymentExpired || !o.payment_expires_at),
         // Same as api/_lib/orders.mjs: a locked view keeps status and dates, not what was said or sent.
         paidAt: o.paid_at, receipt: isLocked ? null : receiptForOrder(o), actionNote: o.status === 'action_required' && !isLocked ? o.action_note : null,
         docLock: !!o.doc_lock,
@@ -329,6 +333,21 @@ function markPaid(o, sessionId, amountCents = o?.amount_due_cents) {
     updateOrder(o, { paid_at: now(), paid_amount_cents: paidCents, stripe_session_id: sessionId, ...(o.legal_hold ? {} : { status: 'paid' }) });
     addEvent(o.id, 'payment', `Payment received: ${money(paidCents)}`);
     return true;
+}
+
+function renewMockPayment(o) {
+    if (o.paid_at) fail(409, 'This order is already paid.');
+    if (!Number.isSafeInteger(o.amount_due_cents) || o.amount_due_cents < 100 || !o.stripe_session_id) {
+        fail(409, 'There is no payment link to renew. Contact Nick.');
+    }
+    if (!o.payment_expires_at || Date.parse(o.payment_expires_at) > Date.now()) {
+        fail(409, 'The current payment link is still active.');
+    }
+    const session = `cs_mock_${randomBytes(6).toString('hex')}`;
+    updateOrder(o, { stripe_session_id: session, payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}`,
+        payment_expires_at: new Date(Date.now() + 86340e3).toISOString() });
+    addEvent(o.id, 'payment', `Payment link renewed: ${money(o.amount_due_cents)}`);
+    email(o.client_email, `${o.code}: your renewed payment link`, o.payment_url);
 }
 
 // Mirrors the database trigger enforce_legal_hold: every order write in the mock goes through this, so a write the
@@ -603,8 +622,12 @@ const handlers = {
         if (body.action === 'confirm-payment') {
             if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) fail(400, 'Invalid payment session.');
             // Like api/track.mjs (which asks Stripe): the matching unpaid session counts, whatever the status. Held orders are billed while served.
-            if (body.session === o.stripe_session_id && !o.paid_at) markPaid(o, body.session);
+            if (body.session === o.stripe_session_id && !o.paid_at && (!o.payment_expires_at || Date.parse(o.payment_expires_at) > Date.now())) markPaid(o, body.session);
             if (body.session === o.stripe_session_id && o.paid_at) auditClient(req, o.id, 'payment_confirmation');
+            return json(clientView(o, { unlocked }));
+        }
+        if (body.action === 'renew-payment-link') {
+            renewMockPayment(o);
             return json(clientView(o, { unlocked }));
         }
         if (body.action === 'respond') {
@@ -830,7 +853,7 @@ const handlers = {
             if (!f?.uploaded) fail(404, 'File not found.');
             return json({ url: `/__mock-file/${f.id}` });
         }
-        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'export', 'dispute-pack', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
+        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'renew-payment-link', 'export', 'dispute-pack', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
         const oid = cleanUuid(body.id, 'Order');
         const o = orders.get(oid);
         if (!o) fail(404, 'Order not found.');
@@ -901,10 +924,16 @@ const handlers = {
             const description = cleanText(body.description, 300, false, 'Description');
             const session = `cs_mock_${randomBytes(6).toString('hex')}`;
             updateOrder(o, { ...(o.legal_hold ? {} : { status: 'awaiting_payment' }), amount_due_cents: cents, stripe_session_id: session,
-                payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}` });
+                payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}`,
+                payment_expires_at: new Date(Date.now() + 86340e3).toISOString() });
             addEvent(o.id, 'payment', `Payment requested: ${money(cents)}`, description);
             auditAdmin(adminEmail, 'payment_link', o.code, money(cents));
             email(o.client_email, `${o.code}: confirmed, ${money(cents)} due to start service`, o.payment_url);
+            return json(adminDetail(o));
+        }
+        if (a === 'renew-payment-link') {
+            renewMockPayment(o);
+            auditAdmin(adminEmail, 'payment_link_renewed', o.code, money(o.amount_due_cents));
             return json(adminDetail(o));
         }
         if (a === 'export') {
@@ -1018,7 +1047,8 @@ export async function handleMockRoute(req) {
     if (route === '__mock-pay') {
         const o = [...orders.values()].find(o => o.track_token === url.searchParams.get('t'));
         if (!o) return new Response('Unknown order', { status: 404 });
-        if (url.searchParams.get('s') !== o.stripe_session_id || o.paid_at) {
+        if (url.searchParams.get('s') !== o.stripe_session_id || o.paid_at ||
+            (o.payment_expires_at && Date.parse(o.payment_expires_at) <= Date.now())) {
             return new Response('This payment link has expired. Open your tracking page for the current link.', { status: 410 });
         }
         const back = `/track.html#t=${encodeURIComponent(o.track_token)}`;
@@ -1111,7 +1141,7 @@ export async function handleMockRoute(req) {
                 <h2 style="margin:0 0 8px;font-size:16px;color:#0d422e">Guided 4-Step End-to-End Walkthrough</h2>
                 <ol style="margin:0;padding-left:20px;font-size:13.5px;line-height:1.7;color:#2c3a33">
                     <li><b>Reply to an “Action required” request:</b> Open <a href="${linkFor('NP-649025')}" style="color:#0d422e;font-weight:600">NP-649025 (Dana Whitfield)</a>, add the apartment number, and click <i>Send to Nick</i>.</li>
-                    <li><b>Complete a simulated payment:</b> Open <a href="${linkFor('NP-403182')}" style="color:#0d422e;font-weight:600">NP-403182 (Pacific Harbor Logistics LLC)</a>, click <i>Pay Securely</i>, and simulate the $175.00 payment.</li>
+                    <li><b>Renew an expired link and pay:</b> Open <a href="${linkFor('NP-403182')}" style="color:#0d422e;font-weight:600">NP-403182 (Pacific Harbor Logistics LLC)</a>, get a fresh link, then simulate the $175.00 payment.</li>
                     <li><b>Work the queue as Nick:</b> Click <i>Open Dashboard as Nick</i> above to see <i>Client replied</i> &amp; <i>Paid</i>, log an attempt, upload Proof of Service, or open <i>Security &amp; App</i> in the top bar.</li>
                     <li><b>Verify Proof of Service &amp; SHA-256 badge:</b> Open <a href="${linkFor('NP-894771')}" style="color:#0d422e;font-weight:600">NP-894771 (Alicia Moreno — Served)</a> to see the Proof of Service PDF and its verified SHA-256 chain-of-custody fingerprint.</li>
                 </ol>
@@ -1131,7 +1161,7 @@ const page = (title, body, width = 420) => new Response(`<!doctype html><meta ch
 function createOrder(fields, createdAt = now()) {
     const o = {
         id: randomUUID(), code: 'NP-' + randomInt(100000, 1000000), track_token: token(), status: 'received',
-        created_at: createdAt, updated_at: createdAt, amount_due_cents: null, payment_url: null, stripe_session_id: null,
+        created_at: createdAt, updated_at: createdAt, amount_due_cents: null, payment_url: null, stripe_session_id: null, payment_expires_at: null,
         paid_at: null, action_note: null, served_at: null, doc_lock: true, ...fields,
     };
     orders.set(o.id, o);
@@ -1179,7 +1209,7 @@ function sampleFile(orderId, kind, filename, at) {
     addEvent(b.id, 'action', 'Action required', b.action_note, true, ago(5));
 
     const c = mk({ code: 'NP-403182', recipient_name: 'Pacific Harbor Logistics LLC', address: '21100 S Figueroa St', city: 'Carson', zip: '90745', doc_type: 'Subpoena (Civil, Criminal, or Federal)',
-        tier: 'sameday', addons: [], estimated_total_cents: 17500, status: 'awaiting_payment', amount_due_cents: 17500, stripe_session_id: 'cs_mock_seed' }, 6);
+        tier: 'sameday', addons: [], estimated_total_cents: 17500, status: 'awaiting_payment', amount_due_cents: 17500, stripe_session_id: 'cs_mock_seed', payment_expires_at: ago(1) }, 6);
     c.payment_url = `/__mock-pay?t=${encodeURIComponent(c.track_token)}&s=cs_mock_seed`;
     addEvent(c.id, 'created', 'Request received', 'Same-Day Rush Service · estimate $175.00', true, ago(6));
     addEvent(c.id, 'payment', 'Payment requested: $175.00', 'Same-Day Rush Service', true, ago(1));

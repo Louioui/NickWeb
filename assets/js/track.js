@@ -65,6 +65,13 @@ function render(o) {
         $('pay-amount').textContent = o.amountDue;
         $('pay-btn').href = safePayUrl;
     }
+    $('renew-payment-panel').classList.toggle('hidden', !o.canRenewPayment);
+    if (o.canRenewPayment) {
+        $('renew-payment-title').textContent = o.paymentExpired ? 'Payment link expired' : 'Check your payment link';
+        $('renew-payment-text').textContent = o.paymentExpired
+            ? `Get a fresh secure Checkout link for the same ${o.amountDue} amount.`
+            : 'If your earlier link has expired, check it here for a fresh one.';
+    }
 
     $('action-panel').classList.toggle('hidden', !o.actionNote);
     if (o.actionNote) $('action-note').textContent = o.actionNote;
@@ -125,6 +132,17 @@ async function load() {
 
 document.addEventListener('click', async (e) => {
     if (e.target.closest('#print-receipt') && order?.receipt) NPS.printReceipt(order.receipt);
+});
+
+$('renew-payment-btn').addEventListener('click', async () => {
+    const button = $('renew-payment-btn'), feedback = $('renew-payment-feedback');
+    button.disabled = true; feedback.classList.remove('hidden'); feedback.textContent = 'Checking the payment link…';
+    try {
+        const updated = await trackCall({ action: 'renew-payment-link' });
+        render(updated);
+        feedback.textContent = 'A fresh payment link is ready. Use Pay Securely above.';
+    } catch (err) { feedback.textContent = err.message || 'Could not renew the link. Try again shortly.'; }
+    finally { button.disabled = false; }
 });
 
 document.addEventListener('click', async (e) => {

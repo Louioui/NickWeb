@@ -35,6 +35,22 @@ assert.equal((await call({action:'verify-code',email:'fresh@example.com',code:'0
 const a=await signup('paralegal@example.com');
 const all=await (await call({action:'list'},a)).json();
 check('verified sample email sees its five requests',()=>assert.equal(all.orders.length,5));
+const expiredOrder = all.orders.find(o => o.code === 'NP-403182');
+const expiredToken = new URL(expiredOrder.trackUrl, 'http://localhost').hash.slice(3);
+const expiredView = await (await call({ action: 'view', t: expiredToken }, '', 'track')).json();
+check('expired payment link is withheld from tracking view', () => {
+    assert.equal(expiredView.paymentExpired, true);
+    assert.equal(expiredView.payUrl, null);
+    assert.equal(expiredView.canRenewPayment, true);
+});
+const renewedView = await (await call({ action: 'renew-payment-link', t: expiredToken }, '', 'track')).json();
+check('client renews expired mock link for the same amount', () => {
+    assert.equal(renewedView.amountDue, '$175.00');
+    assert.match(renewedView.payUrl, /^\/__mock-pay/);
+    assert.equal(renewedView.paymentExpired, false);
+});
+assert.equal((await call({ action: 'renew-payment-link', t: expiredToken }, '', 'track')).status, 409);
+passed++; console.log('PASS active link cannot be renewed again');
 const b=await signup('unrelated@example.com');
 const empty=await (await call({action:'list',email:'paralegal@example.com',userId:'another-client'},b)).json();
 check('a different client cannot override ownership using body fields',()=>assert.equal(empty.orders.length,0));

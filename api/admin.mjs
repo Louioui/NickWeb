@@ -3,8 +3,8 @@ import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
          sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
-import { STATUSES, TIERS, ADDONS, money, receiptForOrder, sendEmail, sendSecurityAlert, markPaid, orderSeal, attemptDetail } from './_lib/orders.mjs';
-import { createCheckout, stripeClient } from './_lib/stripe.mjs';
+import { STATUSES, TIERS, ADDONS, money, receiptForOrder, sendEmail, sendSecurityAlert, markPaid, renewExpiredPaymentLink, orderSeal, attemptDetail } from './_lib/orders.mjs';
+import { createCheckout, checkoutExpiresAt, stripeClient } from './_lib/stripe.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 import { zipEvidencePack } from './_lib/evidence-pack.mjs';
 import { printingSummary } from './_lib/pdf-pages.mjs';
@@ -42,6 +42,7 @@ export const POST = handle(async (request) => {
     if (a === 'toggle-doc-lock') return toggleDocLock(request, body, admin);
     if (a === 'unlock-legal-hold') return unlockLegalHold(request, body, admin);
     if (a === 'payment-link') return paymentLink(request, body, admin);
+    if (a === 'renew-payment-link') return renewPaymentLink(request, body, admin);
     if (a === 'proof-upload') return proofUpload(body);
     if (a === 'proof-finish') return proofFinish(request, body);
     if (a === 'file-url') return fileUrl(request, body, admin);
@@ -635,8 +636,12 @@ async function paymentLink(request, body, admin) {
         }
     }
     const session = await createCheckout(order, cents, description, origin);
+    let expiresAt;
+    try { expiresAt = checkoutExpiresAt(session); }
+    catch (err) { await stripeClient().checkout.sessions.expire(session.id).catch(() => {}); throw err; }
     // A served order (under legal hold) keeps its "Served" status while it's billed; the Pay button still shows.
     let save = db().from('orders').update({ amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id,
+        payment_expires_at: expiresAt,
         ...(order.legal_hold ? {} : { status: 'awaiting_payment' }) }).eq('id', order.id).is('paid_at', null);
     save = order.stripe_session_id ? save.eq('stripe_session_id', order.stripe_session_id) : save.is('stripe_session_id', null);
     const { data: saved, error: linkErr } = await save.select('id').maybeSingle();
@@ -653,6 +658,14 @@ async function paymentLink(request, body, admin) {
         lines: [`Total due: ${money(cents)}${description ? ` (${description})` : ''}.`, 'Payment must be sent to effectuate service. Attempts begin once payment is received.', 'Pay securely by card or Apple Pay. The link works for 24 hours; ask Nick for a new one if it expires.'],
         button: { label: `Pay ${money(cents)}`, url: session.url },
     });
+    return json(await detail(order.id));
+}
+
+async function renewPaymentLink(request, body, admin) {
+    await rateLimit(`admin-paylink:${sha256(admin)}`, 20, 900);
+    const order = await getOrder(body.id);
+    await renewExpiredPaymentLink(order, siteOrigin(request));
+    await auditAdmin(request, admin, 'payment_link_renewed', order.code, money(order.amount_due_cents));
     return json(await detail(order.id));
 }
 

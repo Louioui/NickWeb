@@ -457,9 +457,10 @@ function actionForm(o) {
     if (actionTab === 'payment') {
         if (o.paid_at) return `<p class="result-box result-ok text-sm">Paid ${NPS.money(o.paid_amount_cents ?? o.amount_due_cents)} on ${esc(NPS.fmtDate(o.paid_at))}.</p>`;
         const printing = current.printing;
+        const expired = o.stripe_session_id && (!o.payment_expires_at || Date.parse(o.payment_expires_at) <= Date.now());
         return `
         <div class="result-box result-info text-sm"><strong>PDF printing:</strong> ${printing.complete ? `${printing.pages} page${printing.pages === 1 ? '' : 's'} across ${printing.pdfs} document PDF${printing.pdfs === 1 ? '' : 's'} · ${NPS.money(printing.feeCents)} estimated fee (first 100 pages free; $0.15 per additional page)` : `${printing.countedPdfs} of ${printing.pdfs} document PDFs counted. Review older or unreadable PDFs before quoting a printing fee.`}</div>
-        ${o.payment_url && o.status === 'awaiting_payment' ? `<p class="result-box result-warn text-sm">A payment link for ${NPS.money(o.amount_due_cents)} was already sent. Sending a new one replaces it.</p>` : ''}
+        ${expired && o.amount_due_cents ? `<div class="result-box result-warn text-sm"><p>${o.payment_expires_at ? 'The payment link has expired.' : 'Check whether this payment link has expired.'} Amount: ${NPS.money(o.amount_due_cents)}.</p><button type="button" class="btn btn-outline btn-sm mt-2" data-click="renewPaymentLink">Check and renew for same amount</button></div>` : o.payment_url && o.status === 'awaiting_payment' ? `<p class="result-box result-warn text-sm">A payment link for ${NPS.money(o.amount_due_cents)} was already sent. Sending a new one replaces it.</p>` : ''}
         <div class="grid sm:grid-cols-3 gap-4">
             <div><label for="f-amount" class="field-label">Amount ($)</label><input id="f-amount" type="number" min="1" step="0.01" class="field" value="${((o.amount_due_cents ?? o.estimated_total_cents) / 100).toFixed(2)}"></div>
             <div class="sm:col-span-2"><label for="f-desc" class="field-label">What it covers (shown to client)</label><input id="f-desc" class="field" value="${esc(o.tier_name + (o.addon_names.length ? ' + ' + o.addon_names.join(', ') : ''))}"></div>
@@ -591,6 +592,13 @@ async function exportJob() {
     const a = Object.assign(document.createElement('a'), { href: url, download: `${current.order.code}-data.json` });
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+async function renewPaymentLink(_arg, button) {
+    if (!current?.order) return;
+    button.disabled = true;
+    try { current = await api('renew-payment-link', { id: current.order.id }); renderDetail(); }
+    catch (err) { $('action-error').textContent = err.message || 'Could not renew the link.'; $('action-error').classList.remove('hidden'); }
+    finally { button.disabled = false; }
 }
 async function downloadDisputePack(_arg, button) {
     if (!current) return;
@@ -953,7 +961,7 @@ async function copyAddress() {
 // Buttons say what they do with data-click (and data-arg) instead of inline onclick, so the page's Content Security
 // Policy can refuse inline scripts. Only the functions listed here can be triggered this way.
 const CLICK_ACTIONS = {
-    backToList, closeSecurityModal, refreshJobs, exportJob, downloadDisputePack, showEmailStep, rotateLink, toggleDocLockJob, printRecord, printReceipt, copyAddress,
+    backToList, closeSecurityModal, refreshJobs, exportJob, downloadDisputePack, renewPaymentLink, showEmailStep, rotateLink, toggleDocLockJob, printRecord, printReceipt, copyAddress,
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes, sendStepUpCode,
     dismissSecuritySetup, openRecoverySetup,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
