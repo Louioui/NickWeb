@@ -364,7 +364,11 @@ function actionForm(o) {
         const seal = o.integrity_seal || {};
         const stepUp = totpEnabled ? `
             <div><label for="f-stepup" class="field-label">Code from your authenticator app</label>
-            <input id="f-stepup" inputmode="text" maxlength="9" spellcheck="false" autocomplete="one-time-code" class="field font-mono tracking-widest max-w-[12rem] uppercase" placeholder="000000"><p class="text-xs text-muted mt-1">Or one of your recovery codes (XXXX-XXXX).</p></div>` : '';
+            <input id="f-stepup" inputmode="text" maxlength="9" spellcheck="false" autocomplete="one-time-code" class="field font-mono tracking-widest max-w-[12rem] uppercase" placeholder="000000"><p class="text-xs text-muted mt-1">Or one of your recovery codes (XXXX-XXXX).</p></div>` : `
+            <div><label for="f-stepup" class="field-label">Step-up code from your email</label>
+            <div class="flex flex-wrap items-center gap-2"><input id="f-stepup" inputmode="numeric" maxlength="9" spellcheck="false" autocomplete="one-time-code" class="field font-mono tracking-widest max-w-[12rem]" placeholder="12345678">
+            <button type="button" class="btn btn-outline btn-sm" data-click="emailStepUp" data-arg="f-stepup">Email me a code</button></div>
+            <p class="text-xs text-muted mt-1">Needed to unlock legal hold or delete a request. Turn on two-step sign-in to use your authenticator app instead.</p></div>`;
         return `
         <div class="space-y-3 pb-5 rule-b">
             <p class="text-sm font-semibold text-primary"><i class="fa-solid fa-shield-halved text-bronze mr-1"></i> Protection</p>
@@ -760,8 +764,29 @@ function updateSecurityState(enabled) {
     $('totp-status-badge').className = `status-pill ${totpEnabled ? 'status-done' : 'status-muted'}`;
     $('totp-setup-label').textContent = totpEnabled ? 'Move to a New Phone' : 'Turn On Two-Step Sign-In';
     $('totp-disable-btn').classList.toggle('hidden', !totpEnabled);
-    $('totp-current-wrap').classList.toggle('hidden', !totpEnabled);
+    $('totp-current-wrap').classList.remove('hidden');
+    $('totp-current-label').textContent = totpEnabled ? 'Current code from your authenticator app' : 'Step-up code from your email';
+    $('totp-current-input').placeholder = totpEnabled ? '000000 or XXXX-XXXX' : '12345678';
+    $('totp-current-help').textContent = totpEnabled
+        ? 'Needed to change your phone, turn two-step off, or create new recovery codes. Lost your phone? Type one of your recovery codes (XXXX-XXXX) instead.'
+        : 'Needed to turn on two-step sign-in or create recovery codes. Tap "Email me a code", then type the 8-digit code here.';
+    $('stepup-email-btn').classList.toggle('hidden', totpEnabled);
 }
+// F-09: with two-step off, sensitive actions are confirmed with an 8-digit code emailed to Nick a moment ago.
+async function emailStepUp(targetId, btn) {
+    if (btn) btn.disabled = true;
+    try {
+        const { minutes } = await api('stepup-send-code');
+        const msg = `Step-up code sent to your email. It works for ${minutes} minutes.`;
+        if (targetId === 'f-stepup') { const e = $('action-error'); if (e) { e.textContent = msg; e.className = 'result-box result-ok text-sm'; } }
+        else securityMessage(msg);
+        $(targetId)?.focus();
+    } catch (err) {
+        if (targetId === 'f-stepup') { const e = $('action-error'); if (e) { e.textContent = err.message; e.className = 'result-box result-err'; } }
+        else securityMessage(err.message, 'err');
+    } finally { if (btn) btn.disabled = false; }
+}
+
 async function startTotpSetup() {
     $('security-modal-msg').classList.add('hidden');
     try {
@@ -847,6 +872,7 @@ const CLICK_ACTIONS = {
     backToList, closeSecurityModal, refreshJobs, exportJob, showEmailStep, rotateLink, toggleDocLockJob, printRecord,
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
+    emailStepUp: (arg, el) => emailStepUp(arg, el),
     setLegalHold: (arg) => setLegalHold(arg === 'true'),
     setActionTab: (arg) => setActionTab(arg),
     setFilter: (arg) => setFilter(arg),

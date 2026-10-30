@@ -24,6 +24,7 @@ export const POST = handle(async (request) => {
     if (a === 'logout-all') return logoutAll(request, admin);
     if (a === 'sessions') return sessions(request, admin);
     if (a === 'revoke-session') return revokeSession(request, body, admin);
+    if (a === 'stepup-send-code') return sendStepUpCode(admin);
     if (a === 'passkeys') return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
     if (a === 'passkey-register-options') return passkeyRegisterOptions(request, body, admin);
     if (a === 'passkey-register-verify') return passkeyRegisterVerify(request, body, admin);
@@ -111,11 +112,20 @@ async function checkTotp(addr, secretEnc, code, bucket) {
 }
 
 // Step-up check before sensitive actions. With an authenticator on, a fresh code is required; returns whether one was checked.
-// A fresh authenticator code, or (phone lost) one single-use recovery code, confirms a sensitive action.
+// Sensitive actions need a fresh second check. With the authenticator on: a current authenticator code, or (phone lost)
+// one single-use recovery code. With it off: an 8-digit step-up code emailed to Nick a moment ago (stepup-send-code),
+// so a stolen session cookie alone can never delete records, mint recovery codes or enrol its own authenticator.
 async function requireStepUp(admin, code) {
     const row = await getAdminTotp(admin);
-    if (!row?.enabled) return false;
     const typed = String(code || '').trim().toUpperCase();
+    if (!row?.enabled) {
+        const digits = typed.replace(/[\s-]+/g, '');
+        if (!/^\d{8}$/.test(digits)) throw new HttpError(403, 'Email yourself a step-up code, then enter the 8-digit code to continue.');
+        const { data, error } = await db().rpc('use_admin_code', { p_email: admin, p_hash: stepUpHash(admin, digits) });
+        if (error) throw error;
+        if (!data) throw new HttpError(403, 'That step-up code is wrong or expired. Email yourself a new one.');
+        return true;
+    }
     const recovery = typed.replace(/[^A-Z0-9]/g, '');
     if (!/^\d{6}$/.test(typed.replace(/\s+/g, '')) && recovery.length === 8) {
         await rateLimit(`admin-stepup:${sha256(admin)}`, 10, 900);
@@ -128,6 +138,26 @@ async function requireStepUp(admin, code) {
         throw new HttpError(403, 'Enter the current 6-digit code from your authenticator app, or one of your recovery codes.');
     }
     return true;
+}
+// Step-up codes share the login-code table and its guess limits, but hash differently, so one can't be used as the other.
+const stepUpHash = (addr, digits) => sha256(`stepup:${addr}:${digits}`);
+const STEPUP_MINUTES = 5;
+async function sendStepUpCode(admin) {
+    await rateLimit(`admin-stepup-send:${sha256(admin)}`, 3, 900);
+    if ((await getAdminTotp(admin))?.enabled) throw new HttpError(400, 'Use the code from your authenticator app instead.');
+    const code = String(randomInt(0, 100000000)).padStart(8, '0');
+    const { error } = await db().from('admin_codes').insert({ email: admin, code_hash: stepUpHash(admin, code),
+        expires_at: new Date(Date.now() + STEPUP_MINUTES * 60e3).toISOString() });
+    if (error) throw error;
+    await sendEmail({
+        to: admin,
+        subject: `Your dashboard step-up code: ${code}`,
+        heading: `Your step-up code is ${code}`,
+        lines: [`Enter it to confirm the change you just started on your dashboard. It expires in ${STEPUP_MINUTES} minutes.`,
+            "If you didn't start a change, someone may be signed in to your dashboard: use Log Out All Devices now."],
+    });
+    if (!IS_PROD && !process.env.RESEND_API_KEY) console.log(`[dev] admin step-up code for ${admin}: ${code}`);
+    return json({ ok: true, minutes: STEPUP_MINUTES });
 }
 
 const recoveryHash = (addr, code) => keyedHash('admin-recovery-v1', `${addr}:${code}`);
@@ -374,7 +404,7 @@ async function generateRecoveryCodes(request, body, admin) {
 async function totpSetup(request, body, admin) {
     await rateLimit(`admin-totp:${sha256(admin)}`, 6, 900);
     const row = await getAdminTotp(admin);
-    if (row?.enabled) await requireStepUp(admin, body?.totp);
+    await requireStepUp(admin, body?.totp);   // also when turning it on, so a stolen session can't enrol its own phone
     const secret = generateTotpSecret(20);
     const enc = encryptSecret(secret);
     const { error } = row
@@ -559,10 +589,7 @@ async function unlockLegalHold(request, body, admin) {
     const order = await getOrder(body.id);
     const hold = !!body.hold;
     if (!hold) {
-        const usedTotp = await requireStepUp(admin, body.totp);
-        if (!usedTotp && String(body.confirm || '').trim().toUpperCase() !== order.code) {
-            throw new HttpError(400, `Type ${order.code} to confirm unlocking legal hold.`);
-        }
+        await requireStepUp(admin, body.totp);
     }
     const { error } = await db().from('orders').update({ legal_hold: hold }).eq('id', order.id);
     if (error) throw error;

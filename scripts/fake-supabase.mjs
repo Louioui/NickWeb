@@ -12,6 +12,7 @@ export function createFakeSupabase() {
         failDownload: new Set(),     // paths whose download returns an error
         failExists: new Set(),       // paths whose info() fails with an auth error (storage unusable, not "missing")
         noBucket: new Set(),         // paths whose info() fails with "Bucket not found"
+        failUpdate: new Set(),       // paths whose update() (store a cleaned photo back) fails
         rateHits: new Map(),
         otp: new Map(),              // email -> code accepted by auth.verifyOtp
         linkHashes: new Map(),       // token hash from admin.generateLink -> email (single use)
@@ -134,6 +135,10 @@ export function createFakeSupabase() {
             if (state.failDownload.has(p) || !state.storage.has(p)) return { data: null, error: { message: 'download failed' } };
             return { data: new Blob([state.storage.get(p)]), error: null };
         },
+        update: async (p, body) => {
+            if (state.failUpdate?.has(p)) return { data: null, error: { message: 'write failed', status: 500 } };
+            state.storage.set(p, new Uint8Array(body)); return { data: { path: p }, error: null };
+        },
         remove: async (paths) => { paths.forEach(p => state.storage.delete(p)); return { data: [], error: null }; },
         createSignedUploadUrl: async (p) => ({ data: { signedUrl: `https://storage.test/upload/${p}` }, error: null }),
         createSignedUrl: async (p) => ({ data: { signedUrl: `https://storage.test/download/${p}` }, error: null }),
@@ -199,7 +204,7 @@ export function createFakeSupabase() {
     client.__state = state;
     client.__reset = () => {
         state.tables = {};
-        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
+        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'failUpdate', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
         state.revoked = [];
     };
     client.__addUser = (email) => {

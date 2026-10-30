@@ -339,10 +339,28 @@ function useMockTotp(adminEmail, secret, code) {
     row.last_used_step = step;
     return true;
 }
+// Same rules as requireStepUp in api/admin.mjs. With the authenticator off, the demo's emailed step-up code is always
+// 87654321 (after "Email me a code"), single use, 5 minutes. With it on: a current app code or an unused recovery code.
+const mockTrustedDevices = new Map();   // device token -> { email, expires }
+const mockStepUpCodes = new Map();   // email -> expiry time
 function requireMockStepUp(adminEmail, totpInput) {
     const row = adminTotpSecrets.get(adminEmail);
-    if (!row?.enabled) return false;
-    if (!useMockTotp(adminEmail, row.secret, totpInput)) fail(403, 'Enter the current 6-digit code from your authenticator app.');
+    const typed = String(totpInput || '').trim().toUpperCase();
+    if (!row?.enabled) {
+        const digits = typed.replace(/[\s-]+/g, '');
+        if (!/^\d{8}$/.test(digits)) fail(403, 'Email yourself a step-up code, then enter the 8-digit code to continue.');
+        const until = mockStepUpCodes.get(adminEmail);
+        if (digits !== '87654321' || !until || until < Date.now()) fail(403, 'That step-up code is wrong or expired. Email yourself a new one.');
+        mockStepUpCodes.delete(adminEmail);
+        return true;
+    }
+    const recovery = typed.replace(/[^A-Z0-9]/g, '');
+    if (!/^\d{6}$/.test(typed) && recovery.length === 8) {
+        const set = adminRecoveryCodes.get(adminEmail);
+        if (!set?.delete(recovery)) fail(403, 'That recovery code is wrong or already used.');
+        return true;
+    }
+    if (!useMockTotp(adminEmail, row.secret, typed)) fail(403, 'Enter the current 6-digit code from your authenticator app, or one of your recovery codes.');
     return true;
 }
 
@@ -365,7 +383,11 @@ const handlers = {
             // Same order as api/client.mjs: ask for the PIN first, check the email code, and only then the PIN.
             const sec = clientSecurity.get(addr);
             const pin = String(body.pin || '').trim();
-            if (sec?.pin_hash && !pin) return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
+            // Trusted devices (30 days), as in api/_lib/clients.mjs: a remembered device skips the PIN, never the code.
+            const deviceTok = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_device=([A-Za-z0-9_-]{40,64})/)?.[1];
+            const trustedRow = deviceTok && mockTrustedDevices.get(deviceTok);
+            const trusted = !!trustedRow && trustedRow.email === addr && trustedRow.expires > Date.now();
+            if (sec?.pin_hash && !pin && !trusted) return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
             if (sec?.pin_hash && sec.locked_until > Date.now()) fail(429, 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.');
             const pending = clientCodes.get(addr);
             if (!pending || pending.expires < Date.now() || pending.attempts >= 5) fail(401, 'That code is invalid or expired. Request another email.');
@@ -374,7 +396,7 @@ const handlers = {
                 if (pending.attempts >= 5) clientCodes.delete(addr);
                 fail(401, 'That code is invalid or expired. Request another email.');
             }
-            if (sec?.pin_hash) {
+            if (sec?.pin_hash && !trusted) {
                 if (!verifyPin(pin, sec.pin_hash)) {
                     if (sec.locked_until && sec.locked_until <= Date.now()) { sec.failed_tries = 0; sec.locked_until = 0; }
                     sec.failed_tries = (sec.failed_tries || 0) + 1;
@@ -394,7 +416,14 @@ const handlers = {
             clientCodes.delete(addr);
             const value = token();
             clientSessions.set(value, addr);
-            return json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
+            const res = json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
+            if (body.remember !== false) {
+                const dev = randomBytes(32).toString('base64url');
+                mockTrustedDevices.set(dev, { email: addr, expires: Date.now() + 30 * 86400e3 });
+                res.headers.append('set-cookie', `nps_device=${dev}; Path=/api/client; HttpOnly; SameSite=Strict; Max-Age=${30 * 86400}`);
+            }
+            if (!trusted) email(addr, 'Security alert: New sign-in to your account');
+            return res;
         }
         const value = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_client=([^;]+)/)?.[1];
         const verifiedEmail = value && /^[A-Za-z0-9_-]{16,160}$/.test(value) ? clientSessions.get(value) : null;
@@ -404,8 +433,11 @@ const handlers = {
                 for (const [k, em] of [...clientSessions.entries()]) {
                     if (em === verifiedEmail) clientSessions.delete(k);
                 }
+                for (const [k, d] of [...mockTrustedDevices.entries()]) if (d.email === verifiedEmail) mockTrustedDevices.delete(k);   // as forgetDevices
             }
-            return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' });
+            const res = json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' });
+            res.headers.append('set-cookie', 'nps_device=; Path=/api/client; HttpOnly; SameSite=Strict; Max-Age=0');
+            return res;
         }
         if (!verifiedEmail || !clients.has(verifiedEmail)) fail(401, 'Please sign in to see your requests.');
         const baseProfile = clients.get(verifiedEmail);
@@ -725,10 +757,17 @@ const handlers = {
             auditAdmin(adminEmail, 'session_revoked');
             return mockSessionList();
         }
+        if (a === 'stepup-send-code') {
+            if (adminTotpSecrets.get(adminEmail)?.enabled) fail(400, 'Use the code from your authenticator app instead.');
+            mockStepUpCodes.set(adminEmail, Date.now() + 5 * 60e3);
+            console.log(`[mock] dashboard step-up code for ${adminEmail}: 87654321`);
+            email(adminEmail, 'Your dashboard step-up code: 87654321');
+            return json({ ok: true, minutes: 5 });
+        }
         if (a === 'totp-setup') {
-            // While one is on, changing it needs the current code, and the new secret waits as pending until confirmed.
+            // Always needs a step-up (an emailed code while it's off), and a new secret waits as pending until confirmed.
             const row = adminTotpSecrets.get(adminEmail);
-            if (row?.enabled) requireMockStepUp(adminEmail, body?.totp);
+            requireMockStepUp(adminEmail, body?.totp);
             const secret = generateTotpSecret(20);
             if (row?.enabled) row.pending = secret;
             else adminTotpSecrets.set(adminEmail, { secret, enabled: false, last_used_step: row?.last_used_step || 0 });
@@ -803,12 +842,9 @@ const handlers = {
             return json(adminDetail(o));
         }
         if (a === 'unlock-legal-hold') {
-            // Same as api/admin.mjs: unlocking needs a fresh authenticator code, or the typed reference without one.
+            // Same as api/admin.mjs: unlocking always needs a step-up (app code, recovery code, or emailed code).
             const hold = !!body.hold;
-            if (!hold) {
-                const usedTotp = requireMockStepUp(adminEmail, body.totp);
-                if (!usedTotp && String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm unlocking legal hold.`);
-            }
+            if (!hold) requireMockStepUp(adminEmail, body.totp);
             o.legal_hold = hold;
             addEvent(o.id, 'note', hold ? 'Legal hold turned on' : 'Legal hold unlocked by Nick', null, false);
             auditAdmin(adminEmail, hold ? 'legal_hold_on' : 'legal_hold_unlocked', o.code);

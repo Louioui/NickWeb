@@ -542,5 +542,90 @@ await check('R2 an authenticator set up under a different APP_SECRET gives a cle
     expect(res.status === 409 && /different copy of this site/.test(body.error), `${res.status} ${JSON.stringify(body)}`);
 });
 
+// --- F-10: the whole file is scanned, wherever the payload sits ---
+const bigPdf = (middle) => {
+    const pad = 'stream\n' + 'A'.repeat(1_500_000) + '\nendstream\n';
+    return new TextEncoder().encode(`%PDF-1.7\n${pad}${middle}\n${pad}%%EOF`);
+};
+await check('F-10 PDF actions buried in the middle of a 3 MB file are refused', async () => {
+    for (const bad of ['/Launch', '/EmbeddedFiles', '/EmbeddedFile', '/RichMedia', '/SubmitForm', '/ImportData', '/GoToE', '/J#61vaScript', '/#4A#53']) {
+        expect(core.verifyFileMagic(bigPdf(`<< /S ${bad} >>`), 'a.pdf') === false, `${bad} accepted`);
+    }
+    expect(core.verifyFileMagic(bigPdf('<< /S /URI /URI (https://example.com) >> /OpenAction << /S /GoTo >>'), 'a.pdf') === true, 'ordinary link/open action refused');
+});
+await check('F-10 hidden HTML in the middle of an image (not only its start or end) is refused', async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
+    const filler = new Uint8Array(1_000_000);
+    const evil = new TextEncoder().encode('<script>alert(1)</script>');
+    expect(core.verifyFileMagic(new Uint8Array([...png, ...filler, ...evil, ...filler]), 'a.png') === false, 'mid-file script accepted');
+});
+
+// --- F-11: photos are cleaned on the server too, for uploads that skipped the site's page ---
+const GPS = 'GPS 37.9577N 121.2908W';
+const jpegSeg = (m, txt) => { const d = new TextEncoder().encode(txt); return [0xFF, m, ((d.length + 2) >> 8) & 255, (d.length + 2) & 255, ...d]; };
+const gpsJpeg = new Uint8Array([0xFF, 0xD8, ...jpegSeg(0xE0, 'JFIF\0'), ...jpegSeg(0xE1, `Exif\0\0${GPS}`), 0xFF, 0xDA, 0, 4, 1, 2, 3, 4, 0xFF, 0xD9]);
+const asText = (u8) => Buffer.from(u8).toString('latin1');
+await check('F-11 a photo uploaded straight to storage loses its GPS before it is confirmed', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'door.jpg', content_type: 'image/jpeg', storage_path: `orders/${o.id}/client/x-door.jpg` });
+    db.__state.storage.set(f.storage_path, gpsJpeg);
+    const r = await core.confirmUploads(o.id, [f.id]);
+    const stored = db.__state.storage.get(f.storage_path);
+    expect(r.files.length === 1 && fileRow(f.id).uploaded, 'photo not confirmed');
+    expect(!asText(stored).includes('GPS') && asText(stored).includes('JFIF'), 'GPS still in the stored photo');
+    expect(fileRow(f.id).sha256 === core.sha256(Buffer.from(stored)), 'fingerprint is not of the cleaned file');
+});
+await check('F-11 if the cleaned photo cannot be stored back, it is not confirmed (retried later)', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'door.jpg', content_type: 'image/jpeg', storage_path: `orders/${o.id}/client/y-door.jpg` });
+    db.__state.storage.set(f.storage_path, gpsJpeg); db.__state.failUpdate.add(f.storage_path);
+    const r = await core.confirmUploads(o.id, [f.id]);
+    expect(r.stillChecking === 1 && !fileRow(f.id).uploaded, 'confirmed with GPS still inside');
+});
+
+// --- F-09: with two-step off, sensitive actions need an emailed step-up code, not just the session cookie ---
+const adminAct = (body, cookie) => adminPOST(post('/api/admin', body, { cookie }));
+async function emailedStepUp(cookie) {
+    emails.length = 0;
+    const res = await adminAct({ action: 'stepup-send-code' }, cookie);
+    expect(res.status === 200, `stepup-send-code ${res.status}`);
+    return /step-up code: (\d{8})/.exec(emails.at(-1)?.subject || '')?.[1];
+}
+await check('F-09 with two-step off, minting recovery codes needs an emailed step-up code', async () => {
+    reset(); const cookie = adminCookie();
+    const bare = await adminAct({ action: 'generate-recovery-codes' }, cookie);
+    expect(bare.status === 403, `session alone was enough (${bare.status})`);
+    const code = await emailedStepUp(cookie);
+    expect(code, 'no step-up code emailed');
+    const ok = await adminAct({ action: 'generate-recovery-codes', totp: code }, cookie);
+    expect(ok.status === 200, `right code refused (${ok.status})`);
+    const again = await adminAct({ action: 'generate-recovery-codes', totp: code }, cookie);
+    expect(again.status === 403, `step-up code worked twice (${again.status})`);
+});
+await check('F-09 with two-step off, a stolen session cannot enrol its own authenticator', async () => {
+    reset(); const cookie = adminCookie();
+    const res = await adminAct({ action: 'totp-setup' }, cookie);
+    expect(res.status === 403 && !(tables().admin_totp || []).length, `authenticator setup started without a step-up (${res.status})`);
+    const code = await emailedStepUp(cookie);
+    expect((await adminAct({ action: 'totp-setup', totp: code }, cookie)).status === 200, 'setup refused with a valid step-up');
+});
+await check('F-09 with two-step off, unlocking legal hold needs the step-up code (typing the reference is not enough)', async () => {
+    reset(); const cookie = adminCookie(); const o = seedOrder({ legal_hold: true, status: 'served' });
+    const res = await adminAct({ action: 'unlock-legal-hold', id: o.id, hold: false, confirm: o.code }, cookie);
+    expect(res.status === 403 && tables().orders[0].legal_hold === true, `hold unlocked without step-up (${res.status})`);
+});
+await check('F-09 a step-up code is not a login code, and a login code is not a step-up code', async () => {
+    reset(); const cookie = adminCookie();
+    const code = await emailedStepUp(cookie);
+    const login = await adminPOST(post('/api/admin', { action: 'verify-code', email: ADMIN, code }));
+    expect(login.status === 401, `step-up code signed in (${login.status})`);
+    reset(); const c2 = adminCookie(); addAdminCode('12345678');
+    const use = await adminAct({ action: 'generate-recovery-codes', totp: '12345678' }, c2);
+    expect(use.status === 403, `login code accepted as step-up (${use.status})`);
+});
+await check('F-09 with the authenticator on, an emailed step-up code cannot be requested', async () => {
+    reset(); seedAdmin2fa();
+    const res = await adminAct({ action: 'stepup-send-code' }, adminCookie());
+    expect(res.status === 400, `step-up email sent while authenticator is on (${res.status})`);
+});
+
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);
 if (failures.length) process.exit(1);
