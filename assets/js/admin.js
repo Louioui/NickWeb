@@ -186,6 +186,8 @@ function renderList() {
     $('list-count').textContent = `${shown.length} ${shown.length === 1 ? 'request' : 'requests'}`;
     $('job-list').innerHTML = shown.length ? shown.map(o => {
         const days = daysUntil(o.deadline);
+        const contactDays = Math.max(0, Math.floor((Date.now() - new Date(o.last_contact_at || o.created_at).getTime()) / 864e5));
+        const contact = isOpen(o) ? `<span class="text-xs ${contactDays >= 3 ? 'text-[#7a1f1c] font-semibold' : 'text-muted'}">${contactDays}d since last contact</span>` : '';
         const due = o.deadline && isOpen(o)
             ? `<span class="${days <= 3 ? 'text-[#7a1f1c] font-semibold' : 'text-muted'}"><i class="fa-regular fa-calendar mr-1"></i>${days < 0 ? 'Past due' : days === 0 ? 'Due today' : `Due in ${days}d`}</span>` : '';
         return `
@@ -195,7 +197,7 @@ function renderList() {
                 ? '<span class="status-pill status-alert"><i class="fa-solid fa-reply mr-1"></i>Client replied</span>'
                 : `<span class="status-pill ${PILL[o.status]}">${esc(statuses[o.status]?.label || o.status)}</span>`}
             <span class="text-xs text-muted truncate">${esc(o.code)} · ${esc(o.city || '')} · ${esc(o.client_firm || o.client_name)}</span>
-            <span class="text-xs text-right">${due}</span>
+            <span class="text-xs text-right">${due}${contact ? `<span class="block mt-1">${contact}</span>` : ''}</span>
         </button>`;
     }).join('') : `<div class="p-8 text-center text-sm text-muted"><p class="font-semibold text-primary mb-2">${q ? 'No matching requests' : 'You’re all caught up here'}</p><p>${q ? 'Try a name, reference number, email, or city.' : 'Requests in this category will appear here.'}</p><button type="button" class="btn btn-outline btn-sm mt-4" data-click="setFilter" data-arg="all">Show all requests</button></div>`;
 }

@@ -440,7 +440,15 @@ async function list() {
         .select('id, code, status, created_at, updated_at, client_name, client_firm, client_email, recipient_name, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
         .order('created_at', { ascending: false }).limit(500);
     if (error) throw error;
-    return json({ orders: await withClientReplied(data), statuses: STATUSES, tiers: TIERS });
+    const orders = await withClientReplied(data);
+    const activeIds = orders.filter(o => !['served', 'closed', 'cancelled'].includes(o.status)).map(o => o.id);
+    if (activeIds.length) {
+        const { data: contacts, error: contactError } = await db().rpc('list_order_contact_dates', { p_order_ids: activeIds });
+        if (contactError) throw contactError;
+        const byId = new Map((contacts || []).map(c => [c.order_id, c.last_contact_at]));
+        for (const order of orders) if (byId.has(order.id)) order.last_contact_at = byId.get(order.id);
+    }
+    return json({ orders, statuses: STATUSES, tiers: TIERS });
 }
 
 // A job "has a client reply" when the client's answer is newer than anything Nick has done on it since.

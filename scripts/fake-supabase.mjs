@@ -105,6 +105,13 @@ export function createFakeSupabase() {
             return ++r.hits;
         },
         verify_order_chain: ({ p_order }) => [{ ok: true, head: 'f'.repeat(64), entries: rows('order_events').filter(e => e.order_id === p_order).length }],
+        list_order_contact_dates: ({ p_order_ids }) => p_order_ids.map(id => {
+            const order = rows('orders').find(o => o.id === id);
+            if (!order) return null;
+            const latest = rows('order_events').filter(e => e.order_id === id && ['action', 'action_response'].includes(e.kind))
+                .map(e => e.created_at).sort().at(-1);
+            return { order_id: id, last_contact_at: latest || order.created_at };
+        }).filter(Boolean),
         admin_codes_last_hour: () => 0,
         use_admin_code: ({ p_email, p_hash }) => {
             const r = rows('admin_codes').filter(c => c.email === p_email && (c.purpose || 'login') === 'login' && !c.used && c.expires_at > new Date().toISOString())

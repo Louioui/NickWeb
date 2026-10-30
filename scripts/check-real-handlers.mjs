@@ -326,6 +326,20 @@ const adminCookie = () => {
     (tables().admin_sessions ||= []).push({ token_hash: core.sha256(token), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString() });
     return `nps_admin=${token}`;
 };
+await check('dashboard last-contact date follows the latest client exchange', async () => {
+    reset();
+    const created = new Date(Date.now() - 5 * 864e5).toISOString();
+    const question = new Date(Date.now() - 2 * 864e5).toISOString();
+    const reply = new Date(Date.now() - 864e5).toISOString();
+    const o = seedOrder({ created_at: created, status: 'attempting' });
+    (tables().order_events ||= []).push(
+        { id: randomUUID(), order_id: o.id, kind: 'action', created_at: question },
+        { id: randomUUID(), order_id: o.id, kind: 'action_response', created_at: reply },
+    );
+    const res = await adminPOST(post('/api/admin', { action: 'list' }, { cookie: adminCookie() }));
+    const body = await res.json();
+    expect(res.status === 200 && body.orders.find(x => x.id === o.id)?.last_contact_at === reply, 'latest reply was not used');
+});
 await check('F-09 sensitive admin action needs a fresh, single-use emailed code without TOTP', async () => {
     reset(); const cookie = adminCookie();
     const call = (action, extra = {}) => adminPOST(post('/api/admin', { action, ...extra }, { cookie }));

@@ -803,7 +803,9 @@ const handlers = {
             const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response'];
             const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(o => {
                 const last = events.filter(e => e.order_id === o.id && kinds.includes(e.kind)).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                return { ...o, client_replied: last?.kind === 'action_response' };
+                const contact = events.filter(e => e.order_id === o.id && ['action', 'action_response'].includes(e.kind))
+                    .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+                return { ...o, client_replied: last?.kind === 'action_response', last_contact_at: contact?.created_at || o.created_at };
             });
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
         }

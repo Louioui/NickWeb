@@ -79,6 +79,10 @@ check('logout-all invalidates all active admin sessions for that admin', () => {
 const nickLogin = await call({ action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '12345678' }, '', 'admin');
 const nickCookie = nickLogin.headers.get('set-cookie').split(';')[0];
 const listData = await (await call({ action: 'list' }, nickCookie, 'admin')).json();
+check('mock active jobs include a last client contact date', () => {
+    assert.ok(listData.orders.filter(o => !['served', 'closed', 'cancelled'].includes(o.status)).every(o =>
+        Number.isFinite(Date.parse(o.last_contact_at)) && o.last_contact_at >= o.created_at));
+});
 const servedOrder = listData.orders.find(o => o.code === 'NP-894771');
 const detailData = await (await call({ action: 'get', id: servedOrder.id }, nickCookie, 'admin')).json();
 const proofFile = detailData.files.find(f => f.kind === 'proof');
