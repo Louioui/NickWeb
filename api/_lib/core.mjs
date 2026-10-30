@@ -1,6 +1,7 @@
 // Shared server code for the /api functions: database client, HTTP helpers, tokens, rate limits.
 // Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
 import { createClient } from '@supabase/supabase-js';
+import { stripPhotoBytes, photoType } from './photos.mjs';
 import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
@@ -364,7 +365,38 @@ export async function prepareUploads(orderId, kind, files) {
 // Verifies that actual uploaded file bytes match the expected binary signature (magic bytes) of the file extension
 // and rejects polyglot files that embed HTML/script tags, executable PDF actions, or macro-enabled/disguised ZIPs.
 const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
-const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
+// PDF actions that run code, open programs, carry hidden files or send data out. Ordinary links, page actions and
+// forms are allowed. XFA forms are not refused: some official court forms use them.
+const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch|EmbeddedFiles?|RichMedia|SubmitForm|ImportData|GoToE)\b/;
+// A PDF without the bytes of its data streams (stream ... endstream), so only its dictionaries and text are left.
+function pdfStructure(bytes) {
+    const s = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1');
+    let out = '', pos = 0;
+    for (;;) {
+        const start = s.indexOf('stream', pos);
+        if (start === -1 || s.startsWith('endstream', start - 3)) { if (start === -1) { out += s.slice(pos); break; } out += s.slice(pos, start + 6); pos = start + 6; continue; }
+        const end = s.indexOf('endstream', start + 6);
+        if (end === -1) { out += s.slice(pos, start); break; }   // an unterminated stream: its bytes are data, not structure
+        out += s.slice(pos, start) + ' stream ';
+        pos = end + 9;
+    }
+    return out;
+}
+// The text chunks of a PNG (tEXt, iTXt, zTXt), the one place in a PNG where readable text can hide.
+function pngTextHasScript(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let pos = 8; pos + 12 <= bytes.length;) {
+        const len = view.getUint32(pos);
+        const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+        if (pos + 12 + len > bytes.length) break;
+        if ((type === 'tEXt' || type === 'iTXt' || type === 'zTXt') && POLYGLOT_SCRIPT_RE.test(Buffer.from(bytes.subarray(pos + 8, pos + 8 + len)).toString('latin1'))) return true;
+        pos += 12 + len;
+    }
+    return false;
+}
+// PDF names may hide letters as #xx (e.g. /J#61vaScript is /JavaScript), so they are decoded before matching.
+const decodePdfNames = (s) => s.replace(/\/[^\s\/<>\[\]()%{}]*#[0-9A-Fa-f]{2}[^\s\/<>\[\]()%{}]*/g,
+    (name) => name.replace(/#([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16))));
 const DOCX_MACRO_OR_EXEC_RE = /(?:vbaProject\.bin|vbaData\.xml|activeX\/activeX|\.(?:exe|dll|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|msi|com|hta|jar|sh)(?:[\x00-\x20"'<>\/\\]|$))/i;
 
 export function verifyFileMagic(bytes, filename) {
@@ -373,14 +405,21 @@ export function verifyFileMagic(bytes, filename) {
     const headLen = Math.min(bytes.length, 4096);
     let head = '';
     for (let i = 0; i < headLen; i++) head += String.fromCharCode(bytes[i]);
-    if (POLYGLOT_SCRIPT_RE.test(head)) return false;
-    // Hidden HTML is often appended after the real image or document, so the last 4 KB is checked too, for every type.
+    // Hidden HTML or script is usually placed at the start of a file or appended after its end, so those are checked
+    // for every type. The middle of a file is compressed or image data, where short patterns turn up by pure chance
+    // (a whole-file scan wrongly refused about 1 in 4 large PDFs), so it is only checked where text can live: PDF
+    // structure outside its data streams, and PNG text chunks.
+    if (POLYGLOT_SCRIPT_RE.test(Buffer.from(bytes.subarray(0, 4096)).toString('latin1'))) return false;
     if (bytes.length > 4096 && POLYGLOT_SCRIPT_RE.test(Buffer.from(bytes.subarray(bytes.length - 4096)).toString('latin1'))) return false;
 
     if (ext === 'pdf') {
         // %PDF- and no Acrobat JavaScript / Launch actions anywhere in the file (not just its first 4 KB). Actions hidden
         // inside compressed object streams can't be seen this way; this is a filter, not a full PDF parser.
-        if (PDF_DANGEROUS_ACTION_RE.test(Buffer.from(bytes).toString('latin1'))) return false;
+        // Actions live in the PDF's dictionaries, which sit outside its (compressed) data streams; scanning only that
+        // part finds an action anywhere in the file without matching random bytes inside images or fonts.
+        const structure = pdfStructure(bytes);
+        if (PDF_DANGEROUS_ACTION_RE.test(structure) || PDF_DANGEROUS_ACTION_RE.test(decodePdfNames(structure))) return false;
+        if (POLYGLOT_SCRIPT_RE.test(structure)) return false;
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {
@@ -402,6 +441,7 @@ export function verifyFileMagic(bytes, filename) {
         return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
     }
     if (ext === 'png') {
+        if (pngTextHasScript(bytes)) return false;
         // 89 50 4E 47 0D 0A 1A 0A (and IHDR chunk header at bytes 12..15 when >= 16 bytes)
         if (bytes.length < 8 || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4E || bytes[3] !== 0x47 ||
             bytes[4] !== 0x0D || bytes[5] !== 0x0A || bytes[6] !== 0x1A || bytes[7] !== 0x0A) return false;
@@ -434,6 +474,20 @@ function isMissingObject(err) {
 // Reads a stored upload and checks it. Returns { state: 'ok', sha256 }, 'bad' (the bytes are not what the name claims),
 // 'missing' (storage confirms it never arrived), or 'unknown' (anything else: retried later, never deleted). Like the rest
 // of supabase-js, these calls report failures as { error } instead of throwing, so each one is checked.
+// Page count of a PDF, for the printing fee. Counts page objects, and also reads the page tree's /Count (which stays
+// visible when pages sit in compressed object streams). Returns null when neither can be found.
+export function countPdfPages(bytes) {
+    const s = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1');
+    const objects = (s.match(/\/Type\s*\/Page(?![s\w])/g) || []).length;
+    let tree = 0;
+    for (const m of s.matchAll(/<<(?:(?!<<|>>)[\s\S]){0,400}?\/Type\s*\/Pages\b(?:(?!<<|>>)[\s\S]){0,400}?>>/g)) {
+        const c = /\/Count\s+(\d{1,6})/.exec(m[0]);
+        if (c) tree = Math.max(tree, Number(c[1]));
+    }
+    const pages = Math.max(objects, tree);
+    return pages > 0 && pages <= 100000 ? pages : null;
+}
+
 export async function inspectStoredFile(path, filename) {
     try {
         const { data: info, error: iErr } = await db().storage.from(BUCKET).info(path);
@@ -441,8 +495,20 @@ export async function inspectStoredFile(path, filename) {
         if (!info) return { state: 'unknown' };
         const { data: blob, error: dErr } = await db().storage.from(BUCKET).download(path);
         if (dErr || !blob) return { state: 'unknown' };
-        const buf = Buffer.from(await blob.arrayBuffer());
-        return verifyFileMagic(buf, filename) ? { state: 'ok', sha256: sha256(buf) } : { state: 'bad' };
+        let buf = Buffer.from(await blob.arrayBuffer());
+        if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
+        // Photos are cleaned again here (location and other hidden metadata), in case they were uploaded without the
+        // site's page. A changed file is stored back first; if that fails, the file waits for the next check.
+        const type = photoType(filename);
+        const clean = type ? stripPhotoBytes(new Uint8Array(buf), type) : null;
+        if (clean && !Buffer.from(clean).equals(buf)) {
+            const { error: wErr } = await db().storage.from(BUCKET).update(path, Buffer.from(clean), { contentType: type, upsert: true });
+            if (wErr) return { state: 'unknown' };
+            buf = Buffer.from(clean);
+            if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
+        }
+        const pages = /\.pdf$/i.test(String(filename)) ? countPdfPages(buf) : null;
+        return { state: 'ok', sha256: sha256(buf), pages };
     } catch {
         return { state: 'unknown' };
     }
@@ -472,9 +538,11 @@ export async function confirmUploads(orderId, fileIds) {
         }
         if (check.state === 'missing') { missing++; continue; }
         if (check.state !== 'ok') { stillChecking++; continue; }
-        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id);
+        let { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256, page_count: check.pages ?? null }).eq('id', r.id);
+        // Before the page_count column exists (migration not applied yet), confirm the file without it.
+        if (uErr && /page_count/.test(uErr.message || '')) ({ error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id));
         if (uErr) throw uErr;
-        done.push({ ...r, sha256: check.sha256 });
+        done.push({ ...r, sha256: check.sha256, page_count: check.pages ?? null });
     }
     return { files: done, stillChecking, missing, rejected };
 }

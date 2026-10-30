@@ -10,7 +10,11 @@ const stripeSessions = new Map();
 class FakeStripe {
     constructor() {
         this.webhooks = { constructEventAsync: async (raw) => JSON.parse(raw) };
-        this.checkout = { sessions: { retrieve: async (id) => stripeSessions.get(id) || { id, payment_status: 'unpaid', metadata: {} }, expire: async () => ({}) } };
+        this.checkout = { sessions: {
+            retrieve: async (id) => stripeSessions.get(id) || { id, payment_status: 'unpaid', metadata: {} },
+            expire: async () => ({}),
+            create: async () => { const id = `cs_test_${randomUUID().replace(/-/g, '')}`; const ses = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid' }; stripeSessions.set(id, ses); return ses; },
+        } };
     }
 }
 mock.module('@supabase/supabase-js', { namedExports: { createClient: () => db } });
@@ -540,6 +544,199 @@ await check('R2 an authenticator set up under a different APP_SECRET gives a cle
     const res = await adminLogin({ code: '12345678', totp: '123456' });
     const body = await res.json();
     expect(res.status === 409 && /different copy of this site/.test(body.error), `${res.status} ${JSON.stringify(body)}`);
+});
+
+// --- F-10: the whole file is scanned, wherever the payload sits ---
+const bigPdf = (middle) => {
+    const pad = 'stream\n' + 'A'.repeat(1_500_000) + '\nendstream\n';
+    return new TextEncoder().encode(`%PDF-1.7\n${pad}${middle}\n${pad}%%EOF`);
+};
+await check('F-10 PDF actions buried in the middle of a 3 MB file are refused', async () => {
+    for (const bad of ['/Launch', '/EmbeddedFiles', '/EmbeddedFile', '/RichMedia', '/SubmitForm', '/ImportData', '/GoToE', '/J#61vaScript', '/#4A#53']) {
+        expect(core.verifyFileMagic(bigPdf(`<< /S ${bad} >>`), 'a.pdf') === false, `${bad} accepted`);
+    }
+    expect(core.verifyFileMagic(bigPdf('<< /S /URI /URI (https://example.com) >> /OpenAction << /S /GoTo >>'), 'a.pdf') === true, 'ordinary link/open action refused');
+});
+const pngChunk = (type, data) => { const d = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    return [(d.length >>> 24) & 255, (d.length >>> 16) & 255, (d.length >>> 8) & 255, d.length & 255, ...new TextEncoder().encode(type), ...d, 0, 0, 0, 0]; };
+await check('F-10 a script hidden in a PNG text chunk in the middle of the file is refused', async () => {
+    const sig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    const idat = pngChunk('IDAT', new Uint8Array(500_000));
+    const png = (text) => new Uint8Array([...sig, ...pngChunk('IHDR', new Uint8Array(13)), ...idat, ...pngChunk('tEXt', `Comment\0${text}`), ...idat, ...pngChunk('IEND', '')]);
+    expect(core.verifyFileMagic(png('<script>alert(1)</script>'), 'a.png') === false, 'script in tEXt accepted');
+    expect(core.verifyFileMagic(png('Taken at the front door'), 'a.png') === true, 'plain PNG text refused');
+});
+await check('F-10 real-looking PDFs with large compressed streams are never refused by chance (5 x 5 MB random data)', async () => {
+    const { randomBytes } = await import('node:crypto');
+    for (let i = 0; i < 5; i++) {
+        const pdf = Buffer.concat([Buffer.from('%PDF-1.7\n1 0 obj << /Length 5242880 /Filter /FlateDecode >>\nstream\n'), randomBytes(5 * 1024 * 1024), Buffer.from('\nendstream\nendobj\n%%EOF')]);
+        expect(core.verifyFileMagic(new Uint8Array(pdf), 'a.pdf') === true, `random stream data refused (try ${i + 1})`);
+    }
+});
+
+// --- F-11: photos are cleaned on the server too, for uploads that skipped the site's page ---
+const GPS = 'GPS 37.9577N 121.2908W';
+const jpegSeg = (m, txt) => { const d = new TextEncoder().encode(txt); return [0xFF, m, ((d.length + 2) >> 8) & 255, (d.length + 2) & 255, ...d]; };
+const gpsJpeg = new Uint8Array([0xFF, 0xD8, ...jpegSeg(0xE0, 'JFIF\0'), ...jpegSeg(0xE1, `Exif\0\0${GPS}`), 0xFF, 0xDA, 0, 4, 1, 2, 3, 4, 0xFF, 0xD9]);
+const asText = (u8) => Buffer.from(u8).toString('latin1');
+await check('F-11 a photo uploaded straight to storage loses its GPS before it is confirmed', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'door.jpg', content_type: 'image/jpeg', storage_path: `orders/${o.id}/client/x-door.jpg` });
+    db.__state.storage.set(f.storage_path, gpsJpeg);
+    const r = await core.confirmUploads(o.id, [f.id]);
+    const stored = db.__state.storage.get(f.storage_path);
+    expect(r.files.length === 1 && fileRow(f.id).uploaded, 'photo not confirmed');
+    expect(!asText(stored).includes('GPS') && asText(stored).includes('JFIF'), 'GPS still in the stored photo');
+    expect(fileRow(f.id).sha256 === core.sha256(Buffer.from(stored)), 'fingerprint is not of the cleaned file');
+});
+await check('F-11 if the cleaned photo cannot be stored back, it is not confirmed (retried later)', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'door.jpg', content_type: 'image/jpeg', storage_path: `orders/${o.id}/client/y-door.jpg` });
+    db.__state.storage.set(f.storage_path, gpsJpeg); db.__state.failUpdate.add(f.storage_path);
+    const r = await core.confirmUploads(o.id, [f.id]);
+    expect(r.stillChecking === 1 && !fileRow(f.id).uploaded, 'confirmed with GPS still inside');
+});
+
+// --- Phase 2: field tools, evidence and payments ---
+const adminAct = (body, cookie) => adminPOST(post('/api/admin', body, { cookie }));
+const track = (o, body) => trackPOST(post('/api/track', { t: o.track_token, ...body }));
+const evs = (o) => (tables().order_events || []).filter(e => e.order_id === o.id);
+await check('P2 PDF pages are counted (page objects, or the page tree when pages are compressed)', async () => {
+    const three = new TextEncoder().encode('%PDF-1.7\n1 0 obj << /Type /Pages /Kids [2 0 R 3 0 R 4 0 R] /Count 3 >>\n2 0 obj << /Type /Page >>\n3 0 obj << /Type /Page >>\n4 0 obj << /Type /Page >>\n%%EOF');
+    expect(core.countPdfPages(three) === 3, `got ${core.countPdfPages(three)}`);
+    const compressed = new TextEncoder().encode('%PDF-1.7\n1 0 obj << /Type /Pages /Kids [5 0 R] /Count 150 >>\n5 0 obj << /Type /ObjStm /N 150 >>\n%%EOF');
+    expect(core.countPdfPages(compressed) === 150, `got ${core.countPdfPages(compressed)}`);
+    expect(core.countPdfPages(new TextEncoder().encode('%PDF-1.7\n%%EOF')) === null, 'invented a page count');
+    reset(); const o = seedOrder(); const f = seedFile(o); db.__state.storage.set(f.storage_path, three);
+    await core.confirmUploads(o.id, [f.id]);
+    expect(fileRow(f.id).page_count === 3, `stored ${fileRow(f.id).page_count}`);
+});
+await check('P2 each attempt is labelled with its time window, in California time', async () => {
+    reset(); const o = seedOrder(); const cookie = adminCookie();
+    const at = (h) => { const d = new Date(); d.setUTCHours(h + 8, 0, 0, 0); while (d > new Date()) d.setUTCDate(d.getUTCDate() - 1); return d.toISOString(); };   // PST = UTC-8 (PDT shifts it by 1h; 9am/9pm stay put)
+    for (const [h, w] of [[9, 'morning'], [21, 'night']]) {
+        const r = await adminAct({ action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', at: at(h) }, cookie);
+        expect(r.status === 200, `attempt ${r.status}`);
+        expect(evs(o).some(e => e.title === `Attempt (${w}): No answer`), `no ${w} label: ${evs(o).map(e => e.title).join(' | ')}`);
+    }
+    const bad = await adminAct({ action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', at: new Date(Date.now() + 864e5).toISOString() }, cookie);
+    expect(bad.status === 400, `future attempt accepted (${bad.status})`);
+});
+await check('P2 bulk close closes only served or cancelled jobs', async () => {
+    reset(); const cookie = adminCookie();
+    const a = seedOrder({ status: 'served', legal_hold: true }), b = seedOrder({ status: 'cancelled', code: 'NP-222222' }), c = seedOrder({ status: 'attempting', code: 'NP-333333' });
+    const r = await (await adminAct({ action: 'bulk-close', ids: [a.id, b.id, c.id] }, cookie)).json();
+    const st = (o) => tables().orders.find(x => x.id === o.id).status;
+    expect(st(a) === 'closed' && st(b) === 'closed' && st(c) === 'attempting', `${st(a)} ${st(b)} ${st(c)}`);
+    expect(r.closed.length === 2 && r.skipped === 1, JSON.stringify(r));
+});
+await check('P2 the tracking page logs views (once an hour), unlocks, downloads and replies for the evidence pack', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o); f.uploaded = true; f.sha256 = 'a'.repeat(64);
+    await track(o, { action: 'view' }); await track(o, { action: 'view' }); await track(o, { action: 'view' });
+    await track(o, { action: 'download', fileId: f.id });
+    const log = tables().client_audit_logs || [];
+    expect(log.filter(l => l.action === 'view').length === 1, `views logged: ${log.filter(l => l.action === 'view').length}`);
+    expect(log.some(l => l.action === 'download' && l.detail === 'a.pdf') && log.every(l => /^[0-9a-f]{64}$/.test(l.ip_hash)), 'download not logged, or IP not hashed');
+    const pack = await (await adminAct({ action: 'evidence-pack', id: o.id }, adminCookie())).json();
+    expect(pack.client_activity.length === 2 && pack.files[0].sha256 === 'a'.repeat(64) && pack.timeline_seal && pack.order.code === o.code, JSON.stringify(pack).slice(0, 300));
+});
+await check('P2 clients can send a note on any open request; it flags "Client replied" and leaves the status alone', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' });
+    const r = await track(o, { action: 'respond', reply: 'They work nights, try after 8 PM.' });
+    expect(r.status === 200, `note refused (${r.status} ${await r.clone().text()})`);
+    expect(tables().orders[0].status === 'attempting', 'status changed');
+    expect(evs(o).some(e => e.kind === 'action_response' && e.title === 'You sent Nick a note'), 'no note entry');
+    expect((tables().client_audit_logs || []).some(l => l.action === 'reply'), 'reply not logged');
+    const list = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(list.orders[0].client_replied === true, 'no Client replied flag');
+    const addr = await track(o, { action: 'respond', address: '9 Other St' });
+    expect(addr.status === 409 && tables().orders[0].address === '12 Main St', 'address changed without Nick asking');
+});
+await check('P2 a finished or locked request does not take notes', async () => {
+    reset(); const served = seedOrder({ status: 'served', legal_hold: true });
+    expect((await track(served, { action: 'respond', reply: 'hi' })).status === 409, 'served request took a note');
+    reset(); const locked = seedOrder({ status: 'attempting', doc_lock: true });
+    expect((await track(locked, { action: 'respond', reply: 'hi' })).status === 403, 'locked request took a note');
+});
+await check('P2 the list shows when Nick last contacted the client', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' });
+    await adminAct({ action: 'update', id: o.id, kind: 'note', note: 'Private', clientVisible: false }, adminCookie());
+    let l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(l.orders[0].last_contact_at === null, 'a private note counted as contact');
+    await adminAct({ action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer' }, adminCookie());
+    l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(typeof l.orders[0].last_contact_at === 'string', 'visible attempt not counted');
+});
+await check('P2 only Nick\'s own entries count as contact, and his shared note clears "Client replied"', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' });
+    (tables().order_events ||= []).push({ id: randomUUID(), order_id: o.id, kind: 'note', title: '2 files added by you', client_visible: true, created_at: new Date().toISOString() });
+    let l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(l.orders[0].last_contact_at === null, 'a client upload counted as Nick contacting the client');
+    await track(o, { action: 'respond', reply: 'Any news?' });
+    l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(l.orders[0].client_replied === true, 'reply not flagged');
+    await new Promise(r => setTimeout(r, 5));
+    await adminAct({ action: 'update', id: o.id, kind: 'note', note: 'Trying again tonight.', clientVisible: true }, adminCookie());
+    l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(l.orders[0].client_replied === false && l.orders[0].last_contact_at, 'Nick\'s shared note did not clear the flag');
+});
+await check('P2 an expired, unpaid payment link can be renewed from the tracking page; a live one cannot', async () => {
+    reset(); const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_oldsession1', payment_url: 'https://checkout.stripe.com/c/pay/cs_test_oldsession1' });
+    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'open', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    expect((await track(o, { action: 'renew-payment' })).status === 409, 'renewed a link that still works');
+    stripeSessions.get('cs_test_oldsession1').status = 'expired';
+    const r = await (await track(o, { action: 'renew-payment' })).json();
+    expect(tables().orders[0].stripe_session_id !== 'cs_test_oldsession1' && /^https:\/\/checkout\.stripe\.com\//.test(r.payUrl || ''), `not renewed: ${JSON.stringify(r).slice(0, 200)}`);
+});
+await check('P2 the receipt appears once paid, and never on a locked page', async () => {
+    reset(); const paid = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 9000, status: 'paid', case_number: 'CV-1', court: 'LA Superior' });
+    const v = await (await track(paid, { action: 'view' })).json();
+    expect(v.receipt?.amountPaid === '$90.00' && v.receipt.caseNumber === 'CV-1', JSON.stringify(v.receipt));
+    reset(); const locked = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 9000, status: 'paid', doc_lock: true });
+    expect((await (await track(locked, { action: 'view' })).json()).receipt === null, 'receipt shown on a locked page');
+});
+
+// --- F-09: with two-step off, sensitive actions need an emailed step-up code, not just the session cookie ---
+async function emailedStepUp(cookie) {
+    emails.length = 0;
+    const res = await adminAct({ action: 'stepup-send-code' }, cookie);
+    expect(res.status === 200, `stepup-send-code ${res.status}`);
+    return /step-up code: (\d{8})/.exec(emails.at(-1)?.subject || '')?.[1];
+}
+await check('F-09 with two-step off, minting recovery codes needs an emailed step-up code', async () => {
+    reset(); const cookie = adminCookie();
+    const bare = await adminAct({ action: 'generate-recovery-codes' }, cookie);
+    expect(bare.status === 403, `session alone was enough (${bare.status})`);
+    const code = await emailedStepUp(cookie);
+    expect(code, 'no step-up code emailed');
+    const ok = await adminAct({ action: 'generate-recovery-codes', totp: code }, cookie);
+    expect(ok.status === 200, `right code refused (${ok.status})`);
+    const again = await adminAct({ action: 'generate-recovery-codes', totp: code }, cookie);
+    expect(again.status === 403, `step-up code worked twice (${again.status})`);
+});
+await check('F-09 with two-step off, a stolen session cannot enrol its own authenticator', async () => {
+    reset(); const cookie = adminCookie();
+    const res = await adminAct({ action: 'totp-setup' }, cookie);
+    expect(res.status === 403 && !(tables().admin_totp || []).length, `authenticator setup started without a step-up (${res.status})`);
+    const code = await emailedStepUp(cookie);
+    expect((await adminAct({ action: 'totp-setup', totp: code }, cookie)).status === 200, 'setup refused with a valid step-up');
+});
+await check('F-09 with two-step off, unlocking legal hold needs the step-up code (typing the reference is not enough)', async () => {
+    reset(); const cookie = adminCookie(); const o = seedOrder({ legal_hold: true, status: 'served' });
+    const res = await adminAct({ action: 'unlock-legal-hold', id: o.id, hold: false, confirm: o.code }, cookie);
+    expect(res.status === 403 && tables().orders[0].legal_hold === true, `hold unlocked without step-up (${res.status})`);
+});
+await check('F-09 a step-up code is not a login code, and a login code is not a step-up code', async () => {
+    reset(); const cookie = adminCookie();
+    const code = await emailedStepUp(cookie);
+    const login = await adminPOST(post('/api/admin', { action: 'verify-code', email: ADMIN, code }));
+    expect(login.status === 401, `step-up code signed in (${login.status})`);
+    reset(); const c2 = adminCookie(); addAdminCode('12345678');
+    const use = await adminAct({ action: 'generate-recovery-codes', totp: '12345678' }, c2);
+    expect(use.status === 403, `login code accepted as step-up (${use.status})`);
+});
+await check('F-09 with the authenticator on, an emailed step-up code cannot be requested', async () => {
+    reset(); seedAdmin2fa();
+    const res = await adminAct({ action: 'stepup-send-code' }, adminCookie());
+    expect(res.status === 400, `step-up email sent while authenticator is on (${res.status})`);
 });
 
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);

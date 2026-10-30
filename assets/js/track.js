@@ -26,6 +26,7 @@ const DOT = { action: 'is-alert', payment: 'is-gold', proof: 'is-done', status: 
 
 let order = null;
 let actionSending = false;
+let lastView = null;   // the latest view, for the receipt and reply box
 let refreshing = false;
 
 function render(o) {
@@ -65,12 +66,29 @@ function render(o) {
         $('pay-btn').href = safePayUrl;
     }
 
-    $('action-panel').classList.toggle('hidden', !o.actionNote);
-    if (o.actionNote) $('action-note').textContent = o.actionNote;
+    // The reply box: answering Nick's question, or (on any open, unlocked request) sending him a note or a file.
+    const answering = !!o.actionNote;
+    $('action-panel').classList.toggle('hidden', !answering && !o.canReply);
+    $('action-note').classList.toggle('hidden', !answering);
+    if (answering) $('action-note').textContent = o.actionNote;
+    $('action-address').classList.toggle('hidden', !answering);
+    $('action-access-wrap').classList.toggle('hidden', !answering);
+    $('action-kicker').innerHTML = answering ? '<i class="fa-solid fa-triangle-exclamation mr-1"></i> Action required' : '<i class="fa-regular fa-comment mr-1"></i> Message Nick';
+    $('action-kicker').className = `font-serif italic mb-1 ${answering ? 'text-[#7a1f1c]' : 'text-bronze'}`;
+    $('action-title').textContent = answering ? 'Nick needs a little more from you' : 'Send Nick a note or a file';
+    $('a-reply').placeholder = answering ? "Answer Nick's question here" : 'For example: they usually get home after 6 PM';
+    $('action-panel').classList.toggle('border-[#9c2a26]/40', answering);
+
+    $('receipt-panel').classList.toggle('hidden', !o.receipt);
+    if (o.receipt) {
+        $('receipt-amount').textContent = o.receipt.amountPaid;
+        $('receipt-date').textContent = NPS.fmtDate(o.receipt.paidAt);
+    }
+    lastView = o;
 
     const proof = o.files.filter(f => f.kind === 'proof');
     const docs = o.files.filter(f => f.kind !== 'proof');
-    const chip = f => `<button type="button" class="file-chip" data-file="${esc(f.id)}" ${f.sha256 ? `title="Verified SHA-256 fingerprint: ${esc(f.sha256)}"` : ''}><i class="fa-solid ${f.kind === 'proof' ? 'fa-file-signature' : 'fa-file-lines'} text-bronze"></i><span>${esc(f.name)}</span><span class="text-muted font-normal">${NPS.fmtSize(f.size)}</span>${f.sha256 ? `<span class="text-[11px] font-mono text-primary bg-primaryLight/60 px-1.5 py-0.5 rounded-sm"><i class="fa-solid fa-shield-halved mr-0.5" aria-hidden="true"></i>SHA-256 ${esc(f.sha256.slice(0, 8))}…</span>` : ''}</button>`;
+    const chip = f => `<span class="inline-flex flex-wrap items-center gap-2"><button type="button" class="file-chip" data-file="${esc(f.id)}" ${f.sha256 ? `title="SHA-256 fingerprint: ${esc(f.sha256)}"` : ''}><i class="fa-solid ${f.kind === 'proof' ? 'fa-file-signature' : 'fa-file-lines'} text-bronze"></i><span>${esc(f.name)}</span><span class="text-muted font-normal">${NPS.fmtSize(f.size)}</span>${f.sha256 ? `<span class="text-[11px] font-mono text-primary bg-primaryLight/60 px-1.5 py-0.5 rounded-sm"><i class="fa-solid fa-shield-halved mr-0.5" aria-hidden="true"></i>SHA-256 ${esc(f.sha256.slice(0, 8))}…</span>` : ''}</button>${f.sha256 ? `<button type="button" class="text-xs text-primary font-semibold underline underline-offset-2" data-verify="${esc(f.id)}">Verify file</button>` : ''}</span>`;
     $('proof-files').innerHTML = proof.map(chip).join('');
     $('doc-files').innerHTML = docs.map(chip).join('');
     $('proof-block').classList.toggle('hidden', !proof.length);
@@ -121,6 +139,35 @@ async function load() {
         showNotFound(err.status === 404 ? null : `${err.message} Your tracking link has been kept. Please try again.`, err.status !== 404);
     }
 }
+
+// Verify a file: download it, compute its SHA-256 in this browser, and compare with the fingerprint taken when it was stored.
+document.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-verify]');
+    if (!btn) return;
+    btn.disabled = true;
+    btn.parentElement.querySelectorAll('.verify-result').forEach(el => el.remove());
+    const show = (ok, msg) => btn.insertAdjacentHTML('afterend', `<span class="verify-result status-pill ${ok ? 'status-done' : 'status-alert'}">${esc(msg)}</span>`);
+    try {
+        const { url, sha256 } = await trackCall({ action: 'download', fileId: btn.dataset.verify });
+        const r = await NPS.verifyFileSha256(url, sha256);
+        show(r.ok, r.ok ? 'Matches the stored fingerprint' : 'Does not match the stored fingerprint');
+    } catch (err) { show(false, err.message); }
+    finally { btn.disabled = false; }
+});
+$('renew-pay').addEventListener('click', async () => {
+    const btn = $('renew-pay'), msg = $('renew-pay-msg');
+    btn.disabled = true;
+    try {
+        const o = await trackCall({ action: 'renew-payment' });
+        render(o);
+        msg.className = 'result-box result-ok text-sm mt-3';
+        msg.textContent = o.paidAt ? 'Your payment was already received.' : 'Here is a new payment link. It works for 24 hours.';
+    } catch (err) {
+        msg.className = 'result-box result-warn text-sm mt-3';
+        msg.textContent = err.message;
+    } finally { btn.disabled = false; }
+});
+$('receipt-btn').addEventListener('click', () => { if (lastView?.receipt) NPS.printReceipt(lastView.receipt); });
 
 document.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-file]');
@@ -176,6 +223,7 @@ $('action-form').addEventListener('submit', async (e) => {
     errBox.textContent = problem;
     if (problem) return;
     actionSending = true;
+    const wasAnswering = !!lastView?.actionNote;
     btn.disabled = true;
     btn.textContent = 'Sending your reply…';
     try {
@@ -192,7 +240,7 @@ $('action-form').addEventListener('submit', async (e) => {
         const feedback = $('reply-feedback');
         const notChecked = (done.filesStillChecking || 0) + (done.filesMissing || 0);
         feedback.className = `result-box ${up.failed.length || notChecked ? 'result-warn' : 'result-ok'} text-sm`;
-        feedback.textContent = up.failed.length
+        feedback.textContent = !wasAnswering && !up.failed.length && !notChecked ? 'Your note was sent to Nick.' : up.failed.length
             ? `Your reply was sent, but ${up.failed.join(', ')} didn't upload. Please call Nick at (209) 922-6817.`
             : done.filesMissing
             ? `Your reply was sent, but ${done.filesMissing} file(s) didn't arrive. Please send them again or call Nick at (209) 922-6817.`

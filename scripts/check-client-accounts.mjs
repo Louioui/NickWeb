@@ -48,7 +48,10 @@ check('devteam@partnershipwithmedia-dev.com can log into admin dashboard', () =>
 const devAdminCookie1 = devAdminLogin1.headers.get('set-cookie').split(';')[0];
 const devAdminCookie2 = devAdminLogin2.headers.get('set-cookie').split(';')[0];
 
-const genRes = await (await call({ action: 'generate-recovery-codes' }, devAdminCookie1, 'admin')).json();
+const bareGen = await call({ action: 'generate-recovery-codes' }, devAdminCookie1, 'admin');
+check('F-09: minting recovery codes with only a session is refused', () => assert.equal(bareGen.status, 403));
+await call({ action: 'stepup-send-code' }, devAdminCookie1, 'admin');
+const genRes = await (await call({ action: 'generate-recovery-codes', totp: '87654321' }, devAdminCookie1, 'admin')).json();
 check('admin can generate 8 single-use backup recovery codes', () => {
     assert.equal(genRes.codes.length, 8);
     assert.equal(genRes.remaining, 8);
