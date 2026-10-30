@@ -7,7 +7,7 @@
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, hitRateLimit, peekRateLimit, text, longText, cleanFileList,
-         prepareUploads, confirmUploads, addEvent, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
+         prepareUploads, confirmUploads, addEvent, auditClientAction, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
 import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, flagUnappliedPayment, sendEmail } from './_lib/orders.mjs';
 import { getClientSecurity, pinLocked } from './_lib/clients.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
@@ -29,7 +29,9 @@ export const POST = handle(async (request) => {
     const unlocked = isOrderUnlocked(order, body);
 
     if (body.action === 'view') {
-        return json(await clientView(order, { unlocked }));
+        const view = await clientView(order, { unlocked });
+        await auditClientAction(request, order.id, 'tracking_view');
+        return json(view);
     }
 
     if (body.action === 'send-unlock-code') {
@@ -87,6 +89,7 @@ export const POST = handle(async (request) => {
         }
         const unlockToken = makeUnlockToken(order);
         const view = await clientView(order, { unlocked: true });
+        await auditClientAction(request, order.id, 'document_unlock');
         return json({ ok: true, unlockToken, ...view });
     }
 
@@ -136,6 +139,7 @@ export const POST = handle(async (request) => {
         fileSha256 = fRow?.sha256 || null;
         // Chain of custody: every document opened from the tracking page is recorded (privately) in the sealed timeline.
         await addEvent(order.id, 'note', 'Document downloaded from tracking page', fRow?.filename || null, false);
+        await auditClientAction(request, order.id, 'file_download', fId);
         return json({ url, sha256: fileSha256, expiresInSeconds: 60 });
     }
 
@@ -147,7 +151,12 @@ export const POST = handle(async (request) => {
             !(await markPaid(order.id, session.amount_total, session.id))) {
             await flagUnappliedPayment(order.id, session.amount_total, session.id).catch(err => console.error(err.message));
         }
-        return json(await clientView(await orderByToken(body.t), { unlocked }));
+        const latest = await orderByToken(body.t);
+        if (session.metadata?.order_id === order.id && session.payment_status === 'paid' &&
+            latest.paid_at && latest.stripe_session_id === session.id) {
+            await auditClientAction(request, order.id, 'payment_confirmation');
+        }
+        return json(await clientView(latest, { unlocked }));
     }
 
     if (body.action === 'respond') {
@@ -191,6 +200,7 @@ export const POST = handle(async (request) => {
         ].filter(Boolean).join(' · ');
         await addEvent(order.id, 'action_response', 'You sent the requested information', summary || null);
         const uploads = await prepareUploads(order.id, 'action_upload', files);
+        await auditClientAction(request, order.id, 'action_reply');
         return json({ ok: true, uploads });
     }
 

@@ -503,3 +503,10 @@ export async function addEvent(orderId, kind, title, detail = null, clientVisibl
     const { error } = await db().from('order_events').insert({ order_id: orderId, kind, title, detail, client_visible: clientVisible });
     if (error) throw error;
 }
+
+export async function auditClientAction(request, orderId, action, fileId = null) {
+    const { error } = await db().from('client_audit_logs').insert({
+        order_id: uuid(orderId, 'Order'), action, file_id: fileId, ip_hash: sha256(clientIp(request)),
+    });
+    if (error) throw error;
+}

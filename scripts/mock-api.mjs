@@ -31,6 +31,11 @@ const adminStepUpCodes = new Map(); // email -> { code, expires }
 const adminBurnFails = new Map();   // email -> count
 const adminCodesBurned = new Set(); // email if active code was burned
 const adminAuditLogs = [];
+const clientAuditLogs = [];
+function auditClient(req, orderId, action, fileId = null) {
+    const ip = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || '127.0.0.1';
+    clientAuditLogs.push({ order_id: orderId, action, file_id: fileId, ip_hash: sha256Hex(ip), created_at: now() });
+}
 function auditAdmin(emailAddr, action, targetCode = null, detailText = null) {
     adminAuditLogs.unshift({ email: emailAddr, action, target_code: targetCode, detail: detailText, created_at: now() });
 }
@@ -522,7 +527,7 @@ const handlers = {
     async track(req, body, url) {
         const o = orderByToken(body.t);
         const unlocked = isMockUnlocked(req, o, body);
-        if (body.action === 'view') return json(clientView(o, { unlocked }));
+        if (body.action === 'view') { auditClient(req, o.id, 'tracking_view'); return json(clientView(o, { unlocked })); }
         if (body.action === 'send-unlock-code') {
             trackUnlockCodes.set(o.id, { code: MOCK_CLIENT_CODE, tries: 0, expires: Date.now() + 600000 });
             const maskedEmail = o.client_email.replace(/^(..).*(@.*)$/, '$1•••$2');
@@ -550,6 +555,7 @@ const handlers = {
                 verified = true;
             }
             const unlockToken = makeMockUnlockToken(req, o);
+            auditClient(req, o.id, 'document_unlock');
             return json({ ok: true, unlockToken, ...clientView(o, { unlocked: true }) });
         }
         if (body.action === 'toggle-doc-lock') {
@@ -574,12 +580,14 @@ const handlers = {
             const f = files.get(fid);
             if (!f || f.order_id !== o.id || !f.uploaded) fail(404, 'File not found.');
             addEvent(o.id, 'note', 'Document downloaded from tracking page', f.filename, false);   // same as api/track.mjs
+            auditClient(req, o.id, 'file_download', fid);
             return json({ url: `/__mock-file/${f.id}`, sha256: f.sha256 || null, expiresInSeconds: 60 });
         }
         if (body.action === 'confirm-payment') {
             if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) fail(400, 'Invalid payment session.');
             // Like api/track.mjs (which asks Stripe): the matching unpaid session counts, whatever the status. Held orders are billed while served.
             if (body.session === o.stripe_session_id && !o.paid_at) markPaid(o, body.session);
+            if (body.session === o.stripe_session_id && o.paid_at) auditClient(req, o.id, 'payment_confirmation');
             return json(clientView(o, { unlocked }));
         }
         if (body.action === 'respond') {
@@ -613,6 +621,7 @@ const handlers = {
                 `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
             ].filter(Boolean).join(' · ');
             addEvent(o.id, 'action_response', 'You sent the requested information', summary || null);
+            auditClient(req, o.id, 'action_reply');
             return json({ ok: true, uploads });
         }
         if (body.action === 'respond-finish') {

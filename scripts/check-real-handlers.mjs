@@ -256,7 +256,6 @@ await check('F-03 the right PIN still unlocks normally', async () => {
     const body = await res.json();
     expect(res.status === 200 && body.unlockToken, `unlock failed (${res.status} ${JSON.stringify(body)})`);
 });
-
 // --- F-04: file checks fail closed ---
 const PDF = new TextEncoder().encode('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n');
 function seedFile(o, over = {}) {
@@ -267,6 +266,24 @@ function seedFile(o, over = {}) {
     return f;
 }
 const fileRow = (id) => (tables().order_files || []).find(f => f.id === id);
+await check('client audit log records tracking, unlock, download, reply and payment without raw IP', async () => {
+    reset(); setPin(CLIENT);
+    const o = seedOrder({ doc_lock: true, status: 'action_required', amount_due_cents: 7500, stripe_session_id: 'cs_test_audit123' });
+    const file = seedFile(o, { uploaded: true });
+    const call = (action, extra = {}) => trackPOST(post('/api/track', { t: o.track_token, action, ...extra }, { 'x-forwarded-for': '203.0.113.17' }));
+    expect((await call('view')).status === 200, 'tracking view failed');
+    const unlocked = await call('verify-unlock-code', { code: PIN });
+    const unlockToken = (await unlocked.json()).unlockToken;
+    expect(unlocked.status === 200 && unlockToken, 'unlock failed');
+    expect((await call('download', { fileId: file.id, unlockToken })).status === 200, 'download failed');
+    expect((await call('respond', { reply: 'Gate code is 2468', unlockToken })).status === 200, 'reply failed');
+    stripeSessions.set(o.stripe_session_id, { id: o.stripe_session_id, payment_status: 'paid', amount_total: 7500, metadata: { order_id: o.id } });
+    expect((await call('confirm-payment', { session: o.stripe_session_id, unlockToken })).status === 200, 'payment confirmation failed');
+    const logs = (tables().client_audit_logs || []).filter(x => x.order_id === o.id);
+    expect(['tracking_view', 'document_unlock', 'file_download', 'action_reply', 'payment_confirmation'].every(action => logs.some(x => x.action === action)), `missing audit action: ${logs.map(x => x.action)}`);
+    expect(logs.every(x => /^[0-9a-f]{64}$/.test(x.ip_hash) && !JSON.stringify(x).includes('203.0.113.17')), 'raw IP stored in audit log');
+});
+
 await check('F-04 a failed download leaves the file unconfirmed', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o);
     db.__state.failDownload.add(f.storage_path);
