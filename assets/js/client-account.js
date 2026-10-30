@@ -3,6 +3,7 @@
     const $ = id => document.getElementById(id), { esc } = NPS;
     let mode = location.hash === '#signup' ? 'signup' : 'signin', pendingEmail = '', sending = false, cooldownUntil = 0;
     let orders = [], filter = 'all', signedIn = false;
+    const accountFiles = new Map();
     // Set while the server is waiting for the Security PIN: after a code ({ kind: 'code' }) or a sign-in link, whose
     // tokens stay in memory only until the PIN is sent ({ kind: 'link', access, refresh }).
     let pinFor = null;
@@ -143,7 +144,7 @@
     };
 
     function showAuth() {
-        signedIn = false; orders = []; pendingEmail = ''; cooldownUntil = 0;
+        signedIn = false; orders = []; accountFiles.clear(); pendingEmail = ''; cooldownUntil = 0;
         clearPinFields(); securityFeedback('');
         $('client-orders').replaceChildren(); $('client-identity').textContent = '';
         $('account-code').value = ''; $('client-search').value = '';
@@ -190,9 +191,47 @@
         const done = o => ['served', 'closed', 'cancelled'].includes(o.status);
         const shown = orders.filter(o => (filter === 'all' || (filter === 'done' ? done(o) : !done(o))) && (!q || [o.code, o.recipient, o.document].some(v => (v || '').toLowerCase().includes(q))));
         $('client-count').textContent = `${shown.length} ${shown.length === 1 ? 'request' : 'requests'}`;
-        $('client-orders').innerHTML = shown.length ? shown.map(o => `<a class="client-request" href="${esc(o.trackUrl)}"><div class="flex flex-wrap justify-between gap-3"><span class="text-xs text-muted">${esc(o.code)}</span><span class="status-pill ${done(o) || o.paid ? 'status-done' : o.status === 'action_required' ? 'status-alert' : 'status-live'}">${esc(o.label)}</span></div><h2 class="font-serif text-lg text-primary mt-3">${esc(o.recipient)}</h2><p class="text-sm text-muted mt-1">${esc(o.document)}</p><div class="flex flex-wrap justify-between gap-3 text-xs mt-4"><span>${esc(NPS.fmtDate(o.created, false))} · ${esc(o.service || '')}</span><span class="font-semibold text-primary">${esc(o.amount)} ${o.paid ? 'paid' : 'estimate / due'} · View request →</span></div></a>`).join('') : `<div class="p-8 text-center"><h2 class="font-serif text-xl text-primary mb-3">${orders.length ? 'No matching requests' : 'Your first request starts here'}</h2><p class="text-sm text-muted mb-5">${orders.length ? 'Try another name, reference or filter.' : 'Submit a service request using your verified email. It will appear here for updates, payment and proof.'}</p>${orders.length ? '<button id="clear-client-filter" type="button" class="btn btn-outline btn-sm">Show all requests</button>' : '<a href="/?client=1#checkout" class="btn btn-pine btn-sm">Start a request</a>'}</div>`;
+        $('client-orders').innerHTML = shown.length ? shown.map(o => `<article class="client-request"><a class="block" href="${esc(o.trackUrl)}"><div class="flex flex-wrap justify-between gap-3"><span class="text-xs text-muted">${esc(o.code)}</span><span class="status-pill ${done(o) || o.paid ? 'status-done' : o.status === 'action_required' ? 'status-alert' : 'status-live'}">${esc(o.label)}</span></div><h2 class="font-serif text-lg text-primary mt-3">${esc(o.recipient)}</h2><p class="text-sm text-muted mt-1">${esc(o.document)}</p><div class="flex flex-wrap justify-between gap-3 text-xs mt-4"><span>${esc(NPS.fmtDate(o.created, false))} · ${esc(o.service || '')}</span><span class="font-semibold text-primary">${esc(o.amount)} ${o.paid ? 'paid' : 'estimate / due'} · View request →</span></div></a><button type="button" class="btn btn-outline btn-sm mt-3" data-account-files="${esc(o.code)}">Show documents and fingerprints</button><div data-account-files-result="${esc(o.code)}" class="mt-3 text-xs" role="status"></div></article>`).join('') : `<div class="p-8 text-center"><h2 class="font-serif text-xl text-primary mb-3">${orders.length ? 'No matching requests' : 'Your first request starts here'}</h2><p class="text-sm text-muted mb-5">${orders.length ? 'Try another name, reference or filter.' : 'Submit a service request using your verified email. It will appear here for updates, payment and proof.'}</p>${orders.length ? '<button id="clear-client-filter" type="button" class="btn btn-outline btn-sm">Show all requests</button>' : '<a href="/?client=1#checkout" class="btn btn-pine btn-sm">Start a request</a>'}</div>`;
         $('clear-client-filter')?.addEventListener('click', () => { filter = 'all'; $('client-search').value = ''; setFilterButtons(); renderOrders(); });
     }
+    const trackingAccess = (o) => {
+        const token = new URL(o.trackUrl, location.origin).hash.slice(3);
+        let unlockToken = '';
+        try { unlockToken = sessionStorage.getItem(`nps-unlock-${token.slice(0, 12)}`) || ''; } catch { /* storage disabled */ }
+        return { token, unlockToken };
+    };
+    $('client-orders').addEventListener('click', async (event) => {
+        const listButton = event.target.closest('[data-account-files]');
+        const verifyButton = event.target.closest('[data-account-verify]');
+        const button = listButton || verifyButton;
+        if (!button) return;
+        const code = button.dataset.accountFiles || button.dataset.orderCode;
+        const o = orders.find(item => item.code === code);
+        const result = button.closest('article')?.querySelector('[data-account-files-result]');
+        if (!o || !result) return;
+        const { token, unlockToken } = trackingAccess(o);
+        button.disabled = true;
+        try {
+            if (listButton) {
+                const view = await NPS.post('/api/track', { t: token, unlockToken, action: 'view' }, { notify: false });
+                if (view.docLock && !view.unlocked) {
+                    result.innerHTML = `<p>Open the tracking page and unlock documents to see their fingerprints here.</p><a class="underline text-primary" href="${esc(o.trackUrl)}">Unlock documents →</a>`;
+                    return;
+                }
+                accountFiles.set(code, view.files || []);
+                result.innerHTML = view.files?.length ? view.files.map(file => `<div class="border-t pt-2 mt-2"><p class="font-semibold">${esc(file.name)}</p>${/^[0-9a-f]{64}$/.test(file.sha256 || '') ? `<p class="font-mono break-all">SHA-256: ${esc(file.sha256)}</p><button type="button" class="btn btn-outline btn-sm mt-2" data-account-verify="${esc(file.id)}" data-order-code="${esc(code)}">Verify File Integrity</button><span class="block mt-1" data-integrity-status="${esc(file.id)}" role="status"></span>` : '<p>Fingerprint pending verification.</p>'}</div>`).join('') : 'No confirmed documents yet.';
+            } else {
+                const file = accountFiles.get(code)?.find(item => item.id === verifyButton.dataset.accountVerify);
+                if (!file) return;
+                const { url } = await NPS.post('/api/track', { t: token, unlockToken, action: 'download', fileId: file.id }, { notify: false });
+                const verification = await NPS.verifyFileSha256(url, file.sha256);
+                const status = verifyButton.parentElement.querySelector('[data-integrity-status]');
+                status.textContent = verification.ok ? 'Matches sealed record' : 'File does not match the recorded fingerprint. Contact Nick.';
+                status.className = verification.ok ? 'block mt-1 text-primary font-semibold' : 'block mt-1 text-[#7a1f1c] font-semibold';
+            }
+        } catch (err) { result.textContent = err.message || 'Could not load the files. Please try again.'; }
+        finally { button.disabled = false; }
+    });
     function setFilterButtons() { document.querySelectorAll('[data-client-filter]').forEach(btn => { btn.setAttribute('aria-pressed', String(btn.dataset.clientFilter === filter)); btn.classList.toggle('is-active', btn.dataset.clientFilter === filter); }); }
     document.querySelectorAll('[data-client-filter]').forEach(btn => btn.onclick = () => { filter = btn.dataset.clientFilter; setFilterButtons(); renderOrders(); });
     $('client-search').oninput = renderOrders;

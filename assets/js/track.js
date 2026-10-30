@@ -70,7 +70,7 @@ function render(o) {
 
     const proof = o.files.filter(f => f.kind === 'proof');
     const docs = o.files.filter(f => f.kind !== 'proof');
-    const chip = f => `<button type="button" class="file-chip" data-file="${esc(f.id)}" ${f.sha256 ? `title="Verified SHA-256 fingerprint: ${esc(f.sha256)}"` : ''}><i class="fa-solid ${f.kind === 'proof' ? 'fa-file-signature' : 'fa-file-lines'} text-bronze"></i><span>${esc(f.name)}</span><span class="text-muted font-normal">${NPS.fmtSize(f.size)}</span>${f.sha256 ? `<span class="text-[11px] font-mono text-primary bg-primaryLight/60 px-1.5 py-0.5 rounded-sm"><i class="fa-solid fa-shield-halved mr-0.5" aria-hidden="true"></i>SHA-256 ${esc(f.sha256.slice(0, 8))}…</span>` : ''}</button>`;
+    const chip = f => `<div class="space-y-2 max-w-full"><button type="button" class="file-chip" data-file="${esc(f.id)}"><i class="fa-solid ${f.kind === 'proof' ? 'fa-file-signature' : 'fa-file-lines'} text-bronze"></i><span>${esc(f.name)}</span><span class="text-muted font-normal">${NPS.fmtSize(f.size)}</span></button>${f.sha256 && /^[0-9a-f]{64}$/.test(f.sha256) ? `<p class="text-[11px] font-mono text-muted break-all">SHA-256: ${esc(f.sha256)}</p><button type="button" class="btn btn-outline btn-sm" data-verify="${esc(f.id)}">Verify File Integrity</button><p class="text-xs" data-integrity-result="${esc(f.id)}" role="status"></p>` : ''}</div>`;
     $('proof-files').innerHTML = proof.map(chip).join('');
     $('doc-files').innerHTML = docs.map(chip).join('');
     $('proof-block').classList.toggle('hidden', !proof.length);
@@ -135,6 +135,25 @@ document.addEventListener('click', async (e) => {
     } finally {
         btn.disabled = false;
     }
+});
+
+document.addEventListener('click', async (e) => {
+    const button = e.target.closest('[data-verify]');
+    if (!button) return;
+    const file = order?.files.find(f => f.id === button.dataset.verify);
+    const result = button.parentElement.querySelector('[data-integrity-result]');
+    if (!file || !result || !/^[0-9a-f]{64}$/.test(file.sha256 || '')) return;
+    button.disabled = true;
+    result.textContent = 'Checking file bytes…';
+    try {
+        const { url } = await trackCall({ action: 'download', fileId: file.id }, { notify: false });
+        const verification = await NPS.verifyFileSha256(url, file.sha256);
+        result.textContent = verification.ok ? 'Matches sealed record' : 'File does not match the recorded fingerprint. Contact Nick.';
+        result.className = verification.ok ? 'text-xs text-primary font-semibold' : 'text-xs text-[#7a1f1c] font-semibold';
+    } catch (err) {
+        result.textContent = err.message || 'Could not verify the file. Please try again.';
+        result.className = 'text-xs text-[#7a1f1c]';
+    } finally { button.disabled = false; }
 });
 
 $('lock-send').addEventListener('click', async () => {

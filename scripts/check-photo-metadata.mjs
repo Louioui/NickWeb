@@ -1,11 +1,12 @@
 // Loads the real browser helper (assets/js/nps.js) and checks that photo metadata (GPS, EXIF, XMP, text) is removed
 // from JPEG, PNG, WebP and HEIC files before upload, while the image data itself is left as it was.
 import assert from 'node:assert/strict';
+import { createHash, webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('../assets/js/nps.js', import.meta.url), 'utf8');
-const context = { window: {}, TextDecoder, TextEncoder, DataView, Uint8Array, File, fetch: () => {} };
+const context = { window: {}, TextDecoder, TextEncoder, DataView, Uint8Array, File, fetch: () => {}, crypto: webcrypto };
 vm.runInNewContext(`${source}\nthis.NPS = NPS;`, context);
 const { stripPhotoBytes } = context.NPS;
 const { stripPhotoBytes: stripServerPhotoBytes } = await import('../api/_lib/photo-metadata.mjs');
@@ -109,5 +110,15 @@ check('server scrubber rejects malformed HEIC GPS offsets', () => {
     malformed[t + 5] = 0xff;
     assert.equal(stripServerPhotoBytes(malformed, 'image/heic'), null);
 });
+const proof = bytes('confirmed proof bytes');
+const fingerprint = createHash('sha256').update(proof).digest('hex');
+context.fetch = async () => new Response(proof);
+const matching = await context.NPS.verifyFileSha256('https://storage.test/proof', fingerprint);
+assert.equal(matching.ok, true);
+context.fetch = async () => new Response(bytes('altered proof bytes'));
+const mismatching = await context.NPS.verifyFileSha256('https://storage.test/proof', fingerprint);
+assert.equal(mismatching.ok, false);
+passed++;
+console.log('PASS in-browser file verifier distinguishes matching from altered bytes');
 
 console.log(`${passed} photo metadata checks passed`);
