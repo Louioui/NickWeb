@@ -40,7 +40,8 @@
             : !$('fb-consent').checked ? 'Please tick the box to say Nick may use your answers.' : '';
         err.classList.toggle('hidden', !problem);
         err.textContent = problem;
-        if (problem) return;
+        // Take the person to what needs fixing: the permission box, or the first question.
+        if (problem) return (!Object.keys(answers).length ? document.querySelector('[data-q]') : $('fb-consent')).focus();
         const btn = $('fb-submit');
         btn.disabled = true; btn.textContent = 'Sending…';
         try {
@@ -48,10 +49,13 @@
             try { localStorage.removeItem(DRAFT); } catch { /* storage off */ }
             $('feedback-form').classList.add('hidden');
             $('fb-done').classList.remove('hidden');
+            $('fb-done').setAttribute('tabindex', '-1');
+            $('fb-done').focus();
             window.scrollTo({ top: 0, behavior: 'smooth' });
         } catch (ex) {
             err.textContent = ex.message;
             err.classList.remove('hidden');
+            err.scrollIntoView({ block: 'center', behavior: 'smooth' });
         } finally { btn.disabled = false; btn.textContent = 'Send my answers'; }
     });
 })();

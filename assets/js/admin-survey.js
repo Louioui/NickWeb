@@ -91,7 +91,17 @@
             finally { b.disabled = false; msg.classList.remove('hidden'); }
         }
     });
+    // Keyboard focus stays inside the window while it's open (Tab and Shift+Tab wrap), as in the Guide.
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && !$('survey-modal').classList.contains('hidden')) close();
+        if ($('survey-modal').classList.contains('hidden')) return;
+        if (e.key === 'Escape') return close();
+        if (e.key !== 'Tab') return;
+        const focusable = [...$('survey-modal').querySelectorAll('button:not([disabled]), [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])')]
+            .filter(el => el.offsetParent !== null);
+        if (!focusable.length) return;
+        const first = focusable[0], last = focusable[focusable.length - 1];
+        if (e.shiftKey && (document.activeElement === first || document.activeElement === $('survey-title'))) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        else if (!$('survey-modal').contains(document.activeElement)) { e.preventDefault(); first.focus(); }
     });
 })();
