@@ -6,6 +6,7 @@ import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie,
 import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal, attemptDetail } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
+import { zipEvidencePack } from './_lib/evidence-pack.mjs';
 
 const COOKIE = 'nps_admin';
 const SESSION_DAYS = 14;
@@ -44,6 +45,7 @@ export const POST = handle(async (request) => {
     if (a === 'proof-finish') return proofFinish(request, body);
     if (a === 'file-url') return fileUrl(request, body, admin);
     if (a === 'export') return exportOrder(request, body, admin);
+    if (a === 'dispute-pack') return disputePack(request, body, admin);
     if (a === 'delete') return deleteOrder(request, body, admin);
     throw new HttpError(400, 'Unknown action.');
 });
@@ -697,6 +699,48 @@ async function exportOrder(request, body, admin) {
         timeline: events.map(({ created_at, title, detail: d, client_visible }) => ({ created_at, title, detail: d, shown_to_client: client_visible })),
         files: files.map(({ filename, kind, size_bytes, sha256: h, created_at }) => ({ filename, kind, size_bytes, sha256: h || null, created_at })),
     });
+}
+
+async function allEvidenceRows(table, columns, orderId) {
+    const result = [];
+    for (let from = 0; ; from += 500) {
+        const { data, error } = await db().from(table).select(columns).eq('order_id', orderId)
+            .order('created_at', { ascending: true }).order('id', { ascending: true }).range(from, from + 499);
+        if (error) throw error;
+        result.push(...(data || []));
+        if (!data || data.length < 500) return result;
+    }
+}
+
+async function disputePack(request, body, admin) {
+    await rateLimit(`admin-dispute-pack:${sha256(admin)}`, 10, 900);
+    const order = await getOrder(body.id);
+    const [events, fileRows, auditRows, chain] = await Promise.all([
+        allEvidenceRows('order_events', 'id, kind, title, detail, created_at', order.id),
+        allEvidenceRows('order_files', 'id, filename, kind, sha256, uploaded, created_at', order.id),
+        allEvidenceRows('client_audit_logs', 'id, action, file_id, created_at', order.id),
+        orderSeal(order.id),
+    ]);
+    if (!chain.verified) throw new HttpError(409, 'The event chain did not verify. Investigate before exporting evidence.');
+    const fileNames = new Map(fileRows.map(f => [f.id, f.filename]));
+    const pack = {
+        exported_at: new Date().toISOString(),
+        order: { code: order.code, client_name: order.client_name, recipient_name: order.recipient_name,
+            case_number: order.case_number || null, court: order.court || null, tier: TIERS[order.tier]?.name || order.tier },
+        attestation: events.find(e => e.kind === 'attestation') || null,
+        payment: { stripe_session_id: order.stripe_session_id || null, amount_due_cents: order.amount_due_cents,
+            paid_at: order.paid_at || null },
+        attempts: events.filter(e => e.kind === 'attempt').map(({ created_at, title, detail }) => ({ created_at, title, detail })),
+        downloads: auditRows.filter(e => e.action === 'file_download').map(({ created_at, file_id }) =>
+            ({ created_at, file_id, filename: fileNames.get(file_id) || null })),
+        files: fileRows.filter(f => f.uploaded).map(({ filename, kind, sha256 }) => ({ filename, kind, sha256: sha256 || null })),
+        chain: { verified: chain.verified, head: chain.head, entries: chain.entries },
+    };
+    await auditAdmin(request, admin, 'dispute_pack_export', order.code);
+    return new Response(zipEvidencePack(pack), { status: 200, headers: {
+        'Content-Type': 'application/zip', 'Content-Disposition': `attachment; filename="${order.code}-dispute-evidence.zip"`,
+        'Cache-Control': 'no-store',
+    } });
 }
 
 // Permanent: removes the stored documents, then the request with its timeline and file records (cascade).

@@ -79,6 +79,17 @@ function seedOrder(over = {}) {
 const setPin = (email, extra = {}) => (tables().client_security_settings ||= []).push({ email, pin_hash: core.hashPin(PIN), failed_tries: 0, locked_until: null, ...extra });
 const pinRow = (email) => (tables().client_security_settings || []).find(r => r.email === email);
 const events = (orderId) => (tables().order_events || []).filter(e => e.order_id === orderId);
+function storedZipEntries(bytes) {
+    const entries = new Map();
+    for (let at = 0; bytes.readUInt32LE(at) === 0x04034b50;) {
+        const size = bytes.readUInt32LE(at + 18), nameLength = bytes.readUInt16LE(at + 26), extraLength = bytes.readUInt16LE(at + 28);
+        const name = bytes.subarray(at + 30, at + 30 + nameLength).toString();
+        const begin = at + 30 + nameLength + extraLength;
+        entries.set(name, bytes.subarray(begin, begin + size).toString());
+        at = begin + size;
+    }
+    return entries;
+}
 
 // --- F-01: the PIN must also guard magic-link sign-in (the `session` action) ---
 await check('F-01 magic-link sign-in asks for the PIN instead of setting a cookie', async () => {
@@ -282,6 +293,28 @@ await check('client audit log records tracking, unlock, download, reply and paym
     const logs = (tables().client_audit_logs || []).filter(x => x.order_id === o.id);
     expect(['tracking_view', 'document_unlock', 'file_download', 'action_reply', 'payment_confirmation'].every(action => logs.some(x => x.action === action)), `missing audit action: ${logs.map(x => x.action)}`);
     expect(logs.every(x => /^[0-9a-f]{64}$/.test(x.ip_hash) && !JSON.stringify(x).includes('203.0.113.17')), 'raw IP stored in audit log');
+});
+await check('admin dispute pack contains paginated evidence, excludes tokens, and needs admin auth', async () => {
+    reset();
+    const o = seedOrder({ recipient_name: '<script>Unsafe</script>', stripe_session_id: 'cs_test_evidence123', paid_at: new Date().toISOString(), amount_due_cents: 7500 });
+    const f = seedFile(o, { filename: 'proof.pdf', kind: 'proof', uploaded: true, sha256: 'a'.repeat(64) });
+    const at = new Date().toISOString();
+    (tables().order_events ||= []).push({ id: randomUUID(), order_id: o.id, kind: 'attestation', title: 'Client legal attestation', created_at: at });
+    for (let n = 0; n < 501; n++) (tables().order_events ||= []).push({ id: randomUUID(), order_id: o.id, kind: 'attempt', title: 'Attempt: No answer', detail: `Try ${n}`, created_at: at });
+    (tables().client_audit_logs ||= []).push({ id: randomUUID(), order_id: o.id, action: 'file_download', file_id: f.id, created_at: at, ip_hash: 'b'.repeat(64) });
+    const denied = await adminPOST(post('/api/admin', { action: 'dispute-pack', id: o.id }));
+    expect(denied.status === 401, `unauthenticated evidence export returned ${denied.status}`);
+    const token = 'A'.repeat(43);
+    (tables().admin_sessions ||= []).push({ token_hash: core.sha256(token), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: at });
+    const res = await adminPOST(post('/api/admin', { action: 'dispute-pack', id: o.id }, { cookie: `nps_admin=${token}` }));
+    expect(res.status === 200 && res.headers.get('content-type') === 'application/zip', `evidence export returned ${res.status}`);
+    const entries = storedZipEntries(Buffer.from(await res.arrayBuffer()));
+    const pack = JSON.parse(entries.get('evidence.json'));
+    expect(pack.attestation.created_at === at && pack.payment.stripe_session_id === o.stripe_session_id && pack.payment.paid_at === o.paid_at, 'attestation or payment missing');
+    expect(pack.attempts.length === 501 && pack.downloads[0].filename === 'proof.pdf' && pack.files[0].sha256 === f.sha256, 'attempt, download or fingerprint missing');
+    expect(pack.chain.verified && /^[0-9a-f]{64}$/.test(pack.chain.head), 'sealed chain head missing');
+    expect(!entries.get('evidence.json').includes(o.track_token) && !entries.get('evidence.json').includes('ip_hash'), 'private token or IP digest exported');
+    expect(entries.get('evidence.html').includes('&lt;script&gt;Unsafe&lt;/script&gt;') && !entries.get('evidence.html').includes('<script>Unsafe</script>'), 'HTML output was not escaped');
 });
 
 await check('F-04 a failed download leaves the file unconfirmed', async () => {

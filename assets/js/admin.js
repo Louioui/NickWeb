@@ -335,6 +335,7 @@ function renderDetail() {
             </div>
             ${groups.length ? `<div class="mt-7 pt-5 rule-t space-y-4">${groups.map(([label, list]) => `
                 <div><p class="field-label">${label}</p><div class="flex flex-wrap gap-2">${list.map(fileChip).join('')}</div></div>`).join('')}</div>` : ''}
+            <div class="mt-7 pt-5 rule-t"><button type="button" class="btn btn-outline btn-sm" data-click="downloadDisputePack">Download Dispute Evidence Pack</button><p class="text-xs text-muted mt-2">Printable HTML and source JSON in one ZIP file.</p></div>
         </div>
 
         <div class="panel">
@@ -587,6 +588,28 @@ async function exportJob() {
     const a = Object.assign(document.createElement('a'), { href: url, download: `${current.order.code}-data.json` });
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+async function downloadDisputePack(_arg, button) {
+    if (!current) return;
+    button.disabled = true;
+    const code = current.order.code;
+    try {
+        const res = await fetch('/api/admin', { method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'dispute-pack', id: current.order.id }) });
+        if (!res.ok) {
+            const error = await res.json().catch(() => ({}));
+            throw new Error(error.error || 'Could not prepare the evidence pack.');
+        }
+        const url = URL.createObjectURL(await res.blob());
+        const link = Object.assign(document.createElement('a'), { href: url, download: `${code}-dispute-evidence.zip` });
+        document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        $('save-feedback').textContent = 'Dispute evidence pack downloaded.';
+        $('save-feedback').className = 'desk-feedback result-box result-ok';
+    } catch (err) {
+        $('save-feedback').textContent = err.message;
+        $('save-feedback').className = 'desk-feedback result-box result-err';
+    } finally { button.disabled = false; }
 }
 
 async function downloadFile(fileId, btn) {
@@ -927,7 +950,7 @@ async function copyAddress() {
 // Buttons say what they do with data-click (and data-arg) instead of inline onclick, so the page's Content Security
 // Policy can refuse inline scripts. Only the functions listed here can be triggered this way.
 const CLICK_ACTIONS = {
-    backToList, closeSecurityModal, refreshJobs, exportJob, showEmailStep, rotateLink, toggleDocLockJob, printRecord, copyAddress,
+    backToList, closeSecurityModal, refreshJobs, exportJob, downloadDisputePack, showEmailStep, rotateLink, toggleDocLockJob, printRecord, copyAddress,
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes, sendStepUpCode,
     dismissSecuritySetup, openRecoverySetup,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,

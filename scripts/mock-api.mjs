@@ -5,6 +5,7 @@ import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken, attemptDetail } from '../api/_lib/orders.mjs';
 import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
 import { stripPhotoBytes } from '../api/_lib/photo-metadata.mjs';
+import { zipEvidencePack } from '../api/_lib/evidence-pack.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
 export const MOCK_CLIENT_CODE = '123456';
@@ -815,7 +816,7 @@ const handlers = {
             if (!f?.uploaded) fail(404, 'File not found.');
             return json({ url: `/__mock-file/${f.id}` });
         }
-        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'export', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
+        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'export', 'dispute-pack', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
         const oid = cleanUuid(body.id, 'Order');
         const o = orders.get(oid);
         if (!o) fail(404, 'Order not found.');
@@ -895,6 +896,30 @@ const handlers = {
             return json({ exported_at: now(), integrity_seal: integritySeal, request: { ...fields, tier: TIERS[o.tier]?.name },
                 timeline: detEvents.map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible })),
                 files: detFiles.map(({ filename, kind, size_bytes, sha256, created_at }) => ({ filename, kind, size_bytes, sha256: sha256 || null, created_at })) });
+        }
+        if (a === 'dispute-pack') {
+            const chain = orderSeal(o.id);
+            if (!chain.verified) fail(409, 'The event chain did not verify. Investigate before exporting evidence.');
+            const evs = events.filter(e => e.order_id === o.id).sort((x, y) => x.created_at.localeCompare(y.created_at));
+            const fls = [...files.values()].filter(f => f.order_id === o.id);
+            const fileNames = new Map(fls.map(f => [f.id, f.filename]));
+            const pack = {
+                exported_at: now(),
+                order: { code: o.code, client_name: o.client_name, recipient_name: o.recipient_name,
+                    case_number: o.case_number || null, court: o.court || null, tier: TIERS[o.tier]?.name || o.tier },
+                attestation: evs.find(e => e.kind === 'attestation') || null,
+                payment: { stripe_session_id: o.stripe_session_id || null, amount_due_cents: o.amount_due_cents,
+                    paid_at: o.paid_at || null },
+                attempts: evs.filter(e => e.kind === 'attempt').map(({ created_at, title, detail }) => ({ created_at, title, detail })),
+                downloads: clientAuditLogs.filter(e => e.order_id === o.id && e.action === 'file_download').map(({ created_at, file_id }) =>
+                    ({ created_at, file_id, filename: fileNames.get(file_id) || null })),
+                files: fls.filter(f => f.uploaded).map(({ filename, kind, sha256 }) => ({ filename, kind, sha256: sha256 || null })),
+                chain: { verified: chain.verified, head: chain.head, entries: chain.entries },
+            };
+            auditAdmin(adminEmail, 'dispute_pack_export', o.code);
+            return new Response(zipEvidencePack(pack), { status: 200, headers: {
+                'Content-Type': 'application/zip', 'Content-Disposition': `attachment; filename="${o.code}-dispute-evidence.zip"`, 'Cache-Control': 'no-store',
+            } });
         }
         if (a === 'delete') {
             if (o.legal_hold) fail(423, 'This order is under legal hold and cannot be deleted. Unlock legal hold first (that step is logged and emailed to you).');
@@ -1145,12 +1170,14 @@ function sampleFile(orderId, kind, filename, at) {
     addEvent(d.id, 'note', 'Internal note', 'Neighbor says he leaves around 7:15am. Try early.', false, ago(25));
     addEvent(d.id, 'attempt', 'Attempt: Subject not home', 'Spoke with roommate, said he works evenings.', true, ago(4));
 
-    const e = mk({ code: 'NP-894771', recipient_name: 'Alicia Moreno', address: '520 Pine Ave', status: 'served', amount_due_cents: 14000, paid_at: ago(100), served_at: ago(20), legal_hold: true }, 120);
+    const e = mk({ code: 'NP-894771', recipient_name: 'Alicia Moreno', address: '520 Pine Ave', status: 'served', amount_due_cents: 14000, paid_at: ago(100), stripe_session_id: 'cs_mock_paid_seed', served_at: ago(20), legal_hold: true }, 120);
     addEvent(e.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(120));
+    addEvent(e.id, 'attestation', 'Client legal attestation & Terms sealed', 'Terms & Best-Efforts Service scope accepted', true, ago(119));
     addEvent(e.id, 'payment', 'Payment received: $140.00', null, true, ago(100));
     addEvent(e.id, 'attempt', 'Attempt: No answer', null, true, ago(70));
     addEvent(e.id, 'status', 'Served', 'Personally served at residence.', true, ago(20));
     sampleFile(e.id, 'client_document', 'Summons-and-Complaint.pdf', ago(120));
     const proof = sampleFile(e.id, 'proof', 'Proof-of-Service-Moreno.pdf', ago(19));
     addEvent(e.id, 'proof', 'Proof of service uploaded', `${proof.filename} (SHA-256: ${proof.sha256.slice(0, 12)}…)`, true, ago(19));
+    clientAuditLogs.push({ order_id: e.id, action: 'file_download', file_id: proof.id, ip_hash: sha256Hex('sample-client-network'), created_at: ago(10) });
 })();

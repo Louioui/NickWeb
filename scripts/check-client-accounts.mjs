@@ -5,6 +5,16 @@ import { verifiedClient, clientCookie, savedClientSession, clientProfile } from 
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
 const call = async (body, cookie = '', endpoint = 'client') => handleMockApi(endpoint, new Request(`http://localhost/api/${endpoint}`, { method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify(body) }));
+function zipJson(bytes) {
+    for (let at = 0; bytes.readUInt32LE(at) === 0x04034b50;) {
+        const size = bytes.readUInt32LE(at + 18), nameSize = bytes.readUInt16LE(at + 26), extraSize = bytes.readUInt16LE(at + 28);
+        const name = bytes.subarray(at + 30, at + 30 + nameSize).toString();
+        const begin = at + 30 + nameSize + extraSize;
+        if (name === 'evidence.json') return JSON.parse(bytes.subarray(begin, begin + size).toString());
+        at = begin + size;
+    }
+    throw new Error('JSON missing from ZIP');
+}
 const signup = async addr => {
     assert.equal((await call({ action:'send-code', intent:'signup', email:addr, name:'Demo Client', firm:'Test Firm' })).status,200);
     const response = await call({ action:'verify-code', email:addr, code:'123456' });
@@ -95,6 +105,17 @@ const trackData = await (await call({ action: 'view', t: detailData.order.track_
 check('Proof of Service exposes matching SHA-256 fingerprint on client tracking view', () => {
     const clientProof = trackData.files.find(f => f.kind === 'proof');
     assert.equal(clientProof?.sha256, proofFile.sha256);
+});
+await call({ action: 'download', t: detailData.order.track_token, fileId: proofFile.id }, '', 'track');
+const mockPackResponse = await call({ action: 'dispute-pack', id: servedOrder.id }, nickCookie, 'admin');
+const mockPack = zipJson(Buffer.from(await mockPackResponse.arrayBuffer()));
+check('mock dispute pack includes verified file and client download evidence', () => {
+    assert.equal(mockPackResponse.headers.get('content-type'), 'application/zip');
+    assert.equal(mockPack.files.find(f => f.kind === 'proof')?.sha256, proofFile.sha256);
+    assert.ok(mockPack.downloads.some(d => d.file_id === proofFile.id));
+    assert.equal(mockPack.chain.verified, true);
+    assert.ok(mockPack.attestation?.created_at && mockPack.payment.stripe_session_id);
+    assert.equal(mockPack.order.track_token, undefined);
 });
 const finishBody = { step: 'finish', t: detailData.order.track_token, fileIds: [] };
 assert.equal((await call(finishBody, '', 'request')).status, 200);
