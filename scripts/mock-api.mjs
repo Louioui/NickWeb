@@ -5,6 +5,7 @@ import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken, receiptForOrder, attemptDetail } from '../api/_lib/orders.mjs';
 import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
 import { stripPhotoBytes } from '../api/_lib/photo-metadata.mjs';
+import { countPdfPages, printingSummary } from '../api/_lib/pdf-pages.mjs';
 import { zipEvidencePack } from '../api/_lib/evidence-pack.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
@@ -211,6 +212,7 @@ function adminDetail(o) {
         order: { ...o, legal_hold: !!o.legal_hold, doc_lock: !!o.doc_lock, integrity_seal: seal, tier_name: TIERS[o.tier]?.name, addon_names: o.addons.map(k => ADDONS[k]?.name).filter(Boolean), receipt: receiptForOrder(o) },
         events: evs,
         files: fls,
+        printing: printingSummary(fls),
         integritySeal: seal,
         statuses: STATUSES,
     };
@@ -289,7 +291,7 @@ function verifyFileMagic(bytes, filename) {
     }
     return false;
 }
-function confirmUploads(orderId, ids) {
+async function confirmUploads(orderId, ids) {
     const out = [];
     for (const id of (Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && UUID_RE.test(id))) {
         const f = files.get(id.toLowerCase());
@@ -299,6 +301,10 @@ function confirmUploads(orderId, ids) {
             continue;
         }
         const ext = f.filename.split('.').pop().toLowerCase();
+        if (ext === 'pdf') {
+            f.page_count = await countPdfPages(f.data);
+            if (!f.page_count) { files.delete(f.id); continue; }
+        }
         const type = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif' }[ext];
         if (type) {
             const clean = stripPhotoBytes(f.data, type);
@@ -494,7 +500,7 @@ const handlers = {
     async request(req, body) {
         if (body.step === 'finish') {
             const o = orderByToken(body.t);
-            const up = confirmUploads(o.id, body.fileIds);
+            const up = await confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} document${up.length === 1 ? '' : 's'} uploaded`);
             if (events.some(e => e.order_id === o.id && e.title === 'Confirmation emailed')) return json({ ok: true });
             email(o.client_email, `We received your request ${o.code}`, `/track.html#t=${o.track_token}`);
@@ -638,7 +644,7 @@ const handlers = {
         if (body.action === 'respond-finish') {
             if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Unlock it first.');
             if (o.status !== 'received') return json(clientView(o, { unlocked }));
-            const up = confirmUploads(o.id, body.fileIds);
+            const up = await confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
             const orderEvents = events.filter(e => e.order_id === o.id);
             const lastResponse = [...orderEvents].reverse().find(e => e.kind === 'action_response');
@@ -945,7 +951,7 @@ const handlers = {
             return json({ uploads: prepareUploads(o.id, 'proof', body.files) });
         }
         if (a === 'proof-finish') {
-            const up = confirmUploads(o.id, body.fileIds);
+            const up = await confirmUploads(o.id, body.fileIds);
             if (!up.length) fail(400, 'The upload did not finish. Please try again.');
             const detailText = up.map(f => f.sha256 ? `${f.filename} (SHA-256: ${f.sha256.slice(0, 12)}…)` : f.filename).join(', ');
             addEvent(o.id, 'proof', 'Proof of service uploaded', detailText);
@@ -1141,7 +1147,7 @@ function sampleFile(orderId, kind, filename, at) {
     const data = samplePdf(`Sample file: ${filename}`);
     const id = randomUUID();
     const sha256 = sha256Hex(data);
-    files.set(id, { id, order_id: orderId, kind, filename, size_bytes: data.length, content_type: 'application/pdf', sha256, uploaded: true, data, created_at: at });
+    files.set(id, { id, order_id: orderId, kind, filename, size_bytes: data.length, content_type: 'application/pdf', sha256, uploaded: true, page_count: 1, data, created_at: at });
     return files.get(id);
 }
 

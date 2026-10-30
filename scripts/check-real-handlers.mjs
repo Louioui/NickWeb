@@ -4,6 +4,8 @@
 import { mock } from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { createFakeSupabase } from './fake-supabase.mjs';
+import { testPdf } from './test-pdf.mjs';
+import { countPdfPages, printingSummary } from '../api/_lib/pdf-pages.mjs';
 
 const db = createFakeSupabase();
 const stripeSessions = new Map();
@@ -282,7 +284,7 @@ await check('F-03 the right PIN still unlocks normally', async () => {
     expect(res.status === 200 && body.unlockToken, `unlock failed (${res.status} ${JSON.stringify(body)})`);
 });
 // --- F-04: file checks fail closed ---
-const PDF = new TextEncoder().encode('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n');
+const PDF = testPdf();
 function seedFile(o, over = {}) {
     const f = { id: randomUUID(), order_id: o.id, kind: 'client_document', storage_path: `orders/${o.id}/client/${randomUUID()}-a.pdf`,
         filename: 'a.pdf', size_bytes: PDF.length, content_type: 'application/pdf', uploaded: false, created_at: new Date().toISOString(), ...over };
@@ -492,6 +494,19 @@ await check('F-10 a PDF with a script action deep inside (past 4 KB) is refused'
     const pdf = new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n<< /S /JavaScript /JS (app.alert(1)) >>\n%%EOF`);
     expect(core.verifyFileMagic(pdf, 'a.pdf') === false, 'deep /JavaScript action accepted');
     expect(core.verifyFileMagic(new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n%%EOF`), 'a.pdf') === true, 'clean PDF refused');
+});
+await check('real PDF page tree drives printing fee; malformed PDFs never get a page count', async () => {
+    reset(); const o = seedOrder();
+    const file = seedFile(o);
+    db.__state.storage.set(file.storage_path, testPdf(101));
+    const confirmed = await core.confirmUploads(o.id, [file.id]);
+    expect(confirmed.files.length === 1 && file.page_count === 101, `page count not stored: ${file.page_count}`);
+    const detail = await adminPOST(post('/api/admin', { action: 'get', id: o.id }, { cookie: adminCookie() }));
+    const view = await detail.json();
+    expect(detail.status === 200 && view.printing.pages === 101 && view.printing.feeCents === 15, 'dashboard fee is not $0.15 for page 101');
+    expect(printingSummary([{ kind: 'client_document', filename: 'a.pdf', page_count: 100 }]).feeCents === 0, 'first 100 pages not free');
+    expect(await countPdfPages(Buffer.from('%PDF-1.7\nnot a page tree\n%%EOF')) === null, 'malformed PDF counted');
+    expect(await countPdfPages(testPdf(1, '/OpenAction << /S /JavaScript /JS (app.alert(1)) >>')) === null, 'PDF action parsed as safe');
 });
 await check('F-10 middle-of-file PDF actions and HTML are refused by the real upload path', async () => {
     const middle = 'x'.repeat(500000);

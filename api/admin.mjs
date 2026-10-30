@@ -7,6 +7,7 @@ import { STATUSES, TIERS, ADDONS, money, receiptForOrder, sendEmail, sendSecurit
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 import { zipEvidencePack } from './_lib/evidence-pack.mjs';
+import { printingSummary } from './_lib/pdf-pages.mjs';
 
 const COOKIE = 'nps_admin';
 const SESSION_DAYS = 14;
@@ -480,7 +481,7 @@ async function detail(id) {
     const order = await getOrder(id);
     const [{ data: events }, fileRes] = await Promise.all([
         db().from('order_events').select('*').eq('order_id', id).order('created_at', { ascending: true }),
-        db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at, uploaded').eq('order_id', id).order('created_at'),
+        db().from('order_files').select('id, kind, filename, size_bytes, sha256, page_count, created_at, uploaded').eq('order_id', id).order('created_at'),
     ]);
     let files = fileRes.data;
     if (fileRes.error) {
@@ -499,6 +500,7 @@ async function detail(id) {
         },
         events,
         files: uploadedFiles,
+        printing: printingSummary(uploadedFiles),
         integritySeal,
         statuses: STATUSES,
     };

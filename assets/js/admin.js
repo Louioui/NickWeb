@@ -455,8 +455,10 @@ function actionForm(o) {
         <div><label for="f-note" class="field-label">What do you need?</label><textarea id="f-note" class="field h-24 resize-none" placeholder="e.g. The apartment number is missing. Which unit does the subject live in?"></textarea></div>
         ${submitBtn('Send to Client')}`;
     if (actionTab === 'payment') {
-        if (o.paid_at) return `<p class="result-box result-ok text-sm">Paid ${NPS.money(o.amount_due_cents)} on ${esc(NPS.fmtDate(o.paid_at))}.</p>`;
+        if (o.paid_at) return `<p class="result-box result-ok text-sm">Paid ${NPS.money(o.paid_amount_cents ?? o.amount_due_cents)} on ${esc(NPS.fmtDate(o.paid_at))}.</p>`;
+        const printing = current.printing;
         return `
+        <div class="result-box result-info text-sm"><strong>PDF printing:</strong> ${printing.complete ? `${printing.pages} page${printing.pages === 1 ? '' : 's'} across ${printing.pdfs} document PDF${printing.pdfs === 1 ? '' : 's'} · ${NPS.money(printing.feeCents)} estimated fee (first 100 pages free; $0.15 per additional page)` : `${printing.countedPdfs} of ${printing.pdfs} document PDFs counted. Review older or unreadable PDFs before quoting a printing fee.`}</div>
         ${o.payment_url && o.status === 'awaiting_payment' ? `<p class="result-box result-warn text-sm">A payment link for ${NPS.money(o.amount_due_cents)} was already sent. Sending a new one replaces it.</p>` : ''}
         <div class="grid sm:grid-cols-3 gap-4">
             <div><label for="f-amount" class="field-label">Amount ($)</label><input id="f-amount" type="number" min="1" step="0.01" class="field" value="${((o.amount_due_cents ?? o.estimated_total_cents) / 100).toFixed(2)}"></div>

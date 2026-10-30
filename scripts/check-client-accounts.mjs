@@ -95,6 +95,12 @@ check('mock active jobs include a last client contact date', () => {
 });
 const servedOrder = listData.orders.find(o => o.code === 'NP-894771');
 const detailData = await (await call({ action: 'get', id: servedOrder.id }, nickCookie, 'admin')).json();
+check('mock admin printing summary counts client PDFs but excludes proof', () => {
+    assert.equal(detailData.printing.pages, 1);
+    assert.equal(detailData.printing.pdfs, 1);
+    assert.equal(detailData.printing.feeCents, 0);
+    assert.equal(detailData.printing.complete, true);
+});
 const accountReceipt = await (await call({ action: 'receipt', code: servedOrder.code }, a)).json();
 check('mock receipt is itemized and uses the recorded captured amount', () => {
     assert.equal(accountReceipt.receipt.amountPaidCents, 14000);

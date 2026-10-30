@@ -2,6 +2,7 @@
 // Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
 import { createClient } from '@supabase/supabase-js';
 import { stripPhotoBytes } from './photo-metadata.mjs';
+import { countPdfPages } from './pdf-pages.mjs';
 import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
@@ -447,6 +448,10 @@ export async function inspectStoredFile(path, filename) {
         if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
         const ext = filename.split('.').pop().toLowerCase();
         const type = TYPE_BY_EXT[ext];
+        if (ext === 'pdf') {
+            const pageCount = await countPdfPages(buf);
+            return pageCount ? { state: 'ok', sha256: sha256(buf), pageCount } : { state: 'bad' };
+        }
         if (!type?.startsWith('image/')) return { state: 'ok', sha256: sha256(buf) };
         const scrubbed = stripPhotoBytes(buf, type);
         if (!scrubbed || !verifyFileMagic(scrubbed, filename)) return { state: 'bad' };
@@ -485,9 +490,9 @@ export async function confirmUploads(orderId, fileIds) {
         }
         if (check.state === 'missing') { missing++; continue; }
         if (check.state !== 'ok') { stillChecking++; continue; }
-        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id);
+        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256, page_count: check.pageCount || null }).eq('id', r.id);
         if (uErr) throw uErr;
-        done.push({ ...r, sha256: check.sha256 });
+        done.push({ ...r, sha256: check.sha256, page_count: check.pageCount || null });
     }
     return { files: done, stillChecking, missing, rejected };
 }

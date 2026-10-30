@@ -49,7 +49,7 @@ export const GET = handle(async (request) => {
             missing.push(f.id);
             continue;
         }
-        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', f.id);
+        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256, page_count: check.pageCount || null }).eq('id', f.id);
         if (uErr) throw uErr;
         await addEvent(f.order_id, 'note', 'Document received', f.filename);
         recovered++;
