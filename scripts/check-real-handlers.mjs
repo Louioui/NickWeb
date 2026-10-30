@@ -893,5 +893,48 @@ await check('F-09 with the authenticator on, an emailed step-up code cannot be r
     expect(res.status === 400, `step-up email sent while authenticator is on (${res.status})`);
 });
 
+
+// --- Ported from the field-tools branch: database file cap, byte-sized request limit, portal receipts and proof files ---
+await check('PORT-1 when the database refuses the 26th file (order_files_cap), the request gets a clear 400', async () => {
+    reset(); const o = seedOrder();
+    const realFrom = db.from;
+    db.from = (t) => t === 'order_files'
+        ? { select: () => ({ eq: async () => ({ count: 20, error: null }) }),
+            insert: () => ({ select: async () => ({ data: null, error: { code: 'P0001', message: 'order_files_cap: at most 25 files per request' } }) }) }
+        : realFrom(t);
+    try {
+        await core.prepareUploads(o.id, 'client_document', [{ name: 'a.pdf', size: 10, type: 'application/pdf' }]);
+        throw new Error('no error thrown');
+    } catch (err) {
+        expect(err instanceof core.HttpError && err.status === 400 && /at most 25 files/.test(err.message), err.message);
+    } finally { db.from = realFrom; }
+});
+await check('PORT-2 a batch of uploads is created in one insert and every file gets its own upload link', async () => {
+    reset(); const o = seedOrder();
+    const out = await core.prepareUploads(o.id, 'client_document', [1, 2, 3].map(i => ({ name: `f${i}.pdf`, size: 10, type: 'application/pdf' })));
+    expect(out.length === 3 && new Set(out.map(x => x.fileId)).size === 3 && out.every(x => x.fileId && x.uploadUrl), JSON.stringify(out));
+});
+await check('PORT-3 the 64 KB request limit counts bytes, so multi-byte text cannot carry three times as much', async () => {
+    const body = JSON.stringify({ action: 'view', note: '\u20ac'.repeat(30000) });   // 30,000 characters, about 90 KB
+    const res = await trackPOST(new Request('https://site.test/api/track', { method: 'POST', headers: { 'content-type': 'application/json' }, body }));
+    expect(res.status === 413, `got ${res.status}`);
+});
+await check('PORT-4 portal receipt and proof links stay inside the client\'s own requests', async () => {
+    reset(); db.__addUser(CLIENT);
+    const mine = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 7500 });
+    const theirs = seedOrder({ id: randomUUID(), code: 'NP-654321', client_email: 'other@example.com', paid_at: new Date().toISOString(), track_token: 'U'.repeat(32) });
+    (tables().order_files ||= []).push(
+        { id: randomUUID(), order_id: mine.id, kind: 'proof', filename: 'mine.pdf', storage_path: 'p/mine.pdf', uploaded: true, sha256: 'c'.repeat(64) },
+        { id: randomUUID(), order_id: theirs.id, kind: 'proof', filename: 'theirs.pdf', storage_path: 'p/theirs.pdf', uploaded: true, sha256: 'd'.repeat(64) });
+    const login = await codeLogin({ remember: false });
+    const cookie = `nps_client=${cookieValue(login, 'nps_client')}`;
+    const links = await (await clientPOST(post('/api/client', { action: 'proof-links' }, { cookie }))).json();
+    expect(links.files.length === 1 && links.files[0].name === 'mine.pdf' && links.files[0].sha256 === 'c'.repeat(64), JSON.stringify(links));
+    expect((tables().client_audit_logs || []).some(l => l.order_id === mine.id && l.action === 'download'), 'portal download not logged');
+    const r = await clientPOST(post('/api/client', { action: 'receipt', code: 'NP-123456' }, { cookie }));
+    expect(r.status === 200 && (await r.json()).receipt?.code === 'NP-123456', `own receipt ${r.status}`);
+    expect((await clientPOST(post('/api/client', { action: 'receipt', code: 'NP-654321' }, { cookie }))).status === 404, 'another client\'s receipt was returned');
+});
+
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);
 if (failures.length) process.exit(1);

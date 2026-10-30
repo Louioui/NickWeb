@@ -58,7 +58,7 @@ export async function readJson(request, maxBytes = 64 * 1024) {
     const origin = request.headers.get('origin');
     if (origin && origin !== new URL(request.url).origin) throw new HttpError(403, 'Invalid request.');
     const text = await request.text();
-    if (text.length > maxBytes) throw new HttpError(413, 'Request is too large.');
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) throw new HttpError(413, 'Request is too large.');   // bytes, not characters
     let parsed;
     try {
         parsed = text ? JSON.parse(text, (k, v) => (k === '__proto__' || k === 'constructor' || k === 'prototype') ? undefined : v) : {};
@@ -347,17 +347,20 @@ export async function prepareUploads(orderId, kind, files) {
         throw new HttpError(400, `Each request can have at most ${MAX_ORDER_FILES} files total.`);
     }
     const folder = { client_document: 'client', proof: 'proof', action_upload: 'action' }[kind];
+    const planned = files.map(f => ({ f, path: `orders/${orderId}/${folder}/${randomToken(8)}-${f.name.replace(/[^\w.\-]+/g, '_').slice(-120)}` }));
+    // One insert for the whole batch: the database's per-request cap (order_files_cap trigger) then accepts or refuses
+    // all of them together, so parallel batches can't push a request past 25 files between the count above and here.
+    const { data: rows, error } = await db().from('order_files').insert(planned.map(({ f, path }) => ({
+        order_id: orderId, kind, storage_path: path, filename: f.name, size_bytes: f.size, content_type: f.type,
+    }))).select('id, storage_path');
+    if (error?.message?.includes('order_files_cap')) throw new HttpError(400, `Each request can have at most ${MAX_ORDER_FILES} files total.`);
+    if (error) throw error;
+    const idFor = new Map((rows || []).map(r => [r.storage_path, r.id]));
     const out = [];
-    for (const f of files) {
-        const safe = f.name.replace(/[^\w.\-]+/g, '_').slice(-120);
-        const path = `orders/${orderId}/${folder}/${randomToken(8)}-${safe}`;
-        const { data: row, error } = await db().from('order_files').insert({
-            order_id: orderId, kind, storage_path: path, filename: f.name, size_bytes: f.size, content_type: f.type,
-        }).select('id').single();
-        if (error) throw error;
+    for (const { f, path } of planned) {
         const { data: signed, error: sErr } = await db().storage.from(BUCKET).createSignedUploadUrl(path);
         if (sErr) throw sErr;
-        out.push({ fileId: row.id, name: f.name, uploadUrl: signed.signedUrl });
+        out.push({ fileId: idFor.get(path), name: f.name, uploadUrl: signed.signedUrl });
     }
     return out;
 }
