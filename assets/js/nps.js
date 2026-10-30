@@ -109,31 +109,50 @@ const NPS = (() => {
 
     // HEIC/HEIF: the container is hard to rebuild in a browser, so the GPS section inside the embedded EXIF block (and
     // any XMP packet) is overwritten with zeros or spaces in place. Nothing moves, so the image itself is untouched.
+    // The EXIF block is found by its TIFF header ("II*\0" or "MM\0*"), with or without an "Exif\0\0" prefix. Because
+    // those four bytes can also occur by chance in image data, nothing is changed unless the whole structure checks out.
+    const TIFF_SIZES = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 };
+    function gpsRanges(buf, t) {
+        const little = buf[t] === 0x49;
+        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        const u16 = (at) => view.getUint16(at, little), u32 = (at) => view.getUint32(at, little);
+        const inside = (at, len) => at >= t && len >= 0 && at + len <= buf.length;
+        const ifd0Off = u32(t + 4);
+        if (ifd0Off < 8 || ifd0Off > 65535 || !inside(t + ifd0Off, 2)) return null;
+        const ifd0 = t + ifd0Off, n = u16(ifd0);
+        if (n < 1 || n > 200 || !inside(ifd0 + 2, n * 12)) return null;
+        let gpsOff = 0;
+        for (let e = 0; e < n; e++) {
+            const entry = ifd0 + 2 + e * 12;
+            if (!TIFF_SIZES[u16(entry + 2)]) return null;   // not a real IFD
+            if (u16(entry) === 0x8825) gpsOff = u32(entry + 8);
+        }
+        if (!gpsOff || gpsOff > 65535 || !inside(t + gpsOff, 2)) return null;
+        const gps = t + gpsOff, count = u16(gps);
+        if (count < 1 || count > 40 || !inside(gps + 2, count * 12)) return null;
+        const ranges = [[gps, 2 + count * 12]];
+        for (let g = 0; g < count; g++) {
+            const ge = gps + 2 + g * 12;
+            const size = TIFF_SIZES[u16(ge + 2)];
+            if (!size || u16(ge) > 0x1F) return null;       // GPS tags are 0x00-0x1F
+            const bytes = size * u32(ge + 4);
+            if (bytes > 4) {
+                const at = t + u32(ge + 8);
+                if (bytes > 4096 || !inside(at, bytes)) return null;
+                ranges.push([at, bytes]);
+            }
+        }
+        return ranges;
+    }
     function wipeIsoGps(buf) {
         const out = buf.slice();
-        const SIZES = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 };
-        for (let i = 0; i + 14 < out.length; i++) {
-            if (out[i] !== 0x45 || out[i + 1] !== 0x78 || out[i + 4] !== 0 || ascii(out, i, 6) !== 'Exif\0\0') continue;
-            const t = i + 6;
-            const little = ascii(out, t, 2) === 'II';
-            if (!little && ascii(out, t, 2) !== 'MM') continue;
-            const view = new DataView(out.buffer);
-            const u16 = (at) => view.getUint16(at, little), u32 = (at) => view.getUint32(at, little);
-            try {
-                const ifd0 = t + u32(t + 4);
-                for (let e = 0, n = u16(ifd0); e < n; e++) {
-                    const entry = ifd0 + 2 + e * 12;
-                    if (u16(entry) !== 0x8825) continue;   // GPSInfo
-                    const gps = t + u32(entry + 8);
-                    const count = u16(gps);
-                    for (let g = 0; g < count; g++) {
-                        const ge = gps + 2 + g * 12;
-                        const bytes = (SIZES[u16(ge + 2)] || 1) * u32(ge + 4);
-                        if (bytes > 4) out.fill(0, t + u32(ge + 8), Math.min(out.length, t + u32(ge + 8) + bytes));
-                    }
-                    out.fill(0, gps, gps + 2 + count * 12);
-                }
-            } catch { /* malformed EXIF: leave it */ }
+        for (let i = 0; i + 8 < out.length; i++) {
+            const ii = out[i] === 0x49 && out[i + 1] === 0x49 && out[i + 2] === 0x2A && out[i + 3] === 0;
+            const mm = out[i] === 0x4D && out[i + 1] === 0x4D && out[i + 2] === 0 && out[i + 3] === 0x2A;
+            if (!ii && !mm) continue;
+            let ranges = null;
+            try { ranges = gpsRanges(out, i); } catch { /* not EXIF */ }
+            for (const [at, len] of ranges || []) out.fill(0, at, at + len);
         }
         const xmp = new TextDecoder('latin1').decode(out);
         for (let at = xmp.indexOf('<x:xmpmeta'); at !== -1; at = xmp.indexOf('<x:xmpmeta', at + 1)) {

@@ -65,6 +65,20 @@ check('HEIC: GPS section and XMP blanked in place, size and image data unchanged
     assert.ok(!s.includes('GPSLatitude') && !s.includes(GPS_TEXT) && s.includes('mdat-image-bytes') && s.includes('ftypheic'));
 });
 
+// HEIC Exif items can also start with a 4-byte offset and then the TIFF header directly (no "Exif\0\0" prefix).
+const heicNoPrefix = bytes(u32be(24), 'ftypheic', [0, 0, 0, 0], 'mif1heic', [0, 0, 0, 0], tiff, 'mdat-image-bytes');
+check('HEIC: GPS is also blanked when the EXIF block has no "Exif\\0\\0" prefix', () => {
+    const out = stripPhotoBytes(heicNoPrefix, 'image/heic');
+    const t = 24 + 4;
+    assert.equal(text(heicNoPrefix.subarray(t, t + 2)), 'II', 'test offsets are wrong');
+    assert.ok(out.subarray(t + 44, t + 68).every(b => b === 0), 'latitude values still present');
+    assert.equal(out[t + 26] | (out[t + 27] << 8), 0, 'GPS IFD still lists entries');
+});
+check('HEIC: bytes that only look like a TIFF header (in image data) are left untouched', () => {
+    const noise = bytes(u32be(24), 'ftypheic', [0, 0, 0, 0], 'mif1heic', 'mdat', 'II*\0', [8, 0, 0, 0, 0xFF, 0xFF, 0x25, 0x88, 9, 9, 9, 9], 'MM\0*', new Array(40).fill(7));
+    assert.deepEqual([...stripPhotoBytes(noise, 'image/heic')], [...noise]);
+});
+
 // JPEG: APP1 (EXIF) and COM segments removed, image segments kept.
 const seg = (marker, data) => bytes([0xFF, marker, ((data.length + 2) >> 8) & 255, (data.length + 2) & 255], data);
 const jpeg = bytes([0xFF, 0xD8], seg(0xE0, bytes('JFIF\0')), seg(0xE1, bytes(`Exif\0\0${GPS_TEXT}`)), seg(0xFE, bytes(GPS_TEXT)),

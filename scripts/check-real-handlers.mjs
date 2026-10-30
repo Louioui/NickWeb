@@ -446,6 +446,12 @@ await check('F-08 a wrong second factor gives the same answer as a wrong email c
     const [a, b] = [await wrongEmail.text(), await wrongSecond.text()];
     expect(wrongEmail.status === 401 && wrongSecond.status === 401 && a === b, `differ: ${a} vs ${b}`);
 });
+await check('P27 a very long browser name never breaks Nick\'s sign-in', async () => {
+    reset(); addAdminCode('12345678');
+    const res = await adminPOST(post('/api/admin', { action: 'verify-code', email: ADMIN, code: '12345678' }, { 'user-agent': 'Mozilla/5.0 '.repeat(30) }));
+    expect(res.status === 200 && res.headers.get('set-cookie'), `sign-in failed (${res.status} ${await res.text()})`);
+    expect(tables().admin_sessions[0].user_agent.length <= 200, 'browser name not shortened');
+});
 await check('F-08 email code + authenticator code still signs in', async () => {
     reset(); const secret = seedAdmin2fa(); addAdminCode('12345678');
     const res = await adminLogin({ code: '12345678', totp: core.totpCode(secret) });

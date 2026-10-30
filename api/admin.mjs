@@ -186,7 +186,8 @@ async function verifyCode(request, body) {
         expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
     if (sErr) throw sErr;
     // The browser name is saved separately so sign-in still works before the user_agent column exists.
-    const agent = text(request.headers.get('user-agent'), { max: 200 });
+    // Cut to 200 characters rather than validated: an unusual browser must never make a sign-in fail.
+    const agent = text(String(request.headers.get('user-agent') || '').slice(0, 200), { max: 200 });
     if (agent) await db().from('admin_sessions').update({ user_agent: agent }).eq('token_hash', sha256(token)).then(() => {}, () => {});
     await auditAdmin(request, addr, method.includes('recovery') ? 'login_recovery_code' : 'login_success', null, `Signed in with ${method}`);
     await sendSecurityAlert(addr, method.includes('recovery') ? 'Recovery code used to sign in' : 'New sign-in to your dashboard', [
