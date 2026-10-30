@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD } from './core.mjs';
+import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS } from './core.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -53,7 +53,8 @@ export async function orderByToken(token) {
     return data;
 }
 
-const isSafePaymentUrl = (u) => typeof u === 'string' && (/^https:\/\/checkout\.stripe\.com\//i.test(u) || u.startsWith('/__mock-pay'));
+// Only real Stripe Checkout links are shown to clients; the local mock's /__mock-pay links never are in production.
+const isSafePaymentUrl = (u) => typeof u === 'string' && (/^https:\/\/checkout\.stripe\.com\//i.test(u) || (!IS_PROD && u.startsWith('/__mock-pay')));
 
 // The timeline's tamper-evident seal. Each entry was chained with SHA-256 by the database when it was written;
 // verify_order_chain recomputes the chain from the stored rows, so any later edit shows up as verified = false.
@@ -71,7 +72,10 @@ export function maskAddress(order) {
 }
 
 // The client's view of an order: no internal notes, only client-visible events and files.
-export async function clientView(order, { unlocked = true } = {}) {
+// Callers must say whether this browser has unlocked a document-locked order; anything unsure gets the locked view.
+// A locked view keeps the status, dates and progress, but not what was said or sent: no timeline details (they can
+// hold gate codes and address changes), no "Action required" note, no file names or fingerprints.
+export async function clientView(order, { unlocked = false } = {}) {
     const [{ data: events }, fileRes] = await Promise.all([
         db().from('order_events').select('created_at, kind, title, detail').eq('order_id', order.id)
             .eq('client_visible', true).order('created_at', { ascending: true }),
@@ -103,18 +107,18 @@ export async function clientView(order, { unlocked = true } = {}) {
         // Held (served) orders keep their status when billed afterwards, so an unpaid link alone shows the Pay button.
         payUrl: (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
         paidAt: order.paid_at,
-        actionNote: order.status === 'action_required' ? order.action_note : null,
+        actionNote: order.status === 'action_required' && !isLocked ? order.action_note : null,
         docLock: !!order.doc_lock,
         unlocked: !isLocked,
         legalHold: !!order.legal_hold,
         integritySeal: seal,
-        events: events || [],
+        events: (events || []).map(e => (isLocked ? { ...e, detail: null } : e)),
         files: (files || []).map(f => ({
             id: f.id,
             kind: f.kind,
-            name: f.filename,
+            name: isLocked ? (f.kind === 'proof' ? 'Proof of service (locked)' : 'Document (locked)') : f.filename,
             size: f.size_bytes,
-            sha256: f.sha256 || null,
+            sha256: isLocked ? null : f.sha256 || null,
             at: f.created_at,
             locked: isLocked,
         })),
@@ -149,9 +153,42 @@ export async function markPaid(orderId, amountCents, sessionId) {
     // Paying after the job was served (Nick serves first for some clients): record the money, keep the status "Served".
     // The legal hold would refuse moving a served order back to "Paid", and the webhook would then fail for days.
     const patch = { paid_at: new Date().toISOString(), stripe_session_id: sessionId, ...(order.legal_hold ? {} : { status: 'paid' }) };
-    const { error: uErr } = await db().from('orders').update(patch).eq('id', orderId).is('paid_at', null);
+    // Only the call that actually flips paid_at writes the timeline entry, so the webhook and the client's return from
+    // Stripe arriving together can't log the payment twice (timeline entries can never be removed).
+    const { data: changed, error: uErr } = await db().from('orders').update(patch).eq('id', orderId).is('paid_at', null).select('id');
     if (uErr) throw uErr;
+    if (!changed?.length) return false;
     await addEvent(orderId, 'payment', `Payment received: ${money(Number(amountCents))}`);
+    return true;
+}
+
+// A paid Stripe session that markPaid would not apply: an older link Nick replaced, less than the amount due, or a
+// second payment. The client was charged, so Nick gets a private timeline entry and an email, once per session, to
+// check Stripe and refund or record it. Nothing is applied automatically. The emails go out first and the timeline
+// entry (which marks the session as handled) is written only if at least one was accepted; otherwise this throws, so the
+// Stripe webhook answers with an error and Stripe delivers the event again later.
+export async function flagUnappliedPayment(orderId, amountCents, sessionId) {
+    uuid(orderId, 'Order');
+    if (typeof sessionId !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(sessionId)) return false;
+    const { data: order, error } = await db().from('orders').select('id, code, paid_at, stripe_session_id, amount_due_cents').eq('id', orderId).maybeSingle();
+    if (error) throw error;
+    if (!order || (order.paid_at && order.stripe_session_id === sessionId)) return false;   // the normal paid case
+    const { data: earlier, error: eErr } = await db().from('order_events').select('detail').eq('order_id', orderId).eq('kind', 'payment').eq('client_visible', false);
+    if (eErr) throw eErr;
+    if ((earlier || []).some(e => String(e.detail || '').includes(sessionId))) return false;   // already flagged
+    const paid = money(Number(amountCents) || 0);
+    const reason = order.paid_at ? 'the order was already paid'
+        : order.stripe_session_id && order.stripe_session_id !== sessionId ? 'it was paid on a payment link that had been replaced'
+        : 'it is less than the amount due';
+    console.error(`Unapplied Stripe payment on ${order.code}: ${sessionId} (${paid}), ${reason}`);
+    const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
+        to, subject: `${order.code}: a payment needs your review`,
+        heading: 'A payment needs your review',
+        lines: [`A card payment of ${paid} on ${order.code} was not applied to the order because ${reason}.`,
+            'Open Stripe to check it, then refund it or record it. The order timeline has the details.'],
+    }).catch(() => false)));
+    if (!sent.some(Boolean)) throw new Error(`Payment review alert for ${order.code} could not be emailed`);
+    await addEvent(orderId, 'payment', 'Payment needs review', `Stripe payment ${sessionId} for ${paid} was not applied because ${reason}. Check it in Stripe, then refund it or record it.`, false);
     return true;
 }
 
@@ -167,6 +204,7 @@ const REPLY_TO = 'nicksprocessservices@outlook.com';
 const LINKISH = /\b(?:https?:\/\/|www\.)\S+|(?<![@\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:[a-z]{2,}|xn--[a-z0-9-]+)(?![a-z0-9-])(?:[:\/]\S*)?/gi;
 export const clean = (s, max = 600) => String(s ?? '').replace(LINKISH, '[link removed]').slice(0, max);
 
+// Returns whether the email was handed to Resend (callers that must know, like payment alerts, check it).
 export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, lines: rawLines, button }) {
     const subject = clean(rawSubject, 160);
     const heading = clean(rawHeading, 160);
@@ -179,7 +217,7 @@ export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, 
         // Locally the email is printed so the flow can be tested. In production it would put login codes and client details in the logs.
         if (IS_PROD) console.error(`Email not sent (RESEND_API_KEY is not set): "${subject.replace(/\d{6}/g, '######')}"`);
         else console.log(`\n[email not sent: no RESEND_API_KEY]\nTo: ${to}\nSubject: ${subject}\n${textBody}\n`);
-        return;
+        return false;   // nothing was delivered, whatever was logged
     }
     const res = await fetch('https://api.resend.com/emails', {
         method: 'POST',
@@ -187,6 +225,7 @@ export async function sendEmail({ to, subject: rawSubject, heading: rawHeading, 
         body: JSON.stringify({ from: FROM, to: [to], reply_to: REPLY_TO, subject, html, text: textBody }),
     });
     if (!res.ok) console.error('Resend error', res.status, await res.text());
+    return res.ok;
 }
 
 export async function sendSecurityAlert(to, eventTitle, detailLines = []) {

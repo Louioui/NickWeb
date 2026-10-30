@@ -4,12 +4,14 @@
   "description": "Nick's Process Services: hand-written pages (index, track, admin) plus Vercel functions in api/. The CSS inside each page is compiled from src/input.css (npm run build).",
   "scripts": {
     "build": "tailwindcss -c tailwind.config.js -i src/input.css -o build/site.css --minify && node scripts/inline-css.js",
-    "test": "node scripts/check-inputs.mjs && node scripts/check-client-accounts.mjs && node scripts/check-security-stress.mjs && node scripts/check-2fa-legal-hold.mjs"
+    "test": "node scripts/check-inputs.mjs && node scripts/check-client-accounts.mjs && node scripts/check-security-stress.mjs && node scripts/check-2fa-legal-hold.mjs && node scripts/check-photo-metadata.mjs && node --experimental-test-module-mocks --no-warnings=ExperimentalWarning scripts/check-real-handlers.mjs && node --experimental-test-module-mocks --no-warnings=ExperimentalWarning scripts/check-passkeys.mjs"
   },
   "devDependencies": {
+    "@simplewebauthn/browser": "14.0.0",
     "tailwindcss": "3.4.17"
   },
   "dependencies": {
+    "@simplewebauthn/server": "14.0.3",
     "@supabase/supabase-js": "^2.118.0",
     "stripe": "^23.0.1"
   }

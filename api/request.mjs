@@ -49,6 +49,8 @@ export const POST = handle(async (request) => {
         tier: body.tier,
         addons,
         estimated_total_cents: cents,
+        // Document lock is on by default: a forwarded tracking link shows status only until the client enters a code.
+        doc_lock: true,
     };
 
     await rateLimit(`request-email:${sha256(row.client_email)}`, 5, 3600);
@@ -82,7 +84,7 @@ async function finish(request, body) {
     await rateLimit(`request-finish:${clientIp(request)}`, 30, 900);
     const order = await orderByToken(body.t);
     if (order.created_at < new Date(Date.now() - 60 * 60 * 1000).toISOString()) return json({ ok: true });  // only right after creating
-    const uploaded = await confirmUploads(order.id, body.fileIds);
+    const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
     if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} document${uploaded.length === 1 ? '' : 's'} uploaded`);
 
     // Send each email once, even if the browser calls finish twice.
@@ -117,7 +119,7 @@ async function finish(request, body) {
                 `Address: ${order.address}${order.unit ? ', ' + order.unit : ''}, ${order.city} ${order.zip}`,
                 `Tier: ${TIERS[order.tier]?.name}${addonNames.length ? ' + ' + addonNames.join(', ') : ''} · estimate ${money(order.estimated_total_cents)}`,
                 order.deadline ? `Deadline: ${order.deadline}` : 'No deadline given.',
-                `${uploaded.length} document(s) attached.`,
+                `${uploaded.length} document(s) attached.${stillChecking ? ` ${stillChecking} more could not be checked yet; they will appear on the order once checked.` : ''}${missing ? ` ${missing} did not reach storage.` : ''}`,
             ],
             button: { label: 'Open in your dashboard', url: `${origin}/admin.html#${order.id}` },
         })),

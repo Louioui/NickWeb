@@ -138,6 +138,8 @@ check('emailed code unlocks the page', unlock.status === 200 && /^\d{10}\.[\w-]{
 check('unlocked page can answer "Action required"', (await call('track', { t, action: 'respond', unit: 'Apt 1', unlockToken: unlock.data.unlockToken })).status === 200);
 // Downloads are recorded privately in the sealed timeline (chain of custody), and the seal still verifies.
 const servedId = (await call('admin', { action: 'list' }, nick)).data.orders.find(o => o.status === 'served').id;
+// Orders start locked; Nick unlocks this one first (that adds its own timeline entry, so it happens before the snapshot).
+await call('admin', { action: 'toggle-doc-lock', id: servedId, locked: false }, nick);   // orders start locked; Nick unlocks this one
 const servedDetail = (await call('admin', { action: 'get', id: servedId }, nick)).data;
 const dl = await call('track', { t: servedDetail.order.track_token, action: 'download', fileId: servedDetail.files[0].id });
 const afterDl = (await call('admin', { action: 'get', id: servedId }, nick)).data;
@@ -163,7 +165,7 @@ for (const fn of ['esc', 'post', 'get', 'fileMeta', 'checkFiles', 'uploadAll', '
     check(`assets/js/nps.js exports ${fn}`, typeof NPS[fn] === 'function');
 }
 check('browser helpers work', NPS.money(14000) === '$140.00' && NPS.esc('<b>') === '&lt;b&gt;');
-const pages = await Promise.all(['admin.html', 'track.html'].map(f => readFile(new URL(`../${f}`, import.meta.url), 'utf8')));
+const pages = await Promise.all(['admin.html', 'track.html', 'assets/js/admin.js', 'assets/js/track.js'].map(f => readFile(new URL(`../${f}`, import.meta.url), 'utf8')));
 check('no page ships unverifiable security claims', !/TLS 1\.3|Zero-Trust|court-certified|tamper-proof|HMAC-SHA256|device-bound/i.test(pages.join('') + npsSrc));
 
 console.log(`${passed} two-step, legal hold, document lock and seal checks passed`);

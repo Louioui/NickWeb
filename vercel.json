@@ -50,6 +50,17 @@
       "source": "/docs/:path*",
       "destination": "/",
       "permanent": false
+    },
+    {
+      "source": "/demo.html",
+      "has": [
+        {
+          "type": "host",
+          "value": "(?:www\\.)?nicksprocessservices\\.dev"
+        }
+      ],
+      "destination": "/",
+      "permanent": false
     }
   ],
   "headers": [
@@ -111,7 +122,7 @@
         },
         {
           "key": "Content-Security-Policy",
-          "value": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; connect-src 'self' https://wlbmtcrgftermdtwnbgb.supabase.co; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'"
+          "value": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; connect-src 'self' https://wlbmtcrgftermdtwnbgb.supabase.co; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'"
         }
       ]
     },
@@ -152,8 +163,26 @@
     }
   ],
   "functions": {
-    "api/*.mjs": {
+    "api/client.mjs": {
       "maxDuration": 10
+    },
+    "api/lookup.mjs": {
+      "maxDuration": 10
+    },
+    "api/stripe-webhook.mjs": {
+      "maxDuration": 10
+    },
+    "api/request.mjs": {
+      "maxDuration": 30
+    },
+    "api/track.mjs": {
+      "maxDuration": 30
+    },
+    "api/admin.mjs": {
+      "maxDuration": 30
+    },
+    "api/keepalive.mjs": {
+      "maxDuration": 30
     }
   }
 }

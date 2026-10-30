@@ -5,6 +5,7 @@ import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
+import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 
 const COOKIE = 'nps_admin';
 const SESSION_DAYS = 14;
@@ -14,11 +15,19 @@ export const POST = handle(async (request) => {
     const a = body.action;
     if (a === 'send-code') return sendCode(request, body);
     if (a === 'verify-code') return verifyCode(request, body);
+    if (a === 'passkey-login-options') return passkeyLoginOptions(request);
+    if (a === 'passkey-login-verify') return passkeyLoginVerify(request, body);
 
     const admin = await requireAdmin(request);
     if (a === 'me') return me(admin);
     if (a === 'logout') return logout(request, admin);
     if (a === 'logout-all') return logoutAll(request, admin);
+    if (a === 'sessions') return sessions(request, admin);
+    if (a === 'revoke-session') return revokeSession(request, body, admin);
+    if (a === 'passkeys') return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
+    if (a === 'passkey-register-options') return passkeyRegisterOptions(request, body, admin);
+    if (a === 'passkey-register-verify') return passkeyRegisterVerify(request, body, admin);
+    if (a === 'passkey-remove') return passkeyRemove(request, body, admin);
     if (a === 'generate-recovery-codes') return generateRecoveryCodes(request, body, admin);
     if (a === 'totp-setup') return totpSetup(request, body, admin);
     if (a === 'totp-enable') return totpEnable(request, body, admin);
@@ -127,22 +136,25 @@ async function verifyCode(request, body) {
     let ok = false;
     let method = 'email';
     if (isAdmin && isEmailCode) {
-        let secondOk = !totpRow?.enabled;
-        if (!secondOk && /^\d{6}$/.test(secondDigits)) {
-            secondOk = await checkTotp(addr, totpRow.secret_enc, secondDigits, 'admin-login-totp');
-            method = 'email+authenticator';
-        } else if (!secondOk && secondRecovery.length === 8) {
-            // Lost phone: email code + one single-use recovery code.
-            const { data, error } = await db().rpc('use_admin_recovery_code', { p_email: addr, p_hash: recoveryHash(addr, secondRecovery) });
-            if (error) throw error;
-            secondOk = !!data;
-            method = 'email+recovery';
-        }
-        if (secondOk) {
-            // Checked and counted in one locked database step (use_admin_code): at most 5 tries per code, 25 per hour.
-            const { data, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${digits}`) });
-            if (error) throw error;
-            ok = !!data;
+        // The email code is checked first (in one locked database step, use_admin_code: at most 5 tries per code, 25 per
+        // hour), so a mistyped email code never uses up a single-use recovery code. A correct email code is spent either
+        // way; after a wrong second step Nick requests a new one. Both failures give the same answer.
+        const { data: emailOk, error } = await db().rpc('use_admin_code', { p_email: addr, p_hash: sha256(`${addr}:${digits}`) });
+        if (error) throw error;
+        ok = !!emailOk;
+        if (ok && totpRow?.enabled) {
+            if (/^\d{6}$/.test(secondDigits)) {
+                ok = await checkTotp(addr, totpRow.secret_enc, secondDigits, 'admin-login-totp');
+                method = 'email+authenticator';
+            } else if (secondRecovery.length === 8) {
+                // Lost phone: email code + one single-use recovery code.
+                const { data, error: rErr } = await db().rpc('use_admin_recovery_code', { p_email: addr, p_hash: recoveryHash(addr, secondRecovery) });
+                if (rErr) throw rErr;
+                ok = !!data;
+                method = 'email+recovery';
+            } else {
+                ok = false;
+            }
         }
     } else if (isAdmin && !totpRow?.enabled && raw.replace(/[^A-Z0-9]/g, '').length === 8 && !isEmailCode) {
         // Without an authenticator, a recovery code can stand in for the email code (for example if Outlook is down).
@@ -169,6 +181,11 @@ async function verifyCode(request, body) {
         throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
     }
 
+    return issueAdminSession(request, addr, method, !!totpRow?.enabled);
+}
+
+// Last step of every dashboard sign-in: at most 5 sessions, a new session cookie, an audit entry and a login alert.
+async function issueAdminSession(request, addr, method, totpEnabled) {
     const nowIso = new Date().toISOString();
     await db().from('admin_sessions').delete().eq('email', addr).lt('expires_at', nowIso);
     const { data: activeSessions } = await db().from('admin_sessions').select('token_hash, created_at')
@@ -177,15 +194,69 @@ async function verifyCode(request, body) {
         await db().from('admin_sessions').delete().in('token_hash', activeSessions.slice(4).map(s => s.token_hash));
     }
     const token = randomToken(32);
-    await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, last_seen_at: nowIso,
+    const { error: sErr } = await db().from('admin_sessions').insert({ token_hash: sha256(token), email: addr, last_seen_at: nowIso,
         expires_at: new Date(Date.now() + SESSION_DAYS * 864e5).toISOString() });
+    if (sErr) throw sErr;
+    // The browser name is saved separately so sign-in still works before the user_agent column exists.
+    // Cut to 200 characters rather than validated: an unusual browser must never make a sign-in fail.
+    const agent = text(String(request.headers.get('user-agent') || '').slice(0, 200), { max: 200 });
+    if (agent) await db().from('admin_sessions').update({ user_agent: agent }).eq('token_hash', sha256(token)).then(() => {}, () => {});
     await auditAdmin(request, addr, method.includes('recovery') ? 'login_recovery_code' : 'login_success', null, `Signed in with ${method}`);
     await sendSecurityAlert(addr, method.includes('recovery') ? 'Recovery code used to sign in' : 'New sign-in to your dashboard', [
-        `Your dashboard was just signed into (${method === 'email' ? 'email code' : method.replace('+', ' + ').replace('email', 'email code')}).`,
+        `Your dashboard was just signed into (${method === 'email' ? 'email code' : method === 'passkey' ? 'passkey' : method.replace('+', ' + ').replace('email', 'email code')}).`,
         `Browser: ${String(request.headers.get('user-agent') || 'unknown').slice(0, 120)}`,
+        ...(method === 'passkey' ? ['If this wasn\'t you, remove any passkey you don\'t recognise under Security & Field App, then use Log Out All Devices.'] : []),
     ]);
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';   // HTTPS-only everywhere but local testing
-    return json({ ok: true, totpEnabled: !!totpRow?.enabled }, 200, { 'set-cookie': `${COOKIE}=${token}; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}` });
+    return json({ ok: true, totpEnabled }, 200, { 'set-cookie': `${COOKIE}=${token}; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}` });
+}
+
+// --- Passkeys. A passkey asks for Face ID, a fingerprint or the device PIN and only works on this site, so it stands in
+// for both the email code and the authenticator code. Adding one needs the authenticator app to be on, plus a fresh
+// authenticator code, so a stolen session cookie can't plant a passkey of its own.
+async function passkeyLoginOptions(request) {
+    const { options, cookie } = await loginOptions(request, 'admin');
+    return json({ ok: true, options }, 200, { 'set-cookie': cookie });
+}
+
+async function passkeyLoginVerify(request, body) {
+    await rateLimit(`admin-verify:${clientIp(request)}`, 10, 900);
+    const { ownerEmail } = await loginVerify(request, 'admin', body.response);
+    // Checked again at every sign-in, so removing an address from ADMIN_EMAILS also shuts out its passkeys.
+    if (!ADMIN_EMAILS.includes(ownerEmail)) throw new HttpError(401, 'That passkey could not be used to sign in. Please try again or use your email code.');
+    const res = await issueAdminSession(request, ownerEmail, 'passkey', !!(await getAdminTotp(ownerEmail))?.enabled);
+    res.headers.append('set-cookie', clearChallengeCookie(request, 'admin'));
+    return res;
+}
+
+async function passkeyRegisterOptions(request, body, admin) {
+    await rateLimit(`admin-passkey:${sha256(admin)}`, 10, 900);
+    if (!(await getAdminTotp(admin))?.enabled) throw new HttpError(400, 'Turn on the authenticator app first, then add a passkey.');
+    await requireStepUp(admin, body?.totp);
+    // A stable id that isn't the email address (the passkey shows the email as its name).
+    const { options, cookie } = await registrationOptions(request, 'admin', admin, keyedHash('admin-passkey-user-v1', admin).slice(0, 32), "Nick's dashboard");
+    return json({ ok: true, options }, 200, { 'set-cookie': cookie });
+}
+
+async function passkeyRegisterVerify(request, body, admin) {
+    await rateLimit(`admin-passkey:${sha256(admin)}`, 10, 900);
+    const label = text(String(body.label || '').slice(0, 80), { max: 80 });
+    await registrationVerify(request, 'admin', admin, body.response, label);
+    await auditAdmin(request, admin, 'passkey_added', null, label ? `Passkey "${label}"` : 'Passkey');
+    await sendSecurityAlert(admin, 'A passkey was added to your dashboard', [
+        `A passkey${label ? ` ("${label}")` : ''} can now be used to sign in to your dashboard.`,
+        `Browser: ${String(request.headers.get('user-agent') || 'unknown').slice(0, 120)}`,
+    ]);
+    return json({ ok: true, passkeys: await listPasskeys('admin', admin) }, 200, { 'set-cookie': clearChallengeCookie(request, 'admin') });
+}
+
+async function passkeyRemove(request, body, admin) {
+    await rateLimit(`admin-passkey:${sha256(admin)}`, 10, 900);
+    await requireStepUp(admin, body?.totp);
+    await removePasskey('admin', admin, body.id);
+    await auditAdmin(request, admin, 'passkey_removed');
+    await sendSecurityAlert(admin, 'A passkey was removed from your dashboard', ['That passkey can no longer be used to sign in.']);
+    return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
 }
 
 async function requireAdmin(request) {
@@ -224,6 +295,41 @@ async function logoutAll(request, admin) {
     await auditAdmin(request, admin, 'logout_all');
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';
     return json({ ok: true }, 200, { 'set-cookie': `${COOKIE}=; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=0` });
+}
+
+// Nick's signed-in devices. Each is identified by the start of its stored token hash (never the token itself).
+const currentHash = (request) => {
+    const token = getCookie(request, COOKIE);
+    return typeof token === 'string' && /^[A-Za-z0-9_-]{40,64}$/.test(token) ? sha256(token) : '';
+};
+async function sessions(request, admin) {
+    let { data, error } = await db().from('admin_sessions').select('token_hash, created_at, last_seen_at, expires_at, user_agent')
+        .eq('email', admin).order('last_seen_at', { ascending: false });
+    if (error) {   // before the user_agent migration
+        ({ data, error } = await db().from('admin_sessions').select('token_hash, created_at, last_seen_at, expires_at')
+            .eq('email', admin).order('last_seen_at', { ascending: false }));
+        if (error) throw error;
+    }
+    const now = new Date().toISOString();
+    const mine = currentHash(request);
+    return json({ sessions: (data || []).filter(s => s.expires_at > now).map(s => ({
+        id: s.token_hash.slice(0, 16), current: s.token_hash === mine, browser: s.user_agent || null,
+        signedIn: s.created_at, lastSeen: s.last_seen_at,
+    })) });
+}
+async function revokeSession(request, body, admin) {
+    await rateLimit(`admin-revoke:${sha256(admin)}`, 20, 900);
+    const id = String(body.sessionId || '');
+    if (!/^[0-9a-f]{16}$/.test(id)) throw new HttpError(400, 'Choose a session.');
+    const { data, error } = await db().from('admin_sessions').select('token_hash').eq('email', admin);
+    if (error) throw error;
+    const target = (data || []).find(s => s.token_hash.startsWith(id));
+    if (!target) throw new HttpError(404, 'That session has already ended.');
+    if (target.token_hash === currentHash(request)) throw new HttpError(400, 'This is the device you are using. Use Log out instead.');
+    const { error: dErr } = await db().from('admin_sessions').delete().eq('token_hash', target.token_hash);
+    if (dErr) throw dErr;
+    await auditAdmin(request, admin, 'session_revoked', null, `Signed out device ${id.slice(0, 6)}`);
+    return sessions(request, admin);
 }
 
 const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -492,8 +598,12 @@ async function proofUpload(body) {
 
 async function proofFinish(request, body) {
     const order = await getOrder(body.id);
-    const uploaded = await confirmUploads(order.id, body.fileIds);
-    if (!uploaded.length) throw new HttpError(400, 'The upload did not finish. Please try again.');
+    // All or nothing: the order is marked served and the client emailed only once every proof file is stored and checked.
+    // Files already checked stay checked, so trying again only re-checks the rest.
+    const { files: uploaded, stillChecking, missing, rejected } = await confirmUploads(order.id, body.fileIds);
+    if (rejected) throw new HttpError(400, `${rejected} file(s) failed the file check (not a real PDF, Word file or photo) and were removed. Nothing was sent to the client. Upload the proof again.`);
+    if (stillChecking) throw new HttpError(503, `${stillChecking} file(s) were stored but couldn't be checked yet. Nothing was sent to the client. Please try again in a minute.`);
+    if (missing || !uploaded.length) throw new HttpError(400, 'The upload did not finish. Nothing was sent to the client. Please upload the proof again.');
     const detailText = uploaded.map(u => u.sha256 ? `${u.filename} (SHA-256: ${u.sha256.slice(0, 12)}…)` : u.filename).join(', ');
     await addEvent(order.id, 'proof', 'Proof of service uploaded', detailText);
     // Adding another proof to an order that is already served leaves its served time (frozen by legal hold) alone.

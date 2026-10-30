@@ -1,7 +1,7 @@
 // Local-only stand-in for the real API. scripts/dev-server.mjs uses it when SUPABASE_SERVICE_ROLE_KEY is not set, so the request
 // form, tracking page and dashboard can be clicked through before any keys exist. Orders live in memory and reset on restart.
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
-import { randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken } from '../api/_lib/orders.mjs';
 import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
 
@@ -20,6 +20,7 @@ const clients = new Map();
 const clientSessions = new Map();
 const clientCodes = new Map();
 const clientSecurity = new Map(); // email -> { pin_hash, failed_tries, locked_until }
+const trackPinFails = new Map();  // order id -> { window, count } (wrong PINs on the tracking page)
 const trackUnlockCodes = new Map(); // order_id -> { code, tries, expires }
 const sessions = new Set();
 const sessionEmails = new Map();
@@ -165,7 +166,7 @@ function maskMockAddress(o) {
     return street + (o.city ? `, ${o.city}` : '') + (o.zip ? ` ${o.zip}` : '');
 }
 
-function clientView(o, { unlocked = true } = {}) {
+function clientView(o, { unlocked = false } = {}) {
     const visibleEvents = events.filter(e => e.order_id === o.id && e.client_visible).sort((a, b) => a.created_at.localeCompare(b.created_at))
         .map(({ created_at, kind, title, detail }) => ({ created_at, kind, title, detail }));
     const uploadedFiles = [...files.values()].filter(f => f.order_id === o.id && f.uploaded);
@@ -182,13 +183,15 @@ function clientView(o, { unlocked = true } = {}) {
         estimate: money(o.estimated_total_cents),
         amountDue: o.amount_due_cents != null ? money(o.amount_due_cents) : null,
         payUrl: (o.status === 'awaiting_payment' || (o.legal_hold && !o.paid_at)) ? o.payment_url : null,
-        paidAt: o.paid_at, actionNote: o.status === 'action_required' ? o.action_note : null,
+        // Same as api/_lib/orders.mjs: a locked view keeps status and dates, not what was said or sent.
+        paidAt: o.paid_at, actionNote: o.status === 'action_required' && !isLocked ? o.action_note : null,
         docLock: !!o.doc_lock,
         unlocked: !isLocked,
         legalHold: !!o.legal_hold,
         integritySeal: seal,
-        events: visibleEvents,
-        files: uploadedFiles.map(f => ({ id: f.id, kind: f.kind, name: f.filename, size: f.size_bytes, sha256: f.sha256 || null, at: f.created_at, locked: isLocked })),
+        events: visibleEvents.map(e => (isLocked ? { ...e, detail: null } : e)),
+        files: uploadedFiles.map(f => ({ id: f.id, kind: f.kind, name: isLocked ? (f.kind === 'proof' ? 'Proof of service (locked)' : 'Document (locked)') : f.filename,
+            size: f.size_bytes, sha256: isLocked ? null : f.sha256 || null, at: f.created_at, locked: isLocked })),
     };
 }
 
@@ -346,6 +349,7 @@ function requireMockStepUp(adminEmail, totpInput) {
 const handlers = {
     async client(req, body) {
         const action = body.action;
+        if (String(action).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
         if (action === 'send-code') {
             const addr = cleanEmail(body.email);
             const signup = body.intent === 'signup';
@@ -358,32 +362,28 @@ const handlers = {
             const addr = cleanEmail(body.email);
             const code = String(body.code || '').trim();
             if (!/^\d{6,8}$/.test(code)) fail(400, 'Enter the verification code from your email.');
+            // Same order as api/client.mjs: ask for the PIN first, check the email code, and only then the PIN.
             const sec = clientSecurity.get(addr);
-            if (sec?.locked_until && sec.locked_until > Date.now()) {
-                fail(429, 'Account temporarily locked after repeated failed 2FA attempts. Please wait 15 minutes.');
-            }
+            const pin = String(body.pin || '').trim();
+            if (sec?.pin_hash && !pin) return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
+            if (sec?.pin_hash && sec.locked_until > Date.now()) fail(429, 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.');
             const pending = clientCodes.get(addr);
             if (!pending || pending.expires < Date.now() || pending.attempts >= 5) fail(401, 'That code is invalid or expired. Request another email.');
-            if (sec?.pin_hash) {
-                const pin = String(body.pin || '').trim();
-                if (!pin) {
-                    return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
-                }
-                if (!verifyPin(pin, sec.pin_hash)) {
-                    sec.failed_tries = (sec.failed_tries || 0) + 1;
-                    if (sec.failed_tries >= 5) {
-                        sec.locked_until = Date.now() + 15 * 60 * 1000;
-                        clientCodes.delete(addr);
-                    }
-                    fail(401, 'Invalid 6-digit Security PIN.');
-                }
-                sec.failed_tries = 0;
-                sec.locked_until = 0;
-            }
             pending.attempts++;
             if (code !== '123456') {
                 if (pending.attempts >= 5) clientCodes.delete(addr);
                 fail(401, 'That code is invalid or expired. Request another email.');
+            }
+            if (sec?.pin_hash) {
+                if (!verifyPin(pin, sec.pin_hash)) {
+                    if (sec.locked_until && sec.locked_until <= Date.now()) { sec.failed_tries = 0; sec.locked_until = 0; }
+                    sec.failed_tries = (sec.failed_tries || 0) + 1;
+                    if (sec.failed_tries >= 5) sec.locked_until = Date.now() + 15 * 60 * 1000;
+                    clientCodes.delete(addr);   // the code is spent
+                    fail(401, 'Wrong Security PIN. Request a new code and try again.');
+                }
+                sec.failed_tries = 0;
+                sec.locked_until = 0;
             }
             if (!clients.has(addr)) {
                 if (pending.intent !== 'signup') fail(401, 'That code is invalid or expired. Create an account first.');
@@ -415,6 +415,8 @@ const handlers = {
         if (action === 'set-pin') {
             const pin = String(body.pin || '').trim();
             if (!/^\d{6}$/.test(pin)) fail(400, 'Please enter a 6-digit numeric Security PIN.');
+            // Same as api/client.mjs: replacing a PIN needs the current one.
+            if (sec?.pin_hash && !verifyPin(String(body.currentPin || '').trim(), sec.pin_hash)) fail(403, 'Enter your current 6-digit Security PIN to change it.');
             clientSecurity.set(verifiedEmail, { pin_hash: hashPin(pin), failed_tries: 0, locked_until: 0 });
             return json({ ok: true, hasPin: true });
         }
@@ -514,22 +516,20 @@ const handlers = {
         if (body.action === 'verify-unlock-code') {
             const code = String(body.code || '').trim();
             if (!/^\d{6}$/.test(code)) fail(400, 'Please enter a 6-digit verification code or Security PIN.');
-            let verified = false;
+            // Same as api/track.mjs: wrong PINs here count on this order's own 15-minute counter, never the portal's lockout.
             const sec = clientSecurity.get(o.client_email.toLowerCase());
-            const pinLocked = sec?.locked_until && sec.locked_until > Date.now();
-            if (sec?.pin_hash && !pinLocked && verifyPin(code, sec.pin_hash)) { verified = true; sec.failed_tries = 0; }
+            const window = Math.floor(Date.now() / 900e3);
+            const fails = trackPinFails.get(o.id);
+            const pinFails = fails?.window === window ? fails.count : 0;
+            const pinUsable = !!sec?.pin_hash && !(sec.locked_until > Date.now()) && pinFails < 5;
+            let verified = pinUsable && verifyPin(code, sec.pin_hash);
             if (!verified) {
                 const row = trackUnlockCodes.get(o.id);
-                if (!row || row.expires < Date.now() || row.tries >= 5) fail(401, 'That unlock code is invalid or expired. Request a new code.');
-                if (code !== row.code) {
-                    // Same as api/track.mjs: a wrong entry also counts against the client's PIN lockout.
-                    if (sec?.pin_hash && !pinLocked) {
-                        sec.failed_tries = (sec.failed_tries || 0) + 1;
-                        if (sec.failed_tries >= 5) sec.locked_until = Date.now() + 15 * 60e3;
-                    }
-                    row.tries++;
-                    if (row.tries >= 5) trackUnlockCodes.delete(o.id);
-                    fail(401, 'That unlock code is invalid or expired.');
+                const codeOk = !!row && row.expires >= Date.now() && row.tries < 5 && code === row.code;
+                if (!codeOk) {
+                    if (pinUsable) trackPinFails.set(o.id, { window, count: pinFails + 1 });
+                    if (row) { row.tries++; if (row.tries >= 5) trackUnlockCodes.delete(o.id); }
+                    fail(401, 'That code or PIN is invalid or expired. Request a new code.');
                 }
                 trackUnlockCodes.delete(o.id);
                 verified = true;
@@ -627,6 +627,7 @@ const handlers = {
 
     async admin(req, body) {
         const a = body.action;
+        if (String(a).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
         if (a === 'send-code') {
             const addr = cleanEmail(body.email);
             if (MOCK_ADMIN_EMAILS.includes(addr)) {
@@ -708,6 +709,21 @@ const handlers = {
             sessions.delete(cookie);
             auditAdmin(adminEmail, 'logout_all');
             return json({ ok: true }, 200, { 'set-cookie': 'nps_admin=; Path=/api/admin; Max-Age=0' });
+        }
+        // Same shape as api/admin.mjs: Nick's signed-in devices, any but this one can be signed out.
+        const mockSessionList = () => json({ sessions: [...sessionEmails.entries()].filter(([, em]) => em === adminEmail).map(([tok]) => ({
+            id: createHash('sha256').update(tok).digest('hex').slice(0, 16), current: tok === cookie,
+            browser: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/141.0 Safari/537.36',
+            signedIn: new Date().toISOString(), lastSeen: new Date().toISOString(),
+        })) });
+        if (a === 'sessions') return mockSessionList();
+        if (a === 'revoke-session') {
+            const target = [...sessionEmails.entries()].find(([tok, em]) => em === adminEmail && createHash('sha256').update(tok).digest('hex').startsWith(String(body.sessionId || '')));
+            if (!target || !/^[0-9a-f]{16}$/.test(String(body.sessionId || ''))) fail(404, 'That session has already ended.');
+            if (target[0] === cookie) fail(400, 'This is the device you are using. Use Log out instead.');
+            sessions.delete(target[0]); sessionEmails.delete(target[0]);
+            auditAdmin(adminEmail, 'session_revoked');
+            return mockSessionList();
         }
         if (a === 'totp-setup') {
             // While one is on, changing it needs the current code, and the new secret waits as pending until confirmed.
@@ -1036,7 +1052,7 @@ function createOrder(fields, createdAt = now()) {
     const o = {
         id: randomUUID(), code: 'NP-' + randomInt(100000, 1000000), track_token: token(), status: 'received',
         created_at: createdAt, updated_at: createdAt, amount_due_cents: null, payment_url: null, stripe_session_id: null,
-        paid_at: null, action_note: null, served_at: null, ...fields,
+        paid_at: null, action_note: null, served_at: null, doc_lock: true, ...fields,
     };
     orders.set(o.id, o);
     return o;

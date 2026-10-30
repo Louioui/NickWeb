@@ -6,9 +6,10 @@
 //   POST { t, action: 'respond', ...fields, files }-> answers "Action required"; returns upload links
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
 import { randomInt } from 'node:crypto';
-import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, text, longText, cleanFileList,
+import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, hitRateLimit, peekRateLimit, text, longText, cleanFileList,
          prepareUploads, confirmUploads, addEvent, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
-import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, sendEmail } from './_lib/orders.mjs';
+import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, flagUnappliedPayment, sendEmail } from './_lib/orders.mjs';
+import { getClientSecurity, pinLocked } from './_lib/clients.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
 
 // Unlocking a document-locked tracking page gives the browser a signed token that expires after 12 hours. It is tied
@@ -60,35 +61,26 @@ export const POST = handle(async (request) => {
         await rateLimit(`track-unlock-verify:${sha256(body.t)}`, 8, 900);
         const code = String(body.code || '').trim();
         if (!/^\d{6}$/.test(code)) throw new HttpError(400, 'Please enter a 6-digit verification code or Security PIN.');
-        let verified = false;
-        // 1. Check Firm Security PIN if configured for order.client_email
-        const clientEmail = order.client_email.toLowerCase();
-        const { data: sec, error: secErr } = await db().from('client_security_settings').select('pin_hash, failed_tries, locked_until').eq('email', clientEmail).maybeSingle();
-        if (secErr) throw secErr;
-        const pinLocked = sec?.locked_until && sec.locked_until > new Date().toISOString();
-        if (sec?.pin_hash && !pinLocked) {
-            if (verifyPin(code, sec.pin_hash)) {
-                verified = true;
-                if (sec.failed_tries) await db().from('client_security_settings').update({ failed_tries: 0, locked_until: null }).eq('email', clientEmail);
-            }
-        }
-        // 2. Otherwise check one-time emailed unlock code
+        // 1. The client's Security PIN, if they set one. Wrong guesses here are counted on this order's own counter (5 per
+        //    15 minutes), every time, so a tracking link can't be used to guess the PIN. It is separate from the portal's
+        //    lockout, so someone holding a forwarded link can't lock the client out of their account.
+        const sec = await getClientSecurity(order.client_email.toLowerCase());
+        const pinBucket = `track-pin:${sha256(`${order.id}|${order.client_email.toLowerCase()}`)}`;
+        const pinUsable = !!sec?.pin_hash && !pinLocked(sec) && (await peekRateLimit(pinBucket, 900)) < 5;
+        let verified = pinUsable && verifyPin(code, sec.pin_hash);
+        // 2. Otherwise the one-time code emailed to the client.
         if (!verified) {
-            const { data: row } = await db().from('track_unlock_codes').select('*').eq('order_id', order.id).maybeSingle();
-            if (!row || row.expires_at < new Date().toISOString() || row.tries >= 5) {
-                throw new HttpError(401, 'That unlock code is invalid or expired. Request a new code.');
-            }
-            if (!timingSafeMatch(row.code_hash, sha256(`${order.id}:${code}`))) {
-                // A wrong entry also counts against the client's PIN lockout, so guessing the PIN here gains nothing.
-                if (sec?.pin_hash && !pinLocked) {
-                    const tries = (sec.failed_tries || 0) + 1;
-                    await db().from('client_security_settings').update({ failed_tries: tries,
-                        ...(tries >= 5 ? { locked_until: new Date(Date.now() + 15 * 60e3).toISOString() } : {}) }).eq('email', clientEmail);
+            const { data: row, error: rowErr } = await db().from('track_unlock_codes').select('*').eq('order_id', order.id).maybeSingle();
+            if (rowErr) throw rowErr;
+            const codeOk = !!row && row.expires_at >= new Date().toISOString() && row.tries < 5 && timingSafeMatch(row.code_hash, sha256(`${order.id}:${code}`));
+            if (!codeOk) {
+                if (pinUsable) await hitRateLimit(pinBucket, 900);
+                if (row) {
+                    const nextTries = (row.tries || 0) + 1;
+                    if (nextTries >= 5) await db().from('track_unlock_codes').delete().eq('order_id', order.id);
+                    else await db().from('track_unlock_codes').update({ tries: nextTries }).eq('order_id', order.id);
                 }
-                const nextTries = (row.tries || 0) + 1;
-                if (nextTries >= 5) await db().from('track_unlock_codes').delete().eq('order_id', order.id);
-                else await db().from('track_unlock_codes').update({ tries: nextTries }).eq('order_id', order.id);
-                throw new HttpError(401, 'That unlock code is invalid or expired.');
+                throw new HttpError(401, 'That code or PIN is invalid or expired. Request a new code.');
             }
             await db().from('track_unlock_codes').delete().eq('order_id', order.id);
             verified = true;
@@ -151,10 +143,11 @@ export const POST = handle(async (request) => {
         if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) throw new HttpError(400, 'Invalid payment session.');
         await rateLimit(`track-pay:${sha256(body.t)}`, 10, 900);
         const session = await stripeClient().checkout.sessions.retrieve(body.session);
-        if (session.metadata?.order_id === order.id && session.payment_status === 'paid') {
-            await markPaid(order.id, session.amount_total, session.id);
+        if (session.metadata?.order_id === order.id && session.payment_status === 'paid' &&
+            !(await markPaid(order.id, session.amount_total, session.id))) {
+            await flagUnappliedPayment(order.id, session.amount_total, session.id).catch(err => console.error(err.message));
         }
-        return json(await clientView(await orderByToken(body.t)));
+        return json(await clientView(await orderByToken(body.t), { unlocked }));
     }
 
     if (body.action === 'respond') {
@@ -204,15 +197,17 @@ export const POST = handle(async (request) => {
     if (body.action === 'respond-finish') {
         if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Unlock it first.');
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
-        if (order.status !== 'received') return json(await clientView(order));
-        const uploaded = await confirmUploads(order.id, body.fileIds);
+        if (order.status !== 'received') return json(await clientView(order, { unlocked }));
+        const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
+        // Told to the client too, so the page doesn't say "sent" for a file that isn't on the request yet.
+        const fileStatus = { filesStillChecking: stillChecking, filesMissing: missing };
         if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} file${uploaded.length === 1 ? '' : 's'} added by you`);
         const { data: recentEvents } = await db().from('order_events').select('kind, title, created_at')
             .eq('order_id', order.id).order('created_at', { ascending: false }).limit(20);
         const lastResponse = (recentEvents || []).find(e => e.kind === 'action_response');
         const lastEmailed = (recentEvents || []).find(e => e.title === 'Reply emailed');
         if (!lastResponse || (lastEmailed && lastEmailed.created_at >= lastResponse.created_at)) {
-            return json(await clientView(await orderByToken(body.t)));
+            return json({ ...await clientView(await orderByToken(body.t), { unlocked }), ...fileStatus });
         }
         await addEvent(order.id, 'note', 'Reply emailed', null, false);
         const origin = siteOrigin(request);
@@ -220,10 +215,12 @@ export const POST = handle(async (request) => {
             to,
             subject: `${order.code}: client sent the information you asked for`,
             heading: `${order.client_name} responded`,
-            lines: [`Request ${order.code} (${order.recipient_name}) is back in your queue.`, uploaded.length ? `${uploaded.length} new file(s) attached.` : 'No new files.'],
+            lines: [`Request ${order.code} (${order.recipient_name}) is back in your queue.`, uploaded.length ? `${uploaded.length} new file(s) attached.` : 'No new files.',
+                ...(stillChecking ? [`${stillChecking} more file(s) could not be checked yet; they will appear on the order once checked.`] : []),
+                ...(missing ? [`${missing} file(s) did not reach storage.`] : [])],
             button: { label: 'Open in your dashboard', url: `${origin}/admin.html#${order.id}` },
         })));
-        return json(await clientView(await orderByToken(body.t)));
+        return json({ ...await clientView(await orderByToken(body.t), { unlocked }), ...fileStatus });
     }
 
     throw new HttpError(400, 'Unknown action.');

@@ -5,9 +5,12 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, ran
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
 export const BUCKET = 'case-files';
-export const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'nicksprocessservices@outlook.com,devteam@partnershipwithmedia-dev.com')
+// Who can sign into the dashboard and gets new-request emails. Without the env var it is Nick alone; anyone else
+// (such as the developers) must be listed in ADMIN_EMAILS on purpose, per environment.
+export const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'nicksprocessservices@outlook.com')
     .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 export const IS_PROD = process.env.VERCEL_ENV === 'production';
+if (IS_PROD && !process.env.ADMIN_EMAILS) console.warn('ADMIN_EMAILS is not set in production; only the built-in owner address can sign in.');
 
 let client = null;
 // Service-role client: bypasses row-level security, so it must only ever run on the server.
@@ -232,11 +235,25 @@ export function verifyTotp(secret, inputCode, timeMs = Date.now()) {
     return matched;
 }
 
-// Throws 429 once a bucket passes `max` hits in its window (counted atomically in the database).
-export async function rateLimit(bucket, max, windowSeconds) {
+// Counts one hit in a bucket's fixed window (atomically in the database) and returns the window's total.
+export async function hitRateLimit(bucket, windowSeconds) {
     const { data, error } = await db().rpc('hit_rate_limit', { p_bucket: bucket, p_window_seconds: windowSeconds });
     if (error) throw error;
-    if (data > max) throw new HttpError(429, 'Too many attempts. Please wait a few minutes and try again.');
+    return data;
+}
+
+// Throws 429 once a bucket passes `max` hits in its window.
+export async function rateLimit(bucket, max, windowSeconds) {
+    if (await hitRateLimit(bucket, windowSeconds) > max) throw new HttpError(429, 'Too many attempts. Please wait a few minutes and try again.');
+}
+
+// Reads a bucket's hits in the current window without adding one (same window start as hit_rate_limit in SQL).
+// ">= start" rather than "= start", so the match never depends on how the timestamp is formatted.
+export async function peekRateLimit(bucket, windowSeconds) {
+    const windowStart = new Date(Math.floor(Date.now() / 1000 / windowSeconds) * windowSeconds * 1000).toISOString();
+    const { data, error } = await db().from('rate_limits').select('hits').eq('bucket', bucket).gte('window_start', windowStart);
+    if (error) throw error;
+    return (data || []).reduce((n, r) => n + (r.hits || 0), 0);
 }
 
 // --- Input cleaning ---
@@ -357,10 +374,13 @@ export function verifyFileMagic(bytes, filename) {
     let head = '';
     for (let i = 0; i < headLen; i++) head += String.fromCharCode(bytes[i]);
     if (POLYGLOT_SCRIPT_RE.test(head)) return false;
+    // Hidden HTML is often appended after the real image or document, so the last 4 KB is checked too, for every type.
+    if (bytes.length > 4096 && POLYGLOT_SCRIPT_RE.test(Buffer.from(bytes.subarray(bytes.length - 4096)).toString('latin1'))) return false;
 
     if (ext === 'pdf') {
-        // %PDF- and no embedded Acrobat JavaScript / Launch actions
-        if (PDF_DANGEROUS_ACTION_RE.test(head)) return false;
+        // %PDF- and no Acrobat JavaScript / Launch actions anywhere in the file (not just its first 4 KB). Actions hidden
+        // inside compressed object streams can't be seen this way; this is a filter, not a full PDF parser.
+        if (PDF_DANGEROUS_ACTION_RE.test(Buffer.from(bytes).toString('latin1'))) return false;
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {
@@ -378,12 +398,7 @@ export function verifyFileMagic(bytes, filename) {
         return true;
     }
     if (ext === 'jpg' || ext === 'jpeg') {
-        // JPEG SOI + marker: FF D8 FF, plus tail polyglot check
-        if (bytes.length > 4096) {
-            let tail = '';
-            for (let i = Math.max(0, bytes.length - 4096); i < bytes.length; i++) tail += String.fromCharCode(bytes[i]);
-            if (POLYGLOT_SCRIPT_RE.test(tail)) return false;
-        }
+        // JPEG SOI + marker: FF D8 FF
         return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
     }
     if (ext === 'png') {
@@ -407,39 +422,61 @@ export function verifyFileMagic(bytes, filename) {
     return false;
 }
 
-// Marks files uploaded only if the object really exists in storage, passes magic-byte inspection, and records a SHA-256 fingerprint.
+// True only when storage positively says the object isn't there. A bad key, a missing bucket or anything unclear is not
+// "missing" (exists() can't tell these apart: its HEAD request has no error body and it reports every 400/404 as absent).
+function isMissingObject(err) {
+    const code = String(err?.code ?? '');
+    const message = String(err?.message ?? '');
+    if (/bucket/i.test(`${code} ${message}`)) return false;
+    return String(err?.statusCode ?? '') === '404' || /^(NoSuchKey|not_found)$/i.test(code) || /object not found/i.test(message);
+}
+
+// Reads a stored upload and checks it. Returns { state: 'ok', sha256 }, 'bad' (the bytes are not what the name claims),
+// 'missing' (storage confirms it never arrived), or 'unknown' (anything else: retried later, never deleted). Like the rest
+// of supabase-js, these calls report failures as { error } instead of throwing, so each one is checked.
+export async function inspectStoredFile(path, filename) {
+    try {
+        const { data: info, error: iErr } = await db().storage.from(BUCKET).info(path);
+        if (iErr) return { state: isMissingObject(iErr) ? 'missing' : 'unknown' };
+        if (!info) return { state: 'unknown' };
+        const { data: blob, error: dErr } = await db().storage.from(BUCKET).download(path);
+        if (dErr || !blob) return { state: 'unknown' };
+        const buf = Buffer.from(await blob.arrayBuffer());
+        return verifyFileMagic(buf, filename) ? { state: 'ok', sha256: sha256(buf) } : { state: 'bad' };
+    } catch {
+        return { state: 'unknown' };
+    }
+}
+
+// Marks files uploaded only if the object really exists in storage, passes magic-byte inspection, and records a SHA-256
+// fingerprint. A disguised file is deleted; one that couldn't be read stays unconfirmed for the daily job to retry.
+// Returns { files: the confirmed files, stillChecking: how many couldn't be read yet (retried later), missing: how many
+// never reached storage, rejected: how many failed the file check and were deleted }, so callers can say what happened.
 export async function confirmUploads(orderId, fileIds) {
     const ids = uuidList(fileIds).slice(0, MAX_FILES);
-    if (!ids.length) return [];
+    if (!ids.length) return { files: [], stillChecking: 0, missing: 0, rejected: 0 };
     const { data: rows, error } = await db().from('order_files').select('id, storage_path, filename, kind')
         .eq('order_id', orderId).in('id', ids);
     if (error) throw error;
     const done = [];
+    let stillChecking = 0;
+    let missing = 0;
+    let rejected = 0;
     for (const r of rows) {
-        const { data: exists } = await db().storage.from(BUCKET).exists(r.storage_path);
-        if (exists) {
-            let fileHash = null;
-            let validMagic = true;
-            try {
-                const { data: blob } = await db().storage.from(BUCKET).download(r.storage_path);
-                if (blob) {
-                    const buf = Buffer.from(await blob.arrayBuffer());
-                    if (!verifyFileMagic(buf, r.filename)) validMagic = false;
-                    else fileHash = sha256(buf);
-                }
-            } catch { /* non-fatal if storage download cannot compute hash */ }
-            if (!validMagic) {
-                await db().storage.from(BUCKET).remove([r.storage_path]).catch(() => {});
-                await db().from('order_files').delete().eq('id', r.id);
-                continue;
-            }
-            const patch = fileHash ? { uploaded: true, sha256: fileHash } : { uploaded: true };
-            const { error: uErr } = await db().from('order_files').update(patch).eq('id', r.id);
-            if (uErr && fileHash) await db().from('order_files').update({ uploaded: true }).eq('id', r.id);
-            done.push({ ...r, sha256: fileHash });
+        const check = await inspectStoredFile(r.storage_path, r.filename);
+        if (check.state === 'bad') {
+            await db().storage.from(BUCKET).remove([r.storage_path]).catch(() => {});
+            await db().from('order_files').delete().eq('id', r.id);
+            rejected++;
+            continue;
         }
+        if (check.state === 'missing') { missing++; continue; }
+        if (check.state !== 'ok') { stillChecking++; continue; }
+        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id);
+        if (uErr) throw uErr;
+        done.push({ ...r, sha256: check.sha256 });
     }
-    return done;
+    return { files: done, stillChecking, missing, rejected };
 }
 
 export async function signedDownload(path, filename) {
