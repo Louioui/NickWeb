@@ -364,7 +364,7 @@ function actionForm(o) {
         const seal = o.integrity_seal || {};
         const stepUp = totpEnabled ? `
             <div><label for="f-stepup" class="field-label">Code from your authenticator app</label>
-            <input id="f-stepup" inputmode="numeric" maxlength="6" autocomplete="one-time-code" class="field font-mono tracking-widest max-w-[12rem]" placeholder="000000"></div>` : '';
+            <input id="f-stepup" inputmode="text" maxlength="9" spellcheck="false" autocomplete="one-time-code" class="field font-mono tracking-widest max-w-[12rem] uppercase" placeholder="000000"><p class="text-xs text-muted mt-1">Or one of your recovery codes (XXXX-XXXX).</p></div>` : '';
         return `
         <div class="space-y-3 pb-5 rule-b">
             <p class="text-sm font-semibold text-primary"><i class="fa-solid fa-shield-halved text-bronze mr-1"></i> Protection</p>

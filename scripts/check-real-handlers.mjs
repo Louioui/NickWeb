@@ -525,5 +525,22 @@ await check('F-08 email code + authenticator code still signs in', async () => {
     expect(res.status === 200 && res.headers.get('set-cookie'), `sign-in failed (${res.status} ${await res.text()})`);
 });
 
+await check('R1 a recovery code (XXXX-XXXX) works where the dashboard asks for the authenticator code, once only', async () => {
+    reset(); seedAdmin2fa();
+    const first = await adminPOST(post('/api/admin', { action: 'generate-recovery-codes', totp: 'abcd-efgh' }, { cookie: adminCookie() }));
+    expect(first.status === 200 && (await first.json()).codes.length === 8, `recovery code refused (${first.status})`);
+    reset(); seedAdmin2fa();
+    tables().admin_recovery_codes[0].used = true;
+    const reused = await adminPOST(post('/api/admin', { action: 'generate-recovery-codes', totp: 'ABCD-EFGH' }, { cookie: adminCookie() }));
+    expect(reused.status === 403, `used recovery code accepted (${reused.status})`);
+});
+await check('R2 an authenticator set up under a different APP_SECRET gives a clear message, not a server error', async () => {
+    reset(); seedAdmin2fa(); addAdminCode('12345678');
+    tables().admin_totp[0].secret_enc = core.encryptSecret('JBSWY3DPEHPK3PXP').replace(/\.([^.]+)$/, '.AAAA$1');
+    const res = await adminLogin({ code: '12345678', totp: '123456' });
+    const body = await res.json();
+    expect(res.status === 409 && /different copy of this site/.test(body.error), `${res.status} ${JSON.stringify(body)}`);
+});
+
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);
 if (failures.length) process.exit(1);

@@ -121,8 +121,8 @@
                 <p class="text-xs text-muted leading-relaxed">Ask for a 6-digit code from an authenticator app (Apple Passwords, Google Authenticator, Microsoft Authenticator, 1Password or Authy) at every sign-in, and before deleting a request, unlocking legal hold, or creating new recovery codes. Someone who gets into your email still can't get in.</p>
                 <div id="totp-current-wrap" class="hidden">
                     <label for="totp-current-input" class="field-label">Current code from your authenticator app</label>
-                    <input id="totp-current-input" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code" class="field text-center font-mono tracking-widest max-w-[12rem]">
-                    <p class="text-xs text-muted mt-1">Needed to change your phone, turn two-step off, or create new recovery codes.</p>
+                    <input id="totp-current-input" inputmode="text" maxlength="9" spellcheck="false" placeholder="000000 or XXXX-XXXX" autocomplete="one-time-code" class="field text-center font-mono tracking-widest max-w-[12rem]">
+                    <p class="text-xs text-muted mt-1">Needed to change your phone, turn two-step off, or create new recovery codes. Lost your phone? Type one of your recovery codes (XXXX-XXXX) instead.</p>
                 </div>
                 <div class="flex flex-wrap gap-2">
                     <button id="totp-setup-btn" type="button" data-click="startTotpSetup" class="btn btn-pine btn-sm"><i class="fa-solid fa-qrcode" aria-hidden="true"></i> <span id="totp-setup-label">Turn On Two-Step Sign-In</span></button>
@@ -168,7 +168,7 @@
                 <ul id="admin-passkey-list" class="space-y-2 text-xs" aria-label="Your passkeys"></ul>
                 <div class="flex flex-wrap items-end gap-2">
                     <div><label for="admin-passkey-label" class="field-label">Device name <span class="font-normal text-muted">(optional)</span></label><input id="admin-passkey-label" class="field max-w-[12rem]" maxlength="80" placeholder="My iPhone" autocomplete="off"></div>
-                    <div><label for="admin-passkey-totp" class="field-label">Authenticator code</label><input id="admin-passkey-totp" class="field font-mono tracking-widest max-w-[8rem]" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="123456"></div>
+                    <div><label for="admin-passkey-totp" class="field-label">Authenticator code</label><input id="admin-passkey-totp" class="field font-mono tracking-widest max-w-[10rem] uppercase" inputmode="text" maxlength="9" spellcheck="false" autocomplete="one-time-code" placeholder="123456"></div>
                     <button type="button" data-click="addAdminPasskey" class="btn btn-pine btn-sm">Add a passkey</button>
                 </div>
             </section>
