@@ -1,6 +1,6 @@
 // GET /api/keepalive — run daily by Vercel Cron (vercel.json). A real query keeps the free Supabase project
 // from pausing after 7 quiet days, and clears out expired login codes and sessions.
-import { db, handle, json, HttpError, BUCKET, addEvent, rateLimit, timingSafeMatch, inspectStoredFile } from './_lib/core.mjs';
+import { db, handle, json, HttpError, BUCKET, addEvent, rateLimit, timingSafeMatch, inspectStoredFile, savePageCount } from './_lib/core.mjs';
 
 const BATCH = 100;
 
@@ -51,6 +51,7 @@ export const GET = handle(async (request) => {
         }
         const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', f.id);
         if (uErr) throw uErr;
+        await savePageCount(f.id, check.pageCount);
         await addEvent(f.order_id, 'note', 'Document received', f.filename);
         recovered++;
     }

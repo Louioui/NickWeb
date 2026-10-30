@@ -65,14 +65,26 @@ function render(o) {
         $('pay-btn').href = safePayUrl;
     }
 
+    const next = NPSField.nextStep({ status: o.status, tier: o.tierKey });
+    $('next-step').classList.toggle('hidden', !next);
+    $('next-step-text').textContent = next;
+    $('receipt-btn').classList.toggle('hidden', !o.receipt);
+    $('message-panel').classList.toggle('hidden', !(o.canMessage && !o.actionNote && o.unlocked));
+
     $('action-panel').classList.toggle('hidden', !o.actionNote);
     if (o.actionNote) $('action-note').textContent = o.actionNote;
 
     const proof = o.files.filter(f => f.kind === 'proof');
     const docs = o.files.filter(f => f.kind !== 'proof');
     const chip = f => `<button type="button" class="file-chip" data-file="${esc(f.id)}" ${f.sha256 ? `title="Verified SHA-256 fingerprint: ${esc(f.sha256)}"` : ''}><i class="fa-solid ${f.kind === 'proof' ? 'fa-file-signature' : 'fa-file-lines'} text-bronze"></i><span>${esc(f.name)}</span><span class="text-muted font-normal">${NPS.fmtSize(f.size)}</span>${f.sha256 ? `<span class="text-[11px] font-mono text-primary bg-primaryLight/60 px-1.5 py-0.5 rounded-sm"><i class="fa-solid fa-shield-halved mr-0.5" aria-hidden="true"></i>SHA-256 ${esc(f.sha256.slice(0, 8))}…</span>` : ''}</button>`;
-    $('proof-files').innerHTML = proof.map(chip).join('');
-    $('doc-files').innerHTML = docs.map(chip).join('');
+    // Each unlocked file shows its SHA-256 fingerprint with Copy and Verify buttons (the check runs in this browser).
+    const withTools = f => `<div class="flex flex-col gap-1">${chip(f)}${f.sha256 ? `<div class="flex flex-wrap items-center gap-2 text-xs">
+        <span class="font-mono text-muted" title="${esc(f.sha256)}">SHA-256 ${esc(f.sha256.slice(0, 16))}…</span>
+        <button type="button" class="text-primary underline underline-offset-2 min-h-[44px]" data-copy-sha="${esc(f.sha256)}" aria-label="Copy the SHA-256 fingerprint of ${esc(f.name)}">Copy</button>
+        <button type="button" class="text-primary underline underline-offset-2 min-h-[44px]" data-verify="${esc(f.id)}" data-sha="${esc(f.sha256)}" aria-label="Verify ${esc(f.name)} against its sealed record">Verify File</button>
+        <span class="verify-result" role="status"></span></div>` : ''}</div>`;
+    $('proof-files').innerHTML = proof.map(withTools).join('');
+    $('doc-files').innerHTML = docs.map(withTools).join('');
     $('proof-block').classList.toggle('hidden', !proof.length);
     $('docs-block').classList.toggle('hidden', !docs.length);
     $('files-panel').classList.toggle('hidden', !o.files.length);
@@ -123,6 +135,21 @@ async function load() {
 }
 
 document.addEventListener('click', async (e) => {
+    const copy = e.target.closest('[data-copy-sha]');
+    if (copy) { NPS.copyText(copy.dataset.copySha, copy); return; }
+    const ver = e.target.closest('[data-verify]');
+    if (ver) {
+        const out = ver.parentElement.querySelector('.verify-result');
+        ver.disabled = true; out.textContent = 'Checking…'; out.className = 'verify-result text-muted';
+        try {
+            const { url } = await trackCall({ action: 'download', fileId: ver.dataset.verify }, { notify: false });
+            const r = await NPS.verifyFileSha256(url, ver.dataset.sha);
+            out.textContent = r.ok ? 'Verified: matches sealed record (SHA-256)' : 'Does NOT match the sealed record. Call Nick at (209) 922-6817.';
+            out.className = `verify-result font-semibold ${r.ok ? 'text-primary' : 'text-[#7a1f1c]'}`;
+        } catch (err) { out.textContent = err.message; out.className = 'verify-result text-[#7a1f1c]'; }
+        finally { ver.disabled = false; }
+        return;
+    }
     const btn = e.target.closest('[data-file]');
     if (!btn) return;
     btn.disabled = true;
@@ -135,6 +162,43 @@ document.addEventListener('click', async (e) => {
     } finally {
         btn.disabled = false;
     }
+});
+
+$('receipt-btn').addEventListener('click', () => { if (order?.receipt) NPS.printDocument(NPSField.receiptHtml(order.receipt)); });
+$('pay-refresh').addEventListener('click', async () => {
+    const msg = $('pay-refresh-msg');
+    $('pay-refresh').disabled = true;
+    try {
+        const r = await trackCall({ action: 'refresh-payment-link' });
+        render(r);
+        msg.textContent = r.fresh ? 'A new 24-hour payment link is ready. Use Pay Securely above.' : 'Your current link still works. Use Pay Securely above.';
+        msg.className = 'result-box result-ok text-sm mt-2';
+    } catch (err) { msg.textContent = err.message; msg.className = 'result-box result-err text-sm mt-2'; }
+    finally { $('pay-refresh').disabled = false; }
+});
+$('message-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+    const files = Array.from($('m-files').files);
+    const show = (id, text) => { $(id).textContent = text; $(id).classList.toggle('hidden', !text); };
+    show('message-error', ''); show('message-ok', '');
+    const problem = files.length ? NPS.checkFiles(files) : '';
+    if (problem) return show('message-error', problem);
+    if (!$('m-text').value.trim() && !files.length) return show('message-error', 'Write a message or attach a file.');
+    btn.disabled = true;
+    try {
+        const { uploads } = await trackCall({ action: 'message', message: $('m-text').value, files: files.map(NPS.fileMeta) });
+        let note = '';
+        if (uploads.length) {
+            const up = await NPS.uploadAll(uploads, files);
+            const r = await trackCall({ action: 'respond-finish', fileIds: up.ok });
+            render(r);
+            if (up.failed.length) note = ` ${up.failed.join(', ')} did not upload; please try those again.`;
+        } else render(await view());
+        $('m-text').value = ''; $('m-files').value = '';
+        show('message-ok', `Sent to Nick.${note}`);
+    } catch (err) { show('message-error', err.message); }
+    finally { btn.disabled = false; }
 });
 
 $('lock-send').addEventListener('click', async () => {

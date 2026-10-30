@@ -24,7 +24,7 @@ await call({action:'send-code',intent:'signup',email:'fresh@example.com',name:'F
 assert.equal((await call({action:'verify-code',email:'fresh@example.com',code:'000000'})).status,401);passed++;
 const a=await signup('paralegal@example.com');
 const all=await (await call({action:'list'},a)).json();
-check('verified sample email sees its five requests',()=>assert.equal(all.orders.length,5));
+check('verified sample email sees its six requests',()=>assert.equal(all.orders.length,6));
 const b=await signup('unrelated@example.com');
 const empty=await (await call({action:'list',email:'paralegal@example.com',userId:'another-client'},b)).json();
 check('a different client cannot override ownership using body fields',()=>assert.equal(empty.orders.length,0));
@@ -48,7 +48,19 @@ check('devteam@partnershipwithmedia-dev.com can log into admin dashboard', () =>
 const devAdminCookie1 = devAdminLogin1.headers.get('set-cookie').split(';')[0];
 const devAdminCookie2 = devAdminLogin2.headers.get('set-cookie').split(';')[0];
 
-const genRes = await (await call({ action: 'generate-recovery-codes' }, devAdminCookie1, 'admin')).json();
+// F-09: with the authenticator off, new recovery codes need an emailed confirmation code (the demo code) first.
+const noStepUp = await call({ action: 'generate-recovery-codes' }, devAdminCookie1, 'admin');
+const noStepUpBody = await noStepUp.json();
+check('F-09 (mock) recovery codes need the emailed step-up while the authenticator is off', () => {
+    assert.equal(noStepUp.status, 403);
+    assert.equal(noStepUpBody.requiresEmailStepUp, true);
+});
+assert.equal((await call({ action: 'send-stepup-code' }, devAdminCookie1, 'admin')).status, 200);
+const wrongStepUp = await call({ action: 'generate-recovery-codes', totp: '00000000' }, devAdminCookie1, 'admin');
+check('F-09 (mock) a wrong emailed code is refused', () => assert.equal(wrongStepUp.status, 403));
+const genRes = await (await call({ action: 'generate-recovery-codes', totp: '12345678' }, devAdminCookie1, 'admin')).json();
+const otherSession = await call({ action: 'totp-setup' }, devAdminCookie2, 'admin');
+check('F-09 (mock) the 5-minute step-up window belongs to one session only', () => assert.equal(otherSession.status, 403));
 check('admin can generate 8 single-use backup recovery codes', () => {
     assert.equal(genRes.codes.length, 8);
     assert.equal(genRes.remaining, 8);
@@ -91,4 +103,55 @@ check('Proof of Service exposes matching SHA-256 fingerprint on client tracking 
     assert.equal(clientProof?.sha256, proofFile.sha256);
 });
 
+// Trusted devices in the mock (same rules as api/_lib/clients.mjs): a remembered device skips the PIN for 30 days;
+// "Sign out all devices" forgets it.
+{
+    const addr = 'trusted-device@example.com';
+    await call({ action: 'send-code', intent: 'signup', email: addr, name: 'Trusty', firm: '' });
+    const first = await call({ action: 'verify-code', email: addr, code: '123456' });
+    const cookies = first.headers.get('set-cookie');
+    const session = /nps_client=[^;,]+/.exec(cookies)[0], device = /nps_device=[^;,]+/.exec(cookies)?.[0];
+    check('trusted device (mock): signing in remembers the device by default', () => assert.ok(device));
+    assert.equal((await call({ action: 'set-pin', pin: '246810' }, session)).status, 200);
+    const again = async (cookie) => { await call({ action: 'send-code', intent: 'signin', email: addr }); return (await call({ action: 'verify-code', email: addr, code: '123456' }, cookie)).json(); };
+    const trustedRes = await again(device);
+    const otherRes = await again('');
+    check('trusted device (mock): the remembered device skips the PIN, a new device is asked for it', () => {
+        assert.equal(trustedRes.ok, true);
+        assert.equal(otherRes.requiresPin, true);
+    });
+    await call({ action: 'logout-all' }, session);
+    const afterLogoutAll = await again(device);
+    check('trusted device (mock): "Sign out all devices" makes the old device ask for the PIN again', () => assert.equal(afterLogoutAll.requiresPin, true));
+}
+// Milestone 2 in the mock: bulk close, safe-walk alert and fresh payment links follow the same rules as production.
+{
+    const m2Login = await call({ action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '12345678' }, '', 'admin');
+    const devAdminCookie1 = m2Login.headers.get('set-cookie').split(';')[0];
+    const list = (await (await call({ action: 'list' }, devAdminCookie1, 'admin')).json()).orders || [];
+    const ids = list.map(o => o.id);
+    const before = Object.fromEntries(list.map(o => [o.id, o.status]));
+    const closeRes = await (await call({ action: 'bulk-close', ids }, devAdminCookie1, 'admin')).json();
+    const after = Object.fromEntries(((await (await call({ action: 'list' }, devAdminCookie1, 'admin')).json()).orders || []).map(o => [o.id, o.status]));
+    check('mock bulk close: only served or cancelled requests become closed', () => {
+        for (const id of ids) {
+            if (['served', 'cancelled'].includes(before[id])) assert.equal(after[id], 'closed');
+            else assert.equal(after[id], before[id]);
+        }
+        assert.ok(Array.isArray(closeRes.closed) && Array.isArray(closeRes.skipped), JSON.stringify(closeRes) + ' ids=' + ids.length);
+    });
+    const target = list.find(o => o.status !== 'closed') || list[0];
+    const walk = await call({ action: 'safe-walk-alert', id: target.id, minutes: 15 }, devAdminCookie1, 'admin');
+    check('mock safe-walk alert answers like production', async () => assert.equal(walk.status, 200));
+    const unpaid = list.find(o => !o.paid_at && o.amount_due_cents >= 100);
+    if (unpaid) {
+        const r1 = await (await call({ action: 'refresh-payment-link', id: unpaid.id }, devAdminCookie1, 'admin')).json();
+        const r2 = await (await call({ action: 'refresh-payment-link', id: unpaid.id }, devAdminCookie1, 'admin')).json();
+        check('mock payment link refresh: an expired link is replaced, and the new one is reused while open', () => {
+            assert.equal(typeof r1.paymentUrl, 'string');
+            assert.equal(r2.fresh, false);
+            assert.equal(r2.paymentUrl, r1.paymentUrl);
+        });
+    }
+}
 console.log(`${passed} client account checks passed`);

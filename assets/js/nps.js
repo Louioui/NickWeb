@@ -34,6 +34,7 @@ const NPS = (() => {
         if (!res.ok) {
             const err = new Error(data.error || FALLBACK_ERROR);
             err.status = res.status;
+            err.data = data;   // extra fields the page may react to (for example requiresEmailStepUp)
             err.data = data;
             throw err;
         }
@@ -300,7 +301,24 @@ const NPS = (() => {
         w.document.getElementById('print-record')?.addEventListener('click', () => w.print());
     }
 
+    // Opens a printable page (receipt, court-prep sheet, evidence pack) built by NPSField. Not opened with 'noopener'
+    // (window.open would then return null); the page's Print button gets a listener, never an inline handler.
+    function printDocument(html) {
+        const w = window.open('', '_blank', 'width=900,height=800');
+        if (!w) { alert('Allow pop-ups for this site to print.'); return; }
+        w.opener = null;
+        w.document.write(html);
+        w.document.close();
+        w.document.getElementById('print-doc')?.addEventListener('click', () => w.print());
+    }
+    async function copyText(text, btn) {
+        try { await navigator.clipboard.writeText(text); } catch { return false; }
+        if (btn) { const old = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = old; }, 1800); }
+        return true;
+    }
+
     return {
+        printDocument, copyText,
         esc, post, get, onChange, fileMeta, checkFiles, uploadAll, stripPhotoBytes,
         verifyFileSha256, printChainOfCustody,
         money, fmtDate, fmtSize,

@@ -1,11 +1,12 @@
 // Service Worker for Nick's Process Services Dashboard (admin.html).
 // Caches ONLY static shell assets (HTML, fonts, icons) so the dashboard opens reliably on spotty cellular connections.
 // NEVER caches /api/*, /__mock*, or cross-origin requests (such as signed document download URLs).
-const CACHE_NAME = 'nps-dashboard-shell-v3';
+const CACHE_NAME = 'nps-dashboard-shell-v4';
 const SHELL_ASSETS = [
     '/admin.html',
     '/manifest.webmanifest',
     '/assets/js/nps.js',
+    '/assets/js/field-tools.js',
     '/assets/js/admin.js',
     '/assets/vendor/qrcode-generator-1.4.4/qrcode.js',
     '/assets/vendor/simplewebauthn-browser-14.0.0/index.umd.min.js',

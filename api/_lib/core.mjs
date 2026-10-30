@@ -1,6 +1,7 @@
 // Shared server code for the /api functions: database client, HTTP helpers, tokens, rate limits.
 // Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
 import { createClient } from '@supabase/supabase-js';
+import { stripPhotoMetadata, PHOTO_TYPES } from './photo-meta.mjs';
 import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
@@ -27,7 +28,8 @@ export function db() {
 }
 
 export class HttpError extends Error {
-    constructor(status, message) { super(message); this.status = status; }
+    // extra: small, safe fields the browser needs to react (for example { requiresEmailStepUp: true }).
+    constructor(status, message, extra = null) { super(message); this.status = status; this.extra = extra; }
 }
 
 export function json(data, status = 200, headers = {}) {
@@ -43,7 +45,7 @@ export function handle(fn) {
         try {
             return await fn(request);
         } catch (err) {
-            if (err instanceof HttpError) return json({ error: err.message }, err.status);
+            if (err instanceof HttpError) return json({ ...(err.extra || {}), error: err.message }, err.status);
             console.error(err);
             return json({ error: 'Something went wrong on our end. Please try again or call (209) 922-6817.' }, 500);
         }
@@ -57,7 +59,7 @@ export async function readJson(request, maxBytes = 64 * 1024) {
     const origin = request.headers.get('origin');
     if (origin && origin !== new URL(request.url).origin) throw new HttpError(403, 'Invalid request.');
     const text = await request.text();
-    if (text.length > maxBytes) throw new HttpError(413, 'Request is too large.');
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) throw new HttpError(413, 'Request is too large.');   // bytes, not characters
     let parsed;
     try {
         parsed = text ? JSON.parse(text, (k, v) => (k === '__proto__' || k === 'constructor' || k === 'prototype') ? undefined : v) : {};
@@ -346,17 +348,20 @@ export async function prepareUploads(orderId, kind, files) {
         throw new HttpError(400, `Each request can have at most ${MAX_ORDER_FILES} files total.`);
     }
     const folder = { client_document: 'client', proof: 'proof', action_upload: 'action' }[kind];
+    const planned = files.map(f => ({ f, path: `orders/${orderId}/${folder}/${randomToken(8)}-${f.name.replace(/[^\w.\-]+/g, '_').slice(-120)}` }));
+    // One insert for the whole batch: the database's per-request cap (order_files_cap trigger) then accepts or refuses
+    // all of them together, so parallel batches can't push a request past 25 files between the count above and here.
+    const { data: rows, error } = await db().from('order_files').insert(planned.map(({ f, path }) => ({
+        order_id: orderId, kind, storage_path: path, filename: f.name, size_bytes: f.size, content_type: f.type,
+    }))).select('id, storage_path');
+    if (error?.message?.includes('order_files_cap')) throw new HttpError(400, `Each request can have at most ${MAX_ORDER_FILES} files total.`);
+    if (error) throw error;
+    const idFor = new Map((rows || []).map(r => [r.storage_path, r.id]));
     const out = [];
-    for (const f of files) {
-        const safe = f.name.replace(/[^\w.\-]+/g, '_').slice(-120);
-        const path = `orders/${orderId}/${folder}/${randomToken(8)}-${safe}`;
-        const { data: row, error } = await db().from('order_files').insert({
-            order_id: orderId, kind, storage_path: path, filename: f.name, size_bytes: f.size, content_type: f.type,
-        }).select('id').single();
-        if (error) throw error;
+    for (const { f, path } of planned) {
         const { data: signed, error: sErr } = await db().storage.from(BUCKET).createSignedUploadUrl(path);
         if (sErr) throw sErr;
-        out.push({ fileId: row.id, name: f.name, uploadUrl: signed.signedUrl });
+        out.push({ fileId: idFor.get(path), name: f.name, uploadUrl: signed.signedUrl });
     }
     return out;
 }
@@ -364,7 +369,11 @@ export async function prepareUploads(orderId, kind, files) {
 // Verifies that actual uploaded file bytes match the expected binary signature (magic bytes) of the file extension
 // and rejects polyglot files that embed HTML/script tags, executable PDF actions, or macro-enabled/disguised ZIPs.
 const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
-const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
+// PDF features that run code, open other programs, carry hidden files, or send data out (F-10).
+const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch|RichMedia|EmbeddedFiles?|XFA|SubmitForm|ImportData)(?![A-Za-z0-9])/;
+// PDF names may spell letters as #xx (for example /J#61vaScript), so names are decoded before they are checked.
+const decodePdfNames = (s) => s.replace(/\/[^\s\/\[\]<>(){}%]*#[0-9A-Fa-f]{2}[^\s\/\[\]<>(){}%]*/g,
+    (name) => name.replace(/#([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16))));
 const DOCX_MACRO_OR_EXEC_RE = /(?:vbaProject\.bin|vbaData\.xml|activeX\/activeX|\.(?:exe|dll|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|msi|com|hta|jar|sh)(?:[\x00-\x20"'<>\/\\]|$))/i;
 
 export function verifyFileMagic(bytes, filename) {
@@ -378,9 +387,11 @@ export function verifyFileMagic(bytes, filename) {
     if (bytes.length > 4096 && POLYGLOT_SCRIPT_RE.test(Buffer.from(bytes.subarray(bytes.length - 4096)).toString('latin1'))) return false;
 
     if (ext === 'pdf') {
-        // %PDF- and no Acrobat JavaScript / Launch actions anywhere in the file (not just its first 4 KB). Actions hidden
-        // inside compressed object streams can't be seen this way; this is a filter, not a full PDF parser.
-        if (PDF_DANGEROUS_ACTION_RE.test(Buffer.from(bytes).toString('latin1'))) return false;
+        // %PDF- and, across the whole file (not just its first and last 4 KB): no code-running, program-launching,
+        // embedded-file or data-sending features, and no HTML/script hidden inside. Actions hidden inside compressed
+        // object streams can't be seen this way; this is a filter, not a full PDF parser.
+        const body = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1');
+        if (POLYGLOT_SCRIPT_RE.test(body) || PDF_DANGEROUS_ACTION_RE.test(decodePdfNames(body))) return false;
         return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
     }
     if (ext === 'docx') {
@@ -422,6 +433,22 @@ export function verifyFileMagic(bytes, filename) {
     return false;
 }
 
+// Counts the pages of a PDF by reading its structure, without running or unpacking anything in it: the larger of the
+// number of /Type /Page objects and the highest /Count of a /Pages node. Pages kept inside compressed object streams
+// can't be seen this way, so the answer can be too low or unknown (null); the printing fee is a helper, not a bill.
+export function countPdfPages(bytes) {
+    if (!(bytes instanceof Uint8Array) || bytes.length < 5) return null;
+    const body = decodePdfNames(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1'));
+    const pages = (body.match(/\/Type\s*\/Page(?![A-Za-z0-9])/g) || []).length;
+    let count = 0;
+    for (const m of body.matchAll(/\/Type\s*\/Pages(?![A-Za-z0-9])[^>]{0,400}?\/Count\s+(\d{1,6})|\/Count\s+(\d{1,6})[^>]{0,400}?\/Type\s*\/Pages(?![A-Za-z0-9])/g)) {
+        count = Math.max(count, Number(m[1] || m[2]));
+    }
+    const n = Math.max(pages, count);
+    return n > 0 && n <= 100000 ? n : null;
+}
+export const printingFeeCents = (totalPages) => Math.max(0, (Number(totalPages) || 0) - 100) * 15;   // first 100 free, then 15¢
+
 // True only when storage positively says the object isn't there. A bad key, a missing bucket or anything unclear is not
 // "missing" (exists() can't tell these apart: its HEAD request has no error body and it reports every 400/404 as absent).
 function isMissingObject(err) {
@@ -431,7 +458,7 @@ function isMissingObject(err) {
     return String(err?.statusCode ?? '') === '404' || /^(NoSuchKey|not_found)$/i.test(code) || /object not found/i.test(message);
 }
 
-// Reads a stored upload and checks it. Returns { state: 'ok', sha256 }, 'bad' (the bytes are not what the name claims),
+// Reads a stored upload and checks it. Returns { state: 'ok', sha256, cleaned }, 'bad' (the bytes are not what the name claims),
 // 'missing' (storage confirms it never arrived), or 'unknown' (anything else: retried later, never deleted). Like the rest
 // of supabase-js, these calls report failures as { error } instead of throwing, so each one is checked.
 export async function inspectStoredFile(path, filename) {
@@ -442,7 +469,18 @@ export async function inspectStoredFile(path, filename) {
         const { data: blob, error: dErr } = await db().storage.from(BUCKET).download(path);
         if (dErr || !blob) return { state: 'unknown' };
         const buf = Buffer.from(await blob.arrayBuffer());
-        return verifyFileMagic(buf, filename) ? { state: 'ok', sha256: sha256(buf) } : { state: 'bad' };
+        if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
+        // F-11: a photo that still carries GPS/EXIF (its uploader skipped the page's cleaning) is cleaned here and the
+        // stored copy replaced, so the fingerprint is taken of the cleaned file. If the replacement can't be written, the
+        // upload stays unconfirmed and is retried, rather than accepted with its location inside.
+        const pageCount = /\.pdf$/i.test(filename) ? countPdfPages(buf) : null;
+        const clean = stripPhotoMetadata(buf, filename);
+        if (!clean) return { state: 'ok', sha256: sha256(buf), cleaned: false, pageCount };
+        if (!verifyFileMagic(clean, filename)) return { state: 'bad' };
+        const ext = filename.split('.').pop().toLowerCase();
+        const { error: wErr } = await db().storage.from(BUCKET).update(path, clean, { contentType: PHOTO_TYPES[ext], upsert: true });
+        if (wErr) return { state: 'unknown' };
+        return { state: 'ok', sha256: sha256(clean), cleaned: true };
     } catch {
         return { state: 'unknown' };
     }
@@ -452,6 +490,12 @@ export async function inspectStoredFile(path, filename) {
 // fingerprint. A disguised file is deleted; one that couldn't be read stays unconfirmed for the daily job to retry.
 // Returns { files: the confirmed files, stillChecking: how many couldn't be read yet (retried later), missing: how many
 // never reached storage, rejected: how many failed the file check and were deleted }, so callers can say what happened.
+// Saved separately (and never fatal), so uploads keep working before the page_count column exists.
+export async function savePageCount(fileId, pageCount) {
+    if (pageCount == null) return;
+    await db().from('order_files').update({ page_count: pageCount }).eq('id', fileId).then(() => {}, () => {});
+}
+
 export async function confirmUploads(orderId, fileIds) {
     const ids = uuidList(fileIds).slice(0, MAX_FILES);
     if (!ids.length) return { files: [], stillChecking: 0, missing: 0, rejected: 0 };
@@ -474,7 +518,8 @@ export async function confirmUploads(orderId, fileIds) {
         if (check.state !== 'ok') { stillChecking++; continue; }
         const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id);
         if (uErr) throw uErr;
-        done.push({ ...r, sha256: check.sha256 });
+        await savePageCount(r.id, check.pageCount);
+        done.push({ ...r, sha256: check.sha256, page_count: check.pageCount ?? null });
     }
     return { files: done, stillChecking, missing, rejected };
 }
@@ -484,6 +529,22 @@ export async function signedDownload(path, filename) {
     const { data, error } = await db().storage.from(BUCKET).createSignedUrl(path, 60, { download: filename });
     if (error) throw error;
     return data.signedUrl;
+}
+
+// Append-only record of what a client did on their request (client_audit_logs), for disputes and court evidence. Never
+// fatal: a failed write is logged and the client's action still goes through (and works before the table exists).
+// 'view_unlocked' is written at most once per 15 minutes per request, so a page that refreshes itself doesn't flood it.
+export async function logClientAction(request, order, action, detail = null) {
+    try {
+        if (action === 'view_unlocked' && (await hitRateLimit(`client-audit-view:${order.id}`, 900)) > 1) return;
+        const { error } = await db().from('client_audit_logs').insert({
+            order_id: order.id, order_code: /^NP-\d{6}$/.test(order.code || '') ? order.code : null, action,
+            ip_hash: request ? sha256(clientIp(request)) : null,
+            user_agent: request ? (String(request.headers.get('user-agent') || '').slice(0, 200) || null) : null,
+            detail: detail ? String(detail).replace(/[\u0000-\u001F\u007F]+/g, ' ').slice(0, 300) : null,
+        });
+        if (error) console.error('Client audit log write failed:', error.message);
+    } catch (err) { console.error('Client audit log write failed:', err?.message); }
 }
 
 export async function addEvent(orderId, kind, title, detail = null, clientVisible = true) {

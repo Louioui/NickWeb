@@ -225,7 +225,7 @@ await step('/api/client blocks all SQLi, PostgREST, cookie tampering, and privil
     }
     // Verify paralegal@example.com still has all 5 orders intact
     const paraList = await (await callMock('client', { action: 'list' }, validClientCookie)).json();
-    assert.equal(paraList.orders.length, 5);
+    assert.equal(paraList.orders.length, 6);   // six sample requests (NP-730264 shows substituted service)
 });
 
 // 6. Exhaustive SQLi & PostgREST attack matrix against /api/admin
@@ -258,7 +258,8 @@ await step('/api/admin blocks all SQLi, PostgREST, auth bypass, and destructive 
         const badStatus = await callMock('admin', { action: 'update', id: sampleOrder.id, kind: 'status', status: payload }, adminCookie);
         assert.equal(badStatus.status, 400);
         const badDelete = await callMock('admin', { action: 'delete', id: sampleOrder.id, confirm: payload }, adminCookie);
-        assert.equal(badDelete.status, 400, 'Delete with SQLi confirmation code must fail');
+        // 403 since F-09 (emailed step-up is checked first while the authenticator is off), 400 for the bad confirmation.
+        assert.ok([400, 403].includes(badDelete.status), `Delete with SQLi confirmation code must fail (got ${badDelete.status})`);
         totalAssertions += 8;
     }
 
@@ -718,7 +719,9 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     // 11f. Tamper-evident admin audit log records failed login, successful login, recovery-code generation, export, and delete
     const activeAdminCookie = adminCookies[5];
     await callMock('admin', { action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '99999999' });
-    await callMock('admin', { action: 'generate-recovery-codes' }, activeAdminCookie);
+    // F-09: authenticator off, so confirm with the emailed code first (it then covers this session for 5 minutes).
+    await callMock('admin', { action: 'send-stepup-code' }, activeAdminCookie);
+    await callMock('admin', { action: 'generate-recovery-codes', totp: '12345678' }, activeAdminCookie);
     const tempOrderRes = await (await callMock('request', {
         clientName: 'Audit Delete Tester',
         clientEmail: 'audit@example.com',

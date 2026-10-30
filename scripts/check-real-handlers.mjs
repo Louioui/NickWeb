@@ -542,5 +542,24 @@ await check('R2 an authenticator set up under a different APP_SECRET gives a cle
     expect(res.status === 409 && /different copy of this site/.test(body.error), `${res.status} ${JSON.stringify(body)}`);
 });
 
+
+// --- Client portal records: receipts and proof links only ever cover the signed-in client's own requests ---
+await check('M3 portal receipt and proof links stay inside the client\'s own requests', async () => {
+    reset(); db.__addUser(CLIENT);
+    const mine = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 7500 });
+    const theirs = seedOrder({ id: randomUUID(), code: 'NP-654321', client_email: 'other@example.com', paid_at: new Date().toISOString(), track_token: 'U'.repeat(32) });
+    (tables().order_files ||= []).push(
+        { id: randomUUID(), order_id: mine.id, kind: 'proof', filename: 'mine.pdf', storage_path: 'p/mine.pdf', uploaded: true, sha256: 'c'.repeat(64) },
+        { id: randomUUID(), order_id: theirs.id, kind: 'proof', filename: 'theirs.pdf', storage_path: 'p/theirs.pdf', uploaded: true, sha256: 'd'.repeat(64) });
+    const login = await codeLogin({ remember: false });
+    const cookie = `nps_client=${cookieValue(login, 'nps_client')}`;
+    const links = await (await clientPOST(post('/api/client', { action: 'proof-links' }, { cookie }))).json();
+    expect(links.files.length === 1 && links.files[0].name === 'mine.pdf' && links.files[0].sha256 === 'c'.repeat(64), JSON.stringify(links));
+    expect((tables().client_audit_logs || []).some(l => l.order_id === mine.id && l.action === 'download'), 'portal download not logged');
+    const r = await clientPOST(post('/api/client', { action: 'receipt', code: 'NP-123456' }, { cookie }));
+    expect(r.status === 200 && (await r.json()).receipt.code === 'NP-123456', `own receipt ${r.status}`);
+    expect((await clientPOST(post('/api/client', { action: 'receipt', code: 'NP-654321' }, { cookie }))).status === 404, 'another client\'s receipt was returned');
+});
+
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);
 if (failures.length) process.exit(1);

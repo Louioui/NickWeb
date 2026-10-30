@@ -3,7 +3,8 @@
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
 import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken } from '../api/_lib/orders.mjs';
-import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
+import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken, verifyFileMagic, countPdfPages, printingFeeCents } from '../api/_lib/core.mjs';
+import { stripPhotoMetadata } from '../api/_lib/photo-meta.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
 export const MOCK_CLIENT_CODE = '123456';
@@ -15,6 +16,16 @@ const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
 const orders = new Map();      // id -> order row
 const events = [];             // { order_id, created_at, kind, title, detail, client_visible }
+const clientAuditLogs = [];    // same rows as client_audit_logs: { order_id, order_code, action, detail, created_at }
+const clientAuditViewAt = new Map();   // order_id -> last 'view_unlocked' time (written at most once per 15 minutes)
+function logClientAction(o, action, detail = null) {
+    if (action === 'view_unlocked') {
+        if (Date.now() - (clientAuditViewAt.get(o.id) || 0) < 900e3) return;
+        clientAuditViewAt.set(o.id, Date.now());
+    }
+    clientAuditLogs.push({ order_id: o.id, order_code: o.code, action, detail, created_at: new Date().toISOString() });
+}
+export const __mockClientAuditLogs = clientAuditLogs;
 const files = new Map();       // id -> { id, order_id, kind, filename, size_bytes, content_type, sha256, uploaded, data, created_at }
 const clients = new Map();
 const clientSessions = new Map();
@@ -83,8 +94,8 @@ function sha256Hex(input) {
 const now = () => new Date().toISOString();
 const token = () => randomBytes(24).toString('base64url');
 const json = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json', ...headers } });
-class MockError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
-const fail = (status, msg) => { throw new MockError(status, msg); };
+class MockError extends Error { constructor(status, msg, extra = null) { super(msg); this.status = status; this.extra = extra; } }
+const fail = (status, msg, extra = null) => { throw new MockError(status, msg, extra); };
 const email = (to, subject, link) => console.log(`[mock email] To: ${to} | ${subject}${link ? ` | ${link}` : ''}`);
 
 const UNSAFE_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/g;
@@ -188,6 +199,9 @@ function clientView(o, { unlocked = false } = {}) {
         docLock: !!o.doc_lock,
         unlocked: !isLocked,
         legalHold: !!o.legal_hold,
+        tierKey: o.tier,
+        canMessage: ['received', 'awaiting_payment', 'paid', 'accepted', 'attempting', 'action_required'].includes(o.status),
+        receipt: o.paid_at && !isLocked ? mockReceipt(o) : null,
         integritySeal: seal,
         events: visibleEvents.map(e => (isLocked ? { ...e, detail: null } : e)),
         files: uploadedFiles.map(f => ({ id: f.id, kind: f.kind, name: isLocked ? (f.kind === 'proof' ? 'Proof of service (locked)' : 'Document (locked)') : f.filename,
@@ -195,6 +209,16 @@ function clientView(o, { unlocked = false } = {}) {
     };
 }
 
+// Same shape as the receipt in api/_lib/orders.mjs clientView.
+function mockPdfPages(o) {
+    return [...files.values()].filter(f => f.order_id === o.id && f.uploaded && f.kind !== 'proof').reduce((n, f) => n + (Number(f.page_count) || 0), 0);
+}
+function mockReceipt(o) {
+    const pages = mockPdfPages(o);
+    return { code: o.code, paidAt: o.paid_at, clientName: o.client_name, clientFirm: o.client_firm, caseNumber: o.case_number, court: o.court,
+        tierName: TIERS[o.tier]?.name, tierCents: TIERS[o.tier]?.cents ?? null, addons: (o.addons || []).filter(k => ADDONS[k]).map(k => ({ name: ADDONS[k].name, cents: ADDONS[k].cents })),
+        printingPages: pages, printingFeeCents: printingFeeCents(pages), totalCents: o.amount_due_cents, stripeRef: o.stripe_session_id };
+}
 function adminDetail(o) {
     const evs = events.filter(e => e.order_id === o.id).sort((a, b) => a.created_at.localeCompare(b.created_at));
     const fls = [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ data, ...f }) => f);
@@ -203,6 +227,7 @@ function adminDetail(o) {
         order: { ...o, legal_hold: !!o.legal_hold, doc_lock: !!o.doc_lock, integrity_seal: seal, tier_name: TIERS[o.tier]?.name, addon_names: o.addons.map(k => ADDONS[k]?.name).filter(Boolean) },
         events: evs,
         files: fls,
+        printing: { pages: mockPdfPages(o), feeCents: printingFeeCents(mockPdfPages(o)), freePages: 100, centsPerPage: 15 },
         integritySeal: seal,
         statuses: STATUSES,
     };
@@ -228,58 +253,7 @@ function prepareUploads(orderId, kind, list) {
         return { fileId: id, name, uploadUrl: `/__mock-upload/${id}` };
     });
 }
-const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
-const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch)\b/;
-const DOCX_MACRO_OR_EXEC_RE = /(?:vbaProject\.bin|vbaData\.xml|activeX\/activeX|\.(?:exe|dll|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|msi|com|hta|jar|sh)(?:[\x00-\x20"'<>\/\\]|$))/i;
-function verifyFileMagic(bytes, filename) {
-    if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > 25 * 1024 * 1024) return false;
-    const ext = typeof filename === 'string' && filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
-    const headLen = Math.min(bytes.length, 4096);
-    let head = '';
-    for (let i = 0; i < headLen; i++) head += String.fromCharCode(bytes[i]);
-    if (POLYGLOT_SCRIPT_RE.test(head)) return false;
-    if (ext === 'pdf') {
-        if (PDF_DANGEROUS_ACTION_RE.test(head)) return false;
-        return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
-    }
-    if (ext === 'docx') {
-        if (bytes[0] !== 0x50 || bytes[1] !== 0x4B || bytes[2] !== 0x03 || bytes[3] !== 0x04) return false;
-        const scanLen = Math.min(bytes.length, 65536);
-        let zipScan = head;
-        for (let i = headLen; i < scanLen; i++) zipScan += String.fromCharCode(bytes[i]);
-        if (bytes.length > scanLen) {
-            const tailStart = Math.max(scanLen, bytes.length - 65536);
-            for (let i = tailStart; i < bytes.length; i++) zipScan += String.fromCharCode(bytes[i]);
-        }
-        if (!zipScan.includes('[Content_Types].xml') && !zipScan.includes('word/')) return false;
-        if (DOCX_MACRO_OR_EXEC_RE.test(zipScan)) return false;
-        return true;
-    }
-    if (ext === 'jpg' || ext === 'jpeg') {
-        if (bytes.length > 4096) {
-            let tail = '';
-            for (let i = Math.max(0, bytes.length - 4096); i < bytes.length; i++) tail += String.fromCharCode(bytes[i]);
-            if (POLYGLOT_SCRIPT_RE.test(tail)) return false;
-        }
-        return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
-    }
-    if (ext === 'png') {
-        if (bytes.length < 8 || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4E || bytes[3] !== 0x47 ||
-            bytes[4] !== 0x0D || bytes[5] !== 0x0A || bytes[6] !== 0x1A || bytes[7] !== 0x0A) return false;
-        if (bytes.length >= 16 && (bytes[12] !== 0x49 || bytes[13] !== 0x48 || bytes[14] !== 0x44 || bytes[15] !== 0x52)) return false;
-        return true;
-    }
-    if (ext === 'webp') {
-        return bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
-            bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
-    }
-    if (ext === 'heic' || ext === 'heif') {
-        if (bytes.length < 12 || bytes[4] !== 0x66 || bytes[5] !== 0x74 || bytes[6] !== 0x79 || bytes[7] !== 0x70) return false;
-        const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
-        return /^(?:heic|heix|hevc|hevx|heim|heis|hevm|hevs|mif1|msf1)$/.test(brand);
-    }
-    return false;
-}
+// Uploads are checked with the real server code (api/_lib/core.mjs, photo-meta.mjs), so the demo can't drift from it.
 function confirmUploads(orderId, ids) {
     const out = [];
     for (const id of (Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && UUID_RE.test(id))) {
@@ -289,6 +263,9 @@ function confirmUploads(orderId, ids) {
             files.delete(f.id);
             continue;
         }
+        const clean = stripPhotoMetadata(f.data, f.filename);   // F-11: same server-side photo cleaning as production
+        if (clean) { f.data = new Uint8Array(clean); f.sha256 = null; f.size_bytes = clean.length; }
+        if (/\.pdf$/i.test(f.filename)) f.page_count = countPdfPages(f.data);
         f.uploaded = true;
         if (!f.sha256) f.sha256 = sha256Hex(f.data);
         out.push(f);
@@ -296,6 +273,16 @@ function confirmUploads(orderId, ids) {
     return out;
 }
 
+// Same rules as api/_lib/payments.mjs: same amount, no second link while the old one is still open (23h59m).
+function mockRefreshPaymentLink(o) {
+    if (o.paid_at) fail(409, 'This request is already paid.');
+    if (!Number.isSafeInteger(o.amount_due_cents) || o.amount_due_cents < 100) fail(409, 'There is no amount due yet. Nick will send a payment link.');
+    if (o.payment_url && (o.payment_link_expires || 0) > Date.now()) return { url: o.payment_url, fresh: false };
+    const session = `cs_mock_${randomBytes(6).toString('hex')}`;
+    updateOrder(o, { stripe_session_id: session, payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}`, payment_link_expires: Date.now() + 86340e3 });
+    addEvent(o.id, 'payment', `New payment link created: ${money(o.amount_due_cents)}`, 'The previous link had expired.');
+    return { url: o.payment_url, fresh: true };
+}
 function markPaid(o, sessionId, amountCents = o?.amount_due_cents) {
     if (!o || o.paid_at) return false;
     if (typeof sessionId !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(sessionId)) return false;
@@ -306,6 +293,7 @@ function markPaid(o, sessionId, amountCents = o?.amount_due_cents) {
     // Same as api/_lib/orders.mjs: a held (served) order records the payment and keeps its status.
     updateOrder(o, { paid_at: now(), stripe_session_id: sessionId, ...(o.legal_hold ? {} : { status: 'paid' }) });
     addEvent(o.id, 'payment', `Payment received: ${money(paidCents)}`);
+    logClientAction(o, 'payment_confirmed', `${money(Number(amountCents))} · Stripe ${sessionId}`);
     return true;
 }
 
@@ -339,11 +327,35 @@ function useMockTotp(adminEmail, secret, code) {
     row.last_used_step = step;
     return true;
 }
-function requireMockStepUp(adminEmail, totpInput) {
+// Same rules as requireStepUp in api/admin.mjs. With the authenticator off (F-09), an emailed 8-digit code for this
+// session (the demo uses the same code as the demo login) covers sensitive actions on that session for 5 minutes.
+const MOCK_OPEN_FOR_MESSAGES = ['received', 'awaiting_payment', 'paid', 'accepted', 'attempting', 'action_required'];
+const mockStepUps = new Map();      // session cookie -> { sentAt, attempts, okAt }
+const trustedDevices = new Map();   // nps_device token -> { email, expires }
+function requireMockStepUp(adminEmail, totpInput, cookie) {
     const row = adminTotpSecrets.get(adminEmail);
-    if (!row?.enabled) return false;
-    if (!useMockTotp(adminEmail, row.secret, totpInput)) fail(403, 'Enter the current 6-digit code from your authenticator app.');
-    return true;
+    if (row?.enabled) {
+        const typed = String(totpInput || '').trim().toUpperCase();
+        const recovery = typed.replace(/[^A-Z0-9]/g, '');
+        if (!/^\d{6}$/.test(typed) && recovery.length === 8) {
+            const codes = adminRecoveryCodes.get(adminEmail);
+            if (!codes?.delete(recovery)) fail(403, 'That recovery code is wrong or already used.');
+            return 'totp';
+        }
+        if (!useMockTotp(adminEmail, row.secret, typed)) fail(403, 'Enter the current 6-digit code from your authenticator app, or one of your recovery codes.');
+        return 'totp';
+    }
+    const s = mockStepUps.get(cookie) || {};
+    if (s.okAt && Date.now() - s.okAt < 5 * 60e3) return 'email';
+    const digits = String(totpInput || '').replace(/[\s-]+/g, '');
+    if (!/^\d{8}$/.test(digits)) fail(403, 'To confirm this, enter the 8-digit code we email you.', { requiresEmailStepUp: true });
+    if (!s.sentAt || Date.now() - s.sentAt > 10 * 60e3 || (s.attempts || 0) >= 5 || digits !== MOCK_ADMIN_CODE) {
+        if (s.sentAt) s.attempts = (s.attempts || 0) + 1;
+        mockStepUps.set(cookie, s);
+        fail(403, 'That code is wrong or expired. Request a new one.', { requiresEmailStepUp: true });
+    }
+    mockStepUps.set(cookie, { okAt: Date.now() });
+    return 'email';
 }
 
 const handlers = {
@@ -365,7 +377,11 @@ const handlers = {
             // Same order as api/client.mjs: ask for the PIN first, check the email code, and only then the PIN.
             const sec = clientSecurity.get(addr);
             const pin = String(body.pin || '').trim();
-            if (sec?.pin_hash && !pin) return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
+            // Same as api/_lib/clients.mjs: a device the client chose to remember (30 days) skips the PIN, never the code.
+            const deviceToken = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_device=([^;]+)/)?.[1];
+            const device = deviceToken && trustedDevices.get(deviceToken);
+            const trusted = !!device && device.email === addr && device.expires > Date.now();
+            if (sec?.pin_hash && !trusted && !pin) return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
             if (sec?.pin_hash && sec.locked_until > Date.now()) fail(429, 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.');
             const pending = clientCodes.get(addr);
             if (!pending || pending.expires < Date.now() || pending.attempts >= 5) fail(401, 'That code is invalid or expired. Request another email.');
@@ -374,7 +390,7 @@ const handlers = {
                 if (pending.attempts >= 5) clientCodes.delete(addr);
                 fail(401, 'That code is invalid or expired. Request another email.');
             }
-            if (sec?.pin_hash) {
+            if (sec?.pin_hash && !trusted) {
                 if (!verifyPin(pin, sec.pin_hash)) {
                     if (sec.locked_until && sec.locked_until <= Date.now()) { sec.failed_tries = 0; sec.locked_until = 0; }
                     sec.failed_tries = (sec.failed_tries || 0) + 1;
@@ -394,7 +410,14 @@ const handlers = {
             clientCodes.delete(addr);
             const value = token();
             clientSessions.set(value, addr);
-            return json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
+            const res = json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
+            if (body.remember !== false) {
+                const t = token();
+                trustedDevices.set(t, { email: addr, expires: Date.now() + 30 * 864e5 });
+                res.headers.append('set-cookie', `nps_device=${t}; Path=/api/client; HttpOnly; SameSite=Strict; Max-Age=${30 * 86400}`);
+            }
+            if (!trusted) console.log(`[mock] login alert email for ${addr}: new sign-in from a device we don't recognise`);
+            return res;
         }
         const value = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_client=([^;]+)/)?.[1];
         const verifiedEmail = value && /^[A-Za-z0-9_-]{16,160}$/.test(value) ? clientSessions.get(value) : null;
@@ -404,8 +427,11 @@ const handlers = {
                 for (const [k, em] of [...clientSessions.entries()]) {
                     if (em === verifiedEmail) clientSessions.delete(k);
                 }
+                for (const [k, d] of [...trustedDevices.entries()]) if (d.email === verifiedEmail) trustedDevices.delete(k);   // trusted devices ask for the PIN again
             }
-            return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' });
+            const res = json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' });
+            res.headers.append('set-cookie', 'nps_device=; Path=/api/client; HttpOnly; SameSite=Strict; Max-Age=0');
+            return res;
         }
         if (!verifiedEmail || !clients.has(verifiedEmail)) fail(401, 'Please sign in to see your requests.');
         const baseProfile = clients.get(verifiedEmail);
@@ -454,11 +480,29 @@ const handlers = {
             addEvent(o.id, 'note', 'Client requested confidential document purge / retention seal', `Requested by verified account ${verifiedEmail}`, true);
             return json({ ok: true, code: o.code });
         }
+        if (action === 'receipt') {
+            const code = String(body.code || '').trim().toUpperCase();
+            const o = [...orders.values()].find(ord => ord.client_email.toLowerCase() === verifiedEmail && ord.code === code);
+            if (!o) fail(404, 'Order not found.');
+            if (!o.paid_at) fail(409, 'This request has not been paid yet.');
+            return json({ receipt: mockReceipt(o) });
+        }
+        if (action === 'proof-links') {
+            const mine = [...orders.values()].filter(o => o.client_email.toLowerCase() === verifiedEmail);
+            const out = [];
+            for (const o of mine) for (const f of files.values()) {
+                if (f.order_id === o.id && f.kind === 'proof' && f.uploaded) {
+                    out.push({ code: o.code, name: f.filename, sha256: f.sha256 || null, url: `/__mock-file/${f.id}` });
+                    logClientAction(o, 'download', `${f.filename} · from client portal`);
+                }
+            }
+            return json({ files: out.slice(0, 50) });
+        }
         if (action === 'list') {
             const list = [...orders.values()].filter(o => o.client_email.toLowerCase() === verifiedEmail).sort((a,b) => b.created_at.localeCompare(a.created_at)).slice(0,100);
             return json({ profile, orders: list.map(o => ({ code: o.code, status: o.status, label: STATUSES[o.status].label, recipient: o.recipient_name, document: o.doc_type,
                 service: TIERS[o.tier]?.name, created: o.created_at, amount: money(o.amount_due_cents ?? o.estimated_total_cents), paid: !!o.paid_at,
-                docLock: !!o.doc_lock, legalHold: o.status === 'served' || !!o.legal_hold, trackUrl: `/track.html#t=${o.track_token}` })) });
+                paidAt: o.paid_at || null, reference: o.client_reference || '', docLock: !!o.doc_lock, legalHold: o.status === 'served' || !!o.legal_hold, trackUrl: `/track.html#t=${o.track_token}` })) });
         }
         fail(400, 'Unknown action.');
     },
@@ -507,7 +551,15 @@ const handlers = {
     async track(req, body, url) {
         const o = orderByToken(body.t);
         const unlocked = isMockUnlocked(req, o, body);
-        if (body.action === 'view') return json(clientView(o, { unlocked }));
+        if (body.action === 'view') {
+            if (unlocked && o.doc_lock) logClientAction(o, 'view_unlocked');
+            return json(clientView(o, { unlocked }));
+        }
+        if (body.action === 'refresh-payment-link') {
+            const { url, fresh } = mockRefreshPaymentLink(o);
+            if (fresh) logClientAction(o, 'payment_link_refreshed');
+            return json({ ...clientView(o, { unlocked }), paymentUrl: url, fresh });
+        }
         if (body.action === 'send-unlock-code') {
             trackUnlockCodes.set(o.id, { code: MOCK_CLIENT_CODE, tries: 0, expires: Date.now() + 600000 });
             const maskedEmail = o.client_email.replace(/^(..).*(@.*)$/, '$1•••$2');
@@ -535,6 +587,7 @@ const handlers = {
                 verified = true;
             }
             const unlockToken = makeMockUnlockToken(req, o);
+            logClientAction(o, 'unlock');
             return json({ ok: true, unlockToken, ...clientView(o, { unlocked: true }) });
         }
         if (body.action === 'toggle-doc-lock') {
@@ -559,6 +612,7 @@ const handlers = {
             const f = files.get(fid);
             if (!f || f.order_id !== o.id || !f.uploaded) fail(404, 'File not found.');
             addEvent(o.id, 'note', 'Document downloaded from tracking page', f.filename, false);   // same as api/track.mjs
+            logClientAction(o, 'download', [f.filename, f.sha256 && `SHA-256 ${f.sha256}`].filter(Boolean).join(' · '));
             return json({ url: `/__mock-file/${f.id}`, sha256: f.sha256 || null, expiresInSeconds: 60 });
         }
         if (body.action === 'confirm-payment') {
@@ -598,11 +652,25 @@ const handlers = {
                 `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
             ].filter(Boolean).join(' · ');
             addEvent(o.id, 'action_response', 'You sent the requested information', summary || null);
+            logClientAction(o, 'reply', `after ${events.filter(e => e.order_id === o.id && e.kind === 'attempt').length} attempt(s)`);
+            return json({ ok: true, uploads });
+        }
+        if (body.action === 'message') {   // same rules as api/track.mjs
+            if (!MOCK_OPEN_FOR_MESSAGES.includes(o.status)) fail(409, 'This request is finished. Call Nick at (209) 922-6817 if you need anything.');
+            if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
+            const message = cleanText(body.message, 2000, false, 'Your message') || '';
+            const list = Array.isArray(body.files) ? body.files : [];
+            if (!message && !list.length) fail(400, 'Write a message or attach a file.');
+            const attempts = events.filter(e => e.order_id === o.id && e.kind === 'attempt').length;
+            addEvent(o.id, 'action_response', 'You sent a message', [message, `[Sent after ${attempts} attempt(s)]`].filter(Boolean).join(' · '));
+            logClientAction(o, 'reply', `message after ${attempts} attempt(s)`);
+            const uploads = list.length ? prepareUploads(o.id, 'action_upload', list) : [];
+            if (!uploads.length) { addEvent(o.id, 'note', 'Reply emailed', null, false); email(ADMIN_EMAIL, `${o.code}: new message from ${o.client_name}`, `/admin.html#${o.id}`); }
             return json({ ok: true, uploads });
         }
         if (body.action === 'respond-finish') {
             if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Unlock it first.');
-            if (o.status !== 'received') return json(clientView(o, { unlocked }));
+            if (!MOCK_OPEN_FOR_MESSAGES.includes(o.status)) return json(clientView(o, { unlocked }));
             const up = confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
             const orderEvents = events.filter(e => e.order_id === o.id);
@@ -691,10 +759,17 @@ const handlers = {
         const cookie = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_admin=([^;]+)/)?.[1];
         if (!cookie || !/^[A-Za-z0-9_-]{16,160}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
         const adminEmail = sessionEmails.get(cookie) || ADMIN_EMAIL;
+        if (a === 'send-stepup-code') {
+            const prev = mockStepUps.get(cookie) || {};
+            mockStepUps.set(cookie, { ...prev, sentAt: Date.now(), attempts: 0 });
+            console.log(`[mock] dashboard confirmation code for ${adminEmail}: ${MOCK_ADMIN_CODE}`);
+            return json({ ok: true });
+        }
         if (a === 'me') {
             const totpRow = adminTotpSecrets.get(adminEmail);
             const auditLogs = adminAuditLogs.filter(l => l.email === adminEmail).slice(0, 10).map(({ action, target_code, detail, created_at }) => ({ action, target_code, detail, created_at }));
-            return json({ email: adminEmail, recoveryRemaining: adminRecoveryCodes.get(adminEmail)?.size || 0, totpEnabled: !!totpRow?.enabled, auditLogs });
+            return json({ email: adminEmail, recoveryRemaining: adminRecoveryCodes.get(adminEmail)?.size || 0, totpEnabled: !!totpRow?.enabled, auditLogs,
+                safeWalk: { recipients: MOCK_ADMIN_EMAILS, configured: false } });
         }
         if (a === 'logout') {
             sessions.delete(cookie);
@@ -728,7 +803,7 @@ const handlers = {
         if (a === 'totp-setup') {
             // While one is on, changing it needs the current code, and the new secret waits as pending until confirmed.
             const row = adminTotpSecrets.get(adminEmail);
-            if (row?.enabled) requireMockStepUp(adminEmail, body?.totp);
+            requireMockStepUp(adminEmail, body?.totp, cookie);
             const secret = generateTotpSecret(20);
             if (row?.enabled) row.pending = secret;
             else adminTotpSecrets.set(adminEmail, { secret, enabled: false, last_used_step: row?.last_used_step || 0 });
@@ -754,7 +829,7 @@ const handlers = {
             return json({ ok: true, totpEnabled: false });
         }
         if (a === 'generate-recovery-codes') {
-            requireMockStepUp(adminEmail, body?.totp);
+            requireMockStepUp(adminEmail, body?.totp, cookie);
             const set = new Set();
             const out = [];
             for (let i = 0; i < 8; i++) {
@@ -771,7 +846,7 @@ const handlers = {
             const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response'];
             const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(o => {
                 const last = events.filter(e => e.order_id === o.id && kinds.includes(e.kind)).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                return { ...o, client_replied: last?.kind === 'action_response' };
+                return { ...o, client_replied: last?.kind === 'action_response', last_activity_at: [o.updated_at, last?.created_at].filter(Boolean).sort().pop() || o.created_at };
             });
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
         }
@@ -781,7 +856,22 @@ const handlers = {
             if (!f?.uploaded) fail(404, 'File not found.');
             return json({ url: `/__mock-file/${f.id}` });
         }
-        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'export', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
+        if (a === 'bulk-close') {   // same rules as api/admin.mjs: only served or cancelled requests are closed
+            const ids = (Array.isArray(body.ids) ? body.ids : []).filter(id => typeof id === 'string' && UUID_RE.test(id)).slice(0, 50);
+            if (!ids.length) fail(400, 'Choose at least one finished request.');
+            const closed = [], skipped = [];
+            for (const id of ids) {
+                const ord = orders.get(id.toLowerCase());
+                if (!ord) continue;
+                if (!['served', 'cancelled'].includes(ord.status)) { skipped.push(ord.code); continue; }
+                updateOrder(ord, { status: 'closed' });
+                addEvent(ord.id, 'status', STATUSES.closed.label, null, true);
+                closed.push(ord.code);
+            }
+            if (closed.length) auditAdmin(adminEmail, 'bulk_close', null, closed.join(', '));
+            return json({ ok: true, closed, skipped });
+        }
+        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'refresh-payment-link', 'safe-walk-alert', 'evidence-pack', 'export', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
         const oid = cleanUuid(body.id, 'Order');
         const o = orders.get(oid);
         if (!o) fail(404, 'Order not found.');
@@ -806,7 +896,7 @@ const handlers = {
             // Same as api/admin.mjs: unlocking needs a fresh authenticator code, or the typed reference without one.
             const hold = !!body.hold;
             if (!hold) {
-                const usedTotp = requireMockStepUp(adminEmail, body.totp);
+                const usedTotp = requireMockStepUp(adminEmail, body.totp, cookie) === 'totp';
                 if (!usedTotp && String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm unlocking legal hold.`);
             }
             o.legal_hold = hold;
@@ -848,11 +938,37 @@ const handlers = {
             const description = cleanText(body.description, 300, false, 'Description');
             const session = `cs_mock_${randomBytes(6).toString('hex')}`;
             updateOrder(o, { ...(o.legal_hold ? {} : { status: 'awaiting_payment' }), amount_due_cents: cents, stripe_session_id: session,
-                payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}` });
+                payment_url: `/__mock-pay?t=${encodeURIComponent(o.track_token)}&s=${session}`, payment_link_expires: Date.now() + 86340e3 });
             addEvent(o.id, 'payment', `Payment requested: ${money(cents)}`, description);
             auditAdmin(adminEmail, 'payment_link', o.code, money(cents));
             email(o.client_email, `${o.code}: confirmed, ${money(cents)} due to start service`, o.payment_url);
             return json(adminDetail(o));
+        }
+        if (a === 'refresh-payment-link') {
+            const { url, fresh } = mockRefreshPaymentLink(o);
+            auditAdmin(adminEmail, 'payment_link_refreshed', o.code, fresh ? 'new link' : 'previous link still open');
+            email(o.client_email, `${o.code}: your payment link`, url);
+            return json({ ...adminDetail(o), paymentUrl: url, fresh });
+        }
+        if (a === 'safe-walk-alert') {
+            const minutes = Math.min(Math.max(Math.round(Number(body.minutes) || 15), 1), 240);
+            for (const to of MOCK_ADMIN_EMAILS) email(to, `URGENT: safe-walk check-in missed on ${o.code}`, `${minutes}-minute timer ran out · ${[o.address, o.unit, o.city, o.zip].filter(Boolean).join(', ')}`);
+            auditAdmin(adminEmail, 'safe_walk_alert', o.code, `${minutes} min timer`);
+            addEvent(o.id, 'note', 'Safe-walk check-in missed; alert emailed', null, false);
+            return json({ ok: true, sent: MOCK_ADMIN_EMAILS.length });
+        }
+        if (a === 'evidence-pack') {
+            const d = adminDetail(o);
+            auditAdmin(adminEmail, 'evidence_pack', o.code);
+            const pick = (k) => d.events.filter(e => e.kind === k).map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible }));
+            return json({ generated_at: now(),
+                order: { code: o.code, status: o.status, created_at: o.created_at, served_at: o.served_at || null, client_name: o.client_name, client_firm: o.client_firm,
+                    client_email: o.client_email, recipient_name: o.recipient_name, case_number: o.case_number, court: o.court,
+                    address: [o.address, o.unit, o.city, o.zip].filter(Boolean).join(', '), tier: d.order.tier_name, addons: d.order.addon_names,
+                    amount_due_cents: o.amount_due_cents, paid_at: o.paid_at, stripe_session_id: o.stripe_session_id },
+                attestation: pick('attestation'), payments: pick('payment'), attempts: pick('attempt'),
+                files: d.files.map(f => ({ filename: f.filename, kind: f.kind, size_bytes: f.size_bytes, sha256: f.sha256 || null, created_at: f.created_at })),
+                timeline_seal: d.integritySeal, client_actions: clientAuditLogs.filter(l => l.order_id === o.id) });
         }
         if (a === 'export') {
             auditAdmin(adminEmail, 'export_order', o.code);
@@ -864,7 +980,7 @@ const handlers = {
         }
         if (a === 'delete') {
             if (o.legal_hold) fail(423, 'This order is under legal hold and cannot be deleted. Unlock legal hold first (that step is logged and emailed to you).');
-            requireMockStepUp(adminEmail, body.totp);
+            requireMockStepUp(adminEmail, body.totp, cookie);
             if (String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm.`);
             let deletedFiles = 0;
             for (const [fid, f] of files) if (f.order_id === o.id) { files.delete(fid); deletedFiles++; }
@@ -911,7 +1027,7 @@ export async function handleMockApi(name, req) {
         const raw = req.method === 'GET' ? '' : await req.text();
         return await handler(req, parseSafeJson(raw), new URL(req.url));
     } catch (err) {
-        if (err instanceof MockError || typeof err?.status === 'number') return json({ error: err.message }, err.status);
+        if (err instanceof MockError || typeof err?.status === 'number') return json({ ...(err.extra || {}), error: err.message }, err.status);
         if (err?.message === 'Please choose a service tier.') return json({ error: err.message }, 400);
         console.error(err);
         return json({ error: 'Something went wrong on our end.' }, 500);
@@ -1070,11 +1186,11 @@ function samplePdf(line) {
     out += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
     return Buffer.from(out, 'latin1');
 }
-function sampleFile(orderId, kind, filename, at) {
+function sampleFile(orderId, kind, filename, at, pageCount = 1) {
     const data = samplePdf(`Sample file: ${filename}`);
     const id = randomUUID();
     const sha256 = sha256Hex(data);
-    files.set(id, { id, order_id: orderId, kind, filename, size_bytes: data.length, content_type: 'application/pdf', sha256, uploaded: true, data, created_at: at });
+    files.set(id, { id, order_id: orderId, kind, filename, size_bytes: data.length, content_type: 'application/pdf', sha256, uploaded: true, data, created_at: at, page_count: pageCount });
     return files.get(id);
 }
 
@@ -1091,7 +1207,7 @@ function sampleFile(orderId, kind, filename, at) {
 
     const a = mk({ code: 'NP-218940', recipient_name: 'Marcus Reyes', address: '412 W Broadway', deadline: inDays(12) }, 2);
     addEvent(a.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(2));
-    sampleFile(a.id, 'client_document', 'Summons-and-Complaint.pdf', ago(2));
+    sampleFile(a.id, 'client_document', 'Summons-and-Complaint.pdf', ago(2), 130);   // 130 pages: shows the $4.50 printing fee helper
 
     const b = mk({ code: 'NP-649025', recipient_name: 'Dana Whitfield', address: '1840 E 7th St', zip: '90813', status: 'action_required',
         action_note: 'The building has 24 units and the documents do not list an apartment number. Which unit does Dana live in? A gate code would help too.' }, 30);
@@ -1104,19 +1220,31 @@ function sampleFile(orderId, kind, filename, at) {
     addEvent(c.id, 'created', 'Request received', 'Same-Day Rush Service · estimate $175.00', true, ago(6));
     addEvent(c.id, 'payment', 'Payment requested: $175.00', 'Same-Day Rush Service', true, ago(1));
 
-    const d = mk({ code: 'NP-517309', recipient_name: 'Kevin Tran', address: '3300 Atlantic Ave', zip: '90807', status: 'attempting', amount_due_cents: 14000, paid_at: ago(40), deadline: inDays(3) }, 50);
+    const d = mk({ code: 'NP-517309', recipient_name: 'Kevin Tran', address: '3300 Atlantic Ave', zip: '90807', status: 'attempting', amount_due_cents: 14000, paid_at: ago(40), deadline: inDays(1) }, 50);   // expedited, due within 48h
     addEvent(d.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(50));
     addEvent(d.id, 'payment', 'Payment received: $140.00', null, true, ago(40));
-    addEvent(d.id, 'attempt', 'Attempt: No answer', 'Lights on, car in driveway, no answer after 3 knocks.', true, ago(26));
+    addEvent(d.id, 'attempt', 'Attempt: No answer', `${new Date(Date.now() - 26 * 3600e3).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}, 7:40 AM · Lights on, car in driveway, no answer after 3 knocks.`, true, ago(26));
     addEvent(d.id, 'note', 'Internal note', 'Neighbor says he leaves around 7:15am. Try early.', false, ago(25));
-    addEvent(d.id, 'attempt', 'Attempt: Subject not home', 'Spoke with roommate, said he works evenings.', true, ago(4));
+    addEvent(d.id, 'attempt', 'Attempt: Subject not home', `${new Date(Date.now() - 4 * 3600e3).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}, 5:15 PM · Spoke with roommate, said he works evenings.`, true, ago(4));
+    // Morning and afternoon are logged; the night window is still missing (shown on the case view).
+
+    const f = mk({ code: 'NP-730264', recipient_name: 'Greg Holloway', address: '88 Ocean Blvd', unit: 'Apt 4', tier: 'standard', addons: [], estimated_total_cents: 7500,
+        status: 'attempting', amount_due_cents: 7500, paid_at: ago(90), deadline: inDays(-1) }, 96);   // overdue
+    addEvent(f.id, 'created', 'Request received', 'Standard Service · estimate $75.00', true, ago(96));
+    addEvent(f.id, 'payment', 'Payment received: $75.00', null, true, ago(90));
+    addEvent(f.id, 'attempt', 'Attempt: Left with co-resident', 'Left with adult co-resident (spouse) at the door. Substituted service.', true, ago(3));
+    // Substituted service: the case view shows the "mail a copy" reminder until a mailing is logged.
 
     const e = mk({ code: 'NP-894771', recipient_name: 'Alicia Moreno', address: '520 Pine Ave', status: 'served', amount_due_cents: 14000, paid_at: ago(100), served_at: ago(20), legal_hold: true }, 120);
     addEvent(e.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(120));
+    addEvent(e.id, 'attestation', 'Client legal attestation & Terms sealed', 'The client confirmed the request is lawful and accepted the Terms when submitting.', false, ago(120));
     addEvent(e.id, 'payment', 'Payment received: $140.00', null, true, ago(100));
     addEvent(e.id, 'attempt', 'Attempt: No answer', null, true, ago(70));
     addEvent(e.id, 'status', 'Served', 'Personally served at residence.', true, ago(20));
     sampleFile(e.id, 'client_document', 'Summons-and-Complaint.pdf', ago(120));
     const proof = sampleFile(e.id, 'proof', 'Proof-of-Service-Moreno.pdf', ago(19));
     addEvent(e.id, 'proof', 'Proof of service uploaded', `${proof.filename} (SHA-256: ${proof.sha256.slice(0, 12)}…)`, true, ago(19));
+    // Client activity for the evidence pack: the client viewed and downloaded the proof.
+    clientAuditLogs.push({ order_id: e.id, order_code: e.code, action: 'view_unlocked', detail: null, created_at: ago(18) },
+        { order_id: e.id, order_code: e.code, action: 'download', detail: `${proof.filename} · SHA-256 ${proof.sha256}`, created_at: ago(18) });
 })();

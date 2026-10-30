@@ -6,6 +6,7 @@ const PILL = {
     accepted: 'status-live', attempting: 'status-live', served: 'status-done', closed: 'status-muted', cancelled: 'status-muted',
 };
 const FILTERS = {
+    priority: { label: 'Due today / Priority', test: o => isOpen(o) },
     active: { label: 'Active', test: o => !['served', 'closed', 'cancelled'].includes(o.status) },
     review: { label: 'New', test: o => o.status === 'received' },
     waiting: { label: 'Waiting on client', test: o => ['action_required', 'awaiting_payment'].includes(o.status) },
@@ -16,8 +17,9 @@ const FILTERS = {
 };
 // Some timeline entries are written for the client ("You sent..."); on Nick's screen they read from his side.
 const NICK_WORDING = { 'You sent the requested information': 'Client sent the requested information' };
-const ATTEMPT_OUTCOMES = ['No answer', 'Subject not home', 'Spoke with resident, subject not there', 'Refused / evading', 'Gated, no access',
-    'Wrong address / moved', 'Business closed', 'Other'];
+const ATTEMPT_OUTCOMES = [...NPSField.ATTEMPT_PRESETS, 'Subject not home', 'Spoke with resident, subject not there', 'Refused / evading',
+    'Gated, no access', 'Wrong address / moved', 'Business closed', 'Other'];
+const URGENCY_BADGE = { overdue: 'Overdue', today: 'Due today', due48: 'Due within 48h' };
 
 let orders = [];
 let statuses = {};
@@ -51,13 +53,47 @@ function restoreDraft() {
 }
 
 const READ_ONLY = new Set(['me', 'list', 'get', 'file-url', 'export', 'send-code', 'verify-code', 'sessions', 'passkeys', 'passkey-login-options']);
-async function api(action, data = {}) {
+async function api(action, data = {}, stepUpRetry = false) {
     try {
         return await NPS.post('/api/admin', { action, ...data }, { notify: !READ_ONLY.has(action) });
     } catch (err) {
         if (err.status === 401 && !['verify-code', 'send-code', 'passkey-login-verify'].includes(action)) showLogin();
+        // F-09: with the authenticator off, sensitive actions need a code emailed to Nick. Ask for it, then try once more.
+        if (err.status === 403 && err.data?.requiresEmailStepUp && !stepUpRetry) {
+            const code = await askEmailStepUp(err.message);
+            if (code) return api(action, { ...data, totp: code }, true);
+        }
         throw err;
     }
+}
+
+// Shows the "Confirm it's you" box, emails a code, and resolves with the typed code (or null if cancelled).
+function askEmailStepUp() {
+    const modal = $('stepup-modal'), input = $('stepup-code'), errBox = $('stepup-error');
+    const showErr = (m) => { errBox.textContent = m || ''; errBox.classList.toggle('hidden', !m); };
+    const send = () => NPS.post('/api/admin', { action: 'send-stepup-code' }).then(() => showErr(''), (e) => showErr(e.message));
+    return new Promise((resolve) => {
+        const finish = (value) => {
+            modal.classList.add('hidden');
+            $('stepup-form').onsubmit = null; $('stepup-cancel').onclick = null; $('stepup-resend').onclick = null;
+            document.removeEventListener('keydown', onKey);
+            resolve(value);
+        };
+        const onKey = (e) => { if (e.key === 'Escape') finish(null); };
+        $('stepup-form').onsubmit = (e) => {
+            e.preventDefault();
+            const code = input.value.replace(/[\s-]+/g, '');
+            if (!/^\d{8}$/.test(code)) return showErr('Enter the 8-digit code from your email.');
+            finish(code);
+        };
+        $('stepup-cancel').onclick = () => finish(null);
+        $('stepup-resend').onclick = send;
+        document.addEventListener('keydown', onKey);
+        input.value = ''; showErr('');
+        modal.classList.remove('hidden');
+        input.focus();
+        send();
+    });
 }
 
 // --- Login ---
@@ -173,15 +209,21 @@ function renderList() {
     $('filters').innerHTML = Object.entries(FILTERS).map(([k, f]) =>
         `<button type="button" aria-pressed="${k === filter}" class="tab-btn ${k === filter ? 'is-active' : ''}" data-click="setFilter" data-arg="${k}">${f.label} <span class="text-muted">${orders.filter(f.test).length}</span></button>`).join('');
     const q = $('search').value.trim().toLowerCase();
-    const shown = orders.filter(FILTERS[filter].test).filter(o => !q ||
+    let shown = orders.filter(FILTERS[filter].test).filter(o => !q ||
         [o.code, o.client_name, o.client_firm, o.client_email, o.recipient_name, o.city, o.zip].some(v => (v || '').toLowerCase().includes(q)));
+    if (filter === 'priority') shown = NPSField.prioritySort(shown);
+    renderListTools(shown);
     $('list-count').textContent = `${shown.length} ${shown.length === 1 ? 'request' : 'requests'}`;
     $('job-list').innerHTML = shown.length ? shown.map(o => {
         const days = daysUntil(o.deadline);
         const due = o.deadline && isOpen(o)
             ? `<span class="${days <= 3 ? 'text-[#7a1f1c] font-semibold' : 'text-muted'}"><i class="fa-regular fa-calendar mr-1"></i>${days < 0 ? 'Past due' : days === 0 ? 'Due today' : `Due in ${days}d`}</span>` : '';
+        const urg = NPSField.urgency(o);
+        const quiet = isOpen(o) ? NPSField.daysSince(o.last_activity_at || o.updated_at || o.created_at) : null;
+        const badges = `${urg ? `<span class="status-pill status-alert"><i class="fa-solid fa-triangle-exclamation mr-1" aria-hidden="true"></i>${URGENCY_BADGE[urg]}</span>` : ''}${quiet != null && quiet >= 1 ? `<span class="text-[11px] text-muted">${quiet} day${quiet === 1 ? '' : 's'} since last update</span>` : ''}`;
         return `
-        <button type="button" aria-pressed="${current?.order.id === o.id}" class="job-row ${current?.order.id === o.id ? 'is-active' : ''}" data-click="openJob" data-arg="${esc(o.id)}">
+        ${badges ? `<div class="flex flex-wrap items-center gap-2 px-4 pt-3" aria-hidden="true">${badges}</div>` : ''}
+        <button type="button" aria-pressed="${current?.order.id === o.id}" aria-label="${esc(o.recipient_name)}, ${esc(o.code)}${urg ? ', ' + URGENCY_BADGE[urg] : ''}${quiet >= 1 ? `, ${quiet} days since last update` : ''}" class="job-row ${current?.order.id === o.id ? 'is-active' : ''}" data-click="openJob" data-arg="${esc(o.id)}">
             <span class="font-semibold text-sm text-ink truncate">${esc(o.recipient_name)}</span>
             ${o.client_replied
                 ? '<span class="status-pill status-alert"><i class="fa-solid fa-reply mr-1"></i>Client replied</span>'
@@ -192,6 +234,44 @@ function renderList() {
     }).join('') : `<div class="p-8 text-center text-sm text-muted"><p class="font-semibold text-primary mb-2">${q ? 'No matching requests' : 'You’re all caught up here'}</p><p>${q ? 'Try a name, reference number, email, or city.' : 'Requests in this category will appear here.'}</p><button type="button" class="btn btn-outline btn-sm mt-4" data-click="setFilter" data-arg="all">Show all requests</button></div>`;
 }
 $('search').addEventListener('input', renderList);
+
+// List tools: the multi-stop route (active lists) and closing finished jobs in one go (Done list).
+let bulkPick = new Set();
+function renderListTools(shown) {
+    const box = $('list-tools');
+    if (filter === 'done') {
+        const finished = shown.filter(o => ['served', 'cancelled'].includes(o.status));
+        box.innerHTML = finished.length ? `<details class="w-full"><summary class="text-sm text-primary font-semibold cursor-pointer min-h-[44px] flex items-center">Close finished jobs (${finished.length})</summary>
+            <fieldset class="space-y-1 mt-2"><legend class="sr-only">Finished jobs to close</legend>${finished.map(o => `<label class="flex items-center gap-2 text-sm min-h-[44px]"><input type="checkbox" class="w-5 h-5 accent-primary" data-bulk="${esc(o.id)}" ${bulkPick.has(o.id) ? 'checked' : ''}> ${esc(o.code)} · ${esc(o.recipient_name)} <span class="text-muted">(${esc(statuses[o.status]?.label || o.status)})</span></label>`).join('')}</fieldset>
+            <button type="button" class="btn btn-outline btn-sm mt-2 min-h-[44px]" data-click="bulkClose">Close selected</button></details>` : '';
+        return;
+    }
+    const stops = shown.filter(isOpen).slice(0, 9).map(NPSField.fullAddress);
+    box.innerHTML = ['priority', 'active', 'urgent', 'working'].includes(filter) && stops.length
+        ? `<a class="btn btn-outline btn-sm min-h-[44px]" href="${esc(NPSField.routeUrl(stops))}" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-route" aria-hidden="true"></i> Open route in Google Maps (${stops.length} stop${stops.length === 1 ? '' : 's'})</a>` : '';
+}
+$('list-tools').addEventListener('change', (e) => {
+    const id = e.target.dataset?.bulk;
+    if (!id) return;
+    if (e.target.checked) bulkPick.add(id); else bulkPick.delete(id);
+});
+async function bulkClose() {
+    if (!bulkPick.size) return showFeedback('Tick the finished jobs to close first.', 'warn');
+    try {
+        const r = await api('bulk-close', { ids: [...bulkPick] });
+        bulkPick = new Set();
+        showFeedback(`Closed ${r.closed.length} job${r.closed.length === 1 ? '' : 's'}.${r.skipped.length ? ` Not closed (not finished): ${r.skipped.join(', ')}.` : ''}`, r.skipped.length ? 'warn' : 'ok');
+        await refreshJobs();
+    } catch (err) { showFeedback(err.message, 'err'); }
+}
+function showFeedback(message, kind = 'ok') {
+    const f = $('save-feedback');
+    f.textContent = message;
+    f.className = `desk-feedback result-box result-${kind}`;
+    clearTimeout(feedbackTimer);
+    feedbackTimer = setTimeout(() => f.classList.add('hidden'), 7000);
+}
+
 
 async function loadList() {
     const r = await api('list');
@@ -290,9 +370,11 @@ function renderDetail() {
                 <span class="status-pill ${PILL[o.status]}">${esc(statuses[o.status]?.label || o.status)}</span>
             </div>
             ${o.action_note ? `<div class="result-box result-warn mt-5 text-sm"><strong>You asked the client:</strong> ${esc(o.action_note)}</div>` : ''}
+            ${fieldPanel(o, events)}
             <div class="grid sm:grid-cols-2 gap-x-8 gap-y-6 mt-6">
                 <dl class="review-recap content-start">
-                    ${row('Address', `<a href="${mapUrl}" target="_blank" rel="noopener noreferrer" class="text-primary font-semibold underline underline-offset-2">${esc(fullAddress)}</a>`)}
+                    ${row('Address', `<a href="${mapUrl}" target="_blank" rel="noopener noreferrer" class="text-primary font-semibold underline underline-offset-2">${esc(fullAddress)}</a>
+                        <button type="button" class="btn btn-outline btn-sm mt-2 min-h-[44px]" data-click="copyAddress" aria-label="Copy the service address">Copy Address</button>`)}
                     ${row('Access', esc(o.access_notes || ''))}
                     ${row('Description', esc(o.physical_notes || ''))}
                     ${row('Instructions', esc(o.instructions || ''))}
@@ -342,6 +424,131 @@ function renderDetail() {
     restoreDraft();
 }
 
+// --- Field tools on the case view ---
+function fieldPanel(o, events) {
+    const windows = NPSField.needsWindows(o.tier) && isOpen(o) ? `<div class="mt-5"><p class="field-label">Attempt windows (${esc(o.tier_name || '')})</p>
+        <ul class="flex flex-wrap gap-2" aria-label="Attempt time windows">${NPSField.attemptWindows(events).map(w => `<li class="status-pill ${w.done ? 'status-done' : 'status-muted'}">${w.done ? '<i class="fa-solid fa-check mr-1" aria-hidden="true"></i>' : ''}${esc(w.label)}<span class="sr-only">: ${w.done ? 'logged' : 'still missing'}</span></li>`).join('')}</ul></div>` : '';
+    const mailing = NPSField.needsSubServiceMailing(events) ? `<div class="result-box result-warn mt-5 text-sm space-y-2"><p><strong>Substituted Service:</strong> Mail copy via First-Class Mail and log mailing date.</p>
+        <div class="flex flex-wrap items-end gap-2"><div><label for="f-mail-city" class="field-label">Mailed from (city)</label><input id="f-mail-city" class="field max-w-[12rem] min-h-[44px]" value="Stockton" autocomplete="address-level2"></div>
+        <button type="button" class="btn btn-pine btn-sm min-h-[44px]" data-click="logMailing">Log copy mailed today</button></div></div>` : '';
+    const stake = stakeouts.get(o.id), walk = safeWalks.get(o.id);
+    const timers = isOpen(o) ? `<details class="mt-5"><summary class="text-sm font-semibold text-primary cursor-pointer min-h-[44px] flex items-center">Field timers</summary>
+        <div class="grid sm:grid-cols-2 gap-4 mt-3">
+            <div class="space-y-2"><p class="field-label">Stakeout timer</p><p id="stake-clock" class="font-mono text-lg" role="timer" aria-live="off">${stake ? 'Running' : 'Not started'}</p>
+                <div class="flex flex-wrap gap-2"><button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="stakeStart" ${stake ? 'disabled' : ''}>Start</button>
+                <button type="button" class="btn btn-pine btn-sm min-h-[44px]" data-click="stakeLog" ${stake ? '' : 'disabled'}>Stop &amp; log time</button></div>
+                <p class="text-xs text-muted">Logs start, end and minutes to the timeline (only you see it).</p></div>
+            <div class="space-y-2"><p class="field-label">Safe-walk check-in</p><p id="walk-clock" class="font-mono text-lg" role="timer" aria-live="off">${walk ? 'Running' : '15:00'}</p>
+                <div class="flex flex-wrap gap-2"><button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="walkStart" ${walk ? 'disabled' : ''}>Start 15 minutes</button>
+                <button type="button" class="btn btn-pine btn-sm min-h-[44px]" data-click="walkSafe" ${walk ? '' : 'disabled'}>I'm Safe</button></div>
+                <p class="text-xs text-muted">If you don't tap "I'm Safe" in time, an urgent email with this job and address goes to <strong>${esc((safeWalkInfo.recipients || []).join(', ') || 'your dashboard email')}</strong>${safeWalkInfo.configured ? '' : ' (you; ask your developer to add a trusted contact as SAFE_WALK_EMAILS)'}. Keep this page open: a phone may pause it in the background, and then the alert is sent when you come back to it.</p></div>
+        </div></details>` : '';
+    return windows + mailing + timers;
+}
+async function copyAddress(_, btn) {
+    const o = current.order;
+    if (!(await NPS.copyText(NPSField.fullAddress(o), btn))) showFeedback('Copying is blocked in this browser. Press and hold the address to copy it.', 'warn');
+}
+async function logMailing() {
+    const city = ($('f-mail-city')?.value || '').trim();
+    try {
+        current = await api('update', { id: current.order.id, kind: 'note', note: `Follow-up copy mailed (First-Class) on ${new Date().toLocaleDateString('en-US')}${city ? ` from ${city}` : ''}.`, clientVisible: true });
+        renderDetail();
+        showFeedback('Mailing logged.');
+    } catch (err) { showFeedback(err.message, 'err'); }
+}
+
+// Stakeout and safe-walk timers keep their start time in this browser (so a reload or a locked phone doesn't lose it).
+const stakeouts = new Map(), safeWalks = new Map();
+let safeWalkInfo = { recipients: [], configured: false };   // from 'me'
+const TIMER_KEY = 'nps-field-timers';
+function saveTimers() {
+    try { localStorage.setItem(TIMER_KEY, JSON.stringify({ stake: [...stakeouts], walk: [...safeWalks] })); } catch { /* private mode */ }
+}
+try {
+    const saved = JSON.parse(localStorage.getItem(TIMER_KEY) || '{}');
+    for (const [k, v] of saved.stake || []) stakeouts.set(k, v);
+    for (const [k, v] of saved.walk || []) safeWalks.set(k, v);
+} catch { /* nothing saved */ }
+const mmss = (ms) => { const t = Math.max(0, Math.round(ms / 1000)); return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`; };
+function stakeStart() { stakeouts.set(current.order.id, Date.now()); saveTimers(); renderDetail(); }
+async function stakeLog() {
+    const id = current.order.id, start = stakeouts.get(id);
+    if (!start) return;
+    const end = Date.now(), minutes = Math.max(1, Math.round((end - start) / 60e3));
+    const t = (ms) => new Date(ms).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+    try {
+        current = await api('update', { id, kind: 'note', note: `Stakeout: ${t(start)} to ${t(end)} (${minutes} min).`, clientVisible: false });
+        stakeouts.delete(id); saveTimers(); renderDetail();
+        showFeedback(`Stakeout logged: ${minutes} min.`);
+    } catch (err) { showFeedback(err.message, 'err'); }
+}
+const WALK_MS = 15 * 60e3;
+function walkStart() { safeWalks.set(current.order.id, Date.now() + WALK_MS); saveTimers(); renderDetail(); }
+function walkSafe() { safeWalks.delete(current.order.id); saveTimers(); renderDetail(); showFeedback('Safe-walk timer stopped. Glad you are safe.'); }
+async function checkSafeWalks() {
+    for (const [id, due] of [...safeWalks]) {
+        if (Date.now() < due) continue;
+        safeWalks.delete(id); saveTimers();
+        try { await api('safe-walk-alert', { id, minutes: 15 }); showFeedback('Safe-walk timer ran out: an urgent alert was emailed.', 'warn'); }
+        catch (err) { safeWalks.set(id, due); saveTimers(); showFeedback(`The safe-walk alert could not be sent: ${err.message}. Call someone now.`, 'err'); }
+        if (current?.order.id === id) renderDetail();
+    }
+}
+setInterval(() => {
+    if (!current) return;
+    const id = current.order.id;
+    if (stakeouts.has(id) && $('stake-clock')) $('stake-clock').textContent = mmss(Date.now() - stakeouts.get(id));
+    if (safeWalks.has(id) && $('walk-clock')) $('walk-clock').textContent = mmss(safeWalks.get(id) - Date.now());
+}, 1000);
+setInterval(checkSafeWalks, 5000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkSafeWalks(); });
+
+// Printouts for court prep and disputes (factual records; Nick still files the official forms himself).
+function printDiligence() { NPS.printDocument(NPSField.diligenceHtml(current.order, current.events)); }
+function printPos010() { NPS.printDocument(NPSField.pos010Html(current.order, current.events)); }
+async function printEvidencePack() {
+    try { NPS.printDocument(NPSField.evidenceHtml(await api('evidence-pack', { id: current.order.id }))); }
+    catch (err) { showFeedback(err.message, 'err'); }
+}
+function printReceipt() {
+    const o = current.order, p = current.printing || {};
+    NPS.printDocument(NPSField.receiptHtml({ code: o.code, paidAt: o.paid_at, clientName: o.client_name, clientFirm: o.client_firm, caseNumber: o.case_number,
+        court: o.court, tierName: o.tier_name, totalCents: o.amount_due_cents, printingPages: p.pages, printingFeeCents: p.feeCents, stripeRef: o.stripe_session_id }));
+}
+function insertTemplate(_, el) {
+    const text = NPSField.TEMPLATES[Number(el.value)];
+    const box = $('f-note');
+    if (!text || !box) return;
+    box.value = box.value ? `${box.value.trimEnd()}\n${text}` : text;
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+    box.focus();
+    el.value = '';
+}
+function pickOutcome(arg) {
+    const sel = $('f-outcome'), when = $('f-when');
+    if (sel) sel.value = arg;
+    if (when) { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); when.value = d.toISOString().slice(0, 16); }
+    document.querySelectorAll('[data-click="pickOutcome"]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.arg === arg)));
+    $('action-form').dispatchEvent(new Event('change'));
+    $('f-note')?.focus();
+}
+function addPrintingFee() {
+    const box = $('f-amount'), fee = current.printing?.feeCents || 0;
+    if (!box || !fee) return;
+    box.value = (Number(box.value || 0) + fee / 100).toFixed(2);
+    const d = $('f-desc');
+    if (d && !/Printing/.test(d.value)) d.value = `${d.value}${d.value ? ' + ' : ''}Printing (${current.printing.pages} pages)`.slice(0, 300);
+    $('f-add-fee').disabled = true;
+}
+async function refreshPayLink() {
+    try {
+        const r = await api('refresh-payment-link', { id: current.order.id });
+        current = r; renderDetail();
+        showFeedback(r.fresh ? 'A fresh 24-hour payment link was emailed to the client.' : 'The current link still works, so it was emailed to the client again.');
+    } catch (err) { showFeedback(err.message, 'err'); }
+}
+
 function setActionTab(k) {
     if (actionBusy || k === actionTab) return;
     rememberDraft();
@@ -374,7 +581,10 @@ function actionForm(o) {
                     : `<i class="fa-solid fa-triangle-exclamation mr-1"></i> Record seal does NOT match. A timeline entry was changed after it was written. Don't delete anything; call your developer.`}
                 ${seal.head ? `<br><span class="font-mono text-muted break-all">Seal: ${esc(seal.head)}</span>` : ''}</p>
             <div class="flex flex-wrap gap-2">
-                <button type="button" class="btn btn-outline btn-sm" data-click="printRecord"><i class="fa-solid fa-print"></i> Print record</button>
+                <button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="printRecord"><i class="fa-solid fa-print"></i> Print record</button>
+                <button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="printEvidencePack"><i class="fa-solid fa-scale-balanced" aria-hidden="true"></i> Dispute &amp; Court Evidence Pack</button>
+                <button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="printDiligence">Print Diligence Log</button>
+                <button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="printPos010">Print POS-010 Draft Sheet</button>
                 <button type="button" class="btn btn-outline btn-sm" data-click="toggleDocLockJob"><i class="fa-solid ${o.doc_lock ? 'fa-lock-open' : 'fa-lock'}"></i> ${o.doc_lock ? 'Turn off document lock' : 'Lock documents on tracking page'}</button>
                 <button type="button" class="btn btn-outline btn-sm" data-click="rotateLink"><i class="fa-solid fa-link-slash"></i> Replace client's tracking link</button>
             </div>
@@ -396,7 +606,7 @@ function actionForm(o) {
         <div class="space-y-3">
             <p class="text-sm font-semibold text-[#7a1f1c]"><i class="fa-solid fa-triangle-exclamation mr-1"></i> Delete permanently</p>
             ${o.legal_hold ? `<p class="text-xs text-muted">This request is under legal hold, so it can't be deleted. Unlock legal hold first.</p>` : `
-            <p class="text-xs text-muted">Removes this request, its timeline, and every uploaded document and proof. It can't be undone. Check your own record-keeping obligations before deleting.</p>
+            <p class="text-xs text-muted">Removes this request, its timeline, and every uploaded document and proof. It can't be undone. Check your own record-keeping obligations before deleting. The client activity record (views and downloads, network addresses kept only as hashes) is permanent and stays, so disputes can still be answered.</p>
             <div><label for="f-confirm" class="field-label">Type ${esc(o.code)} to confirm</label><input id="f-confirm" class="field uppercase" autocomplete="off" spellcheck="false"></div>
             ${stepUp}
             <p id="action-error" class="result-box result-err hidden" role="alert"></p>
@@ -404,6 +614,7 @@ function actionForm(o) {
         </div>`;
     }
     if (actionTab === 'attempt') return `
+        <div class="flex flex-wrap gap-2" role="group" aria-label="One-tap outcome">${NPSField.ATTEMPT_PRESETS.map(p => `<button type="button" class="tab-btn min-h-[44px]" aria-pressed="false" data-click="pickOutcome" data-arg="${esc(p)}">${esc(p)}</button>`).join('')}</div>
         <div class="grid sm:grid-cols-2 gap-4">
             <div><label for="f-outcome" class="field-label">Outcome</label><select id="f-outcome" class="field">${ATTEMPT_OUTCOMES.map(x => `<option>${x}</option>`).join('')}</select></div>
             <div><label for="f-when" class="field-label">When (leave blank for now)</label><input id="f-when" type="datetime-local" class="field"></div>
@@ -419,17 +630,25 @@ function actionForm(o) {
         ${check('f-notify', 'Email the client about it', false)}
         ${submitBtn('Update Status')}`;
     if (actionTab === 'note') return `
+        <div><label for="f-template" class="field-label">Insert a saved message</label><select id="f-template" class="field min-h-[44px]" data-change="insertTemplate"><option value="">Choose…</option>${NPSField.TEMPLATES.map((t, i) => `<option value="${i}">${esc(t)}</option>`).join('')}</select></div>
         <div><label for="f-note" class="field-label">Note</label><textarea id="f-note" class="field h-24 resize-none"></textarea></div>
         ${check('f-visible', 'Client can see this note (otherwise only you can)', false)}
         ${submitBtn('Save Note')}`;
     if (actionTab === 'action') return `
         <p class="text-sm text-muted">The client gets an email and a form on their tracking page to answer, fix the address, or upload a file.</p>
+        <div><label for="f-template" class="field-label">Insert a saved message</label><select id="f-template" class="field min-h-[44px]" data-change="insertTemplate"><option value="">Choose…</option>${NPSField.TEMPLATES.map((t, i) => `<option value="${i}">${esc(t)}</option>`).join('')}</select></div>
         <div><label for="f-note" class="field-label">What do you need?</label><textarea id="f-note" class="field h-24 resize-none" placeholder="e.g. The apartment number is missing. Which unit does the subject live in?"></textarea></div>
         ${submitBtn('Send to Client')}`;
     if (actionTab === 'payment') {
-        if (o.paid_at) return `<p class="result-box result-ok text-sm">Paid ${NPS.money(o.amount_due_cents)} on ${esc(NPS.fmtDate(o.paid_at))}.</p>`;
+        if (o.paid_at) return `<p class="result-box result-ok text-sm">Paid ${NPS.money(o.amount_due_cents)} on ${esc(NPS.fmtDate(o.paid_at))}.</p>
+            <button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="printReceipt"><i class="fa-solid fa-receipt" aria-hidden="true"></i> Print / Save Receipt</button>`;
+        const pr = current.printing || { pages: 0, feeCents: 0 };
         return `
-        ${o.payment_url && o.status === 'awaiting_payment' ? `<p class="result-box result-warn text-sm">A payment link for ${NPS.money(o.amount_due_cents)} was already sent. Sending a new one replaces it.</p>` : ''}
+        ${o.payment_url && o.amount_due_cents ? `<div class="result-box result-warn text-sm space-y-2"><p>A payment link for ${NPS.money(o.amount_due_cents)} was already sent. Links last 24 hours. Sending a new amount below replaces it.</p>
+            <button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="refreshPayLink">Send Fresh Payment Link</button></div>` : ''}
+        <p class="text-sm">Uploaded PDF pages: <strong>${pr.pages}</strong>${pr.pages ? ` · printing fee ${NPS.money(pr.feeCents)} (first 100 pages free, then $0.15/page)` : ''}</p>
+        ${pr.feeCents ? `<button id="f-add-fee" type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="addPrintingFee">Add printing fee (${NPS.money(pr.feeCents)})</button>` : ''}
+        <p class="text-xs text-muted">Page counts come from the PDFs' own structure; a PDF that hides its pages in compressed sections may count low. Check before billing.</p>
         <div class="grid sm:grid-cols-3 gap-4">
             <div><label for="f-amount" class="field-label">Amount ($)</label><input id="f-amount" type="number" min="1" step="0.01" class="field" value="${((o.amount_due_cents ?? o.estimated_total_cents) / 100).toFixed(2)}"></div>
             <div class="sm:col-span-2"><label for="f-desc" class="field-label">What it covers (shown to client)</label><input id="f-desc" class="field" value="${esc(o.tier_name + (o.addon_names.length ? ' + ' + o.addon_names.join(', ') : ''))}"></div>
@@ -818,6 +1037,41 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
 
+// --- "Secure your dashboard" card (until the authenticator app and a passkey are both set up) and the low recovery
+// codes banner. Skipping the card hides it in this browser for a week.
+const SETUP_SKIP_KEY = 'nps-setup-skipped-until';
+function renderSecurityPrompts(me, passkeyCount) {
+    let skipped = 0;
+    try { skipped = Number(localStorage.getItem(SETUP_SKIP_KEY) || 0); } catch { /* private mode */ }
+    const needsSetup = !me.totpEnabled || passkeyCount === 0;
+    const card = $('setup-card');
+    if (needsSetup && Date.now() > skipped) {
+        const step = (done, n, title, textHtml) => `<li class="flex gap-3"><span class="status-pill ${done ? 'status-done' : 'status-muted'} shrink-0">${done ? '<i class="fa-solid fa-check" aria-hidden="true"></i> Done' : `Step ${n}`}</span><div><p class="font-semibold text-ink">${title}</p><p class="text-sm text-muted">${textHtml}</p></div></li>`;
+        card.innerHTML = `<section class="panel p-6 mb-6 space-y-4" aria-labelledby="setup-title">
+            <div class="flex flex-wrap items-start justify-between gap-3"><div><h2 id="setup-title" class="font-display text-2xl text-primary">Secure your dashboard</h2>
+            <p class="text-sm text-muted">Three steps, about five minutes. Afterwards, someone who gets into your email still can't open your jobs.</p></div>
+            <button type="button" class="text-sm text-primary underline underline-offset-2 min-h-[44px]" data-click="skipSetup">Skip for now</button></div>
+            <ol class="space-y-3">
+                ${step(me.totpEnabled, 1, 'Turn on the authenticator app', 'Scan a QR code with Apple Passwords, Google Authenticator or Microsoft Authenticator, then type the 6-digit code it shows.')}
+                ${step(me.totpEnabled && me.recoveryRemaining >= 8, 2, 'Save 8 recovery codes', 'Single-use XXXX-XXXX codes for the day your phone is lost. Keep them in a password manager, not in your email.')}
+                ${step(passkeyCount > 0, 3, 'Add Face ID / Touch ID', 'A passkey lets you log in with your face or fingerprint. It only works on this website, so a fake page can\'t steal it.')}
+            </ol>
+            <button type="button" class="btn btn-pine min-h-[44px]" data-click="openSecurityFromCard">Open security settings</button></section>`;
+        card.classList.remove('hidden');
+    } else card.classList.add('hidden');
+    const banner = $('recovery-banner');
+    if (me.totpEnabled && me.recoveryRemaining <= 3) {
+        banner.innerHTML = `<div class="result-box result-warn mb-6 flex flex-wrap items-center justify-between gap-3" role="status">
+            <p class="text-sm"><strong>Only ${me.recoveryRemaining} recovery code${me.recoveryRemaining === 1 ? '' : 's'} left.</strong> Make a fresh set of 8 so you can still get in if you lose your phone.</p>
+            <button type="button" class="btn btn-outline btn-sm min-h-[44px]" data-click="openSecurityFromCard">Make new recovery codes</button></div>`;
+        banner.classList.remove('hidden');
+    } else banner.classList.add('hidden');
+}
+function skipSetup() {
+    try { localStorage.setItem(SETUP_SKIP_KEY, String(Date.now() + 7 * 864e5)); } catch { /* private mode */ }
+    $('setup-card').classList.add('hidden');
+}
+
 // --- Start: already logged in? ---
 async function start() {
     try {
@@ -829,6 +1083,9 @@ async function start() {
         $('security-modal-email').textContent = me.email;
         updateRecoveryBadge(me.recoveryRemaining);
         updateSecurityState(me.totpEnabled);
+        const passkeyCount = await api('passkeys').then(r => r.passkeys.length, () => -1);   // -1: unknown (not set up yet)
+        renderSecurityPrompts(me, passkeyCount);
+        if (me.safeWalk) safeWalkInfo = me.safeWalk;
         await refreshJobs();
         const hashId = location.hash.slice(1);
         if (hashId) openJob(hashId);
@@ -847,12 +1104,21 @@ const CLICK_ACTIONS = {
     backToList, closeSecurityModal, refreshJobs, exportJob, showEmailStep, rotateLink, toggleDocLockJob, printRecord,
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
+    bulkClose, copyAddress, logMailing, stakeStart, stakeLog, walkStart, walkSafe, printDiligence, printPos010, printEvidencePack,
+    printReceipt, addPrintingFee, refreshPayLink, skipSetup, openSecurityFromCard: () => openSecurityModal(),
+    pickOutcome: (arg) => pickOutcome(arg),
     setLegalHold: (arg) => setLegalHold(arg === 'true'),
     setActionTab: (arg) => setActionTab(arg),
     setFilter: (arg) => setFilter(arg),
     openJob: (arg) => openJob(arg),
     downloadFile: (arg, el) => downloadFile(arg, el),
 };
+// Same allowlist idea for <select> changes (data-change).
+const CHANGE_ACTIONS = { insertTemplate };
+document.addEventListener('change', (e) => {
+    const el = e.target.closest('[data-change]');
+    if (el && Object.hasOwn(CHANGE_ACTIONS, el.dataset.change)) CHANGE_ACTIONS[el.dataset.change](el.value, el);
+});
 document.addEventListener('click', (e) => {
     const el = e.target.closest('[data-click]');
     if (el && Object.hasOwn(CLICK_ACTIONS, el.dataset.click)) CLICK_ACTIONS[el.dataset.click](el.dataset.arg, el);

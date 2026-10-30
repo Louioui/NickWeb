@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS } from './core.mjs';
+import { db, addEvent, logClientAction, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS, printingFeeCents } from './core.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -79,11 +79,16 @@ export async function clientView(order, { unlocked = false } = {}) {
     const [{ data: events }, fileRes] = await Promise.all([
         db().from('order_events').select('created_at, kind, title, detail').eq('order_id', order.id)
             .eq('client_visible', true).order('created_at', { ascending: true }),
-        db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at').eq('order_id', order.id)
+        db().from('order_files').select('id, kind, filename, size_bytes, sha256, page_count, created_at').eq('order_id', order.id)
             .eq('uploaded', true).order('created_at', { ascending: true }),
     ]);
     let files = fileRes.data;
-    if (fileRes.error) {
+    if (fileRes.error) {   // before the page_count migration
+        const noPages = await db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at').eq('order_id', order.id)
+            .eq('uploaded', true).order('created_at', { ascending: true });
+        files = noPages.data;
+    }
+    if (!files) {
         const fallback = await db().from('order_files').select('id, kind, filename, size_bytes, created_at').eq('order_id', order.id)
             .eq('uploaded', true).order('created_at', { ascending: true });
         files = fallback.data;
@@ -107,6 +112,17 @@ export async function clientView(order, { unlocked = false } = {}) {
         // Held (served) orders keep their status when billed afterwards, so an unpaid link alone shows the Pay button.
         payUrl: (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
         paidAt: order.paid_at,
+        tierKey: order.tier,
+        // A message to Nick can be sent on any open request (the "What happens next" banner and reply box use these).
+        canMessage: ['received', 'awaiting_payment', 'paid', 'accepted', 'attempting', 'action_required'].includes(order.status),
+        // Itemized receipt, once paid and only when the page is unlocked (it names the client and the case).
+        receipt: order.paid_at && !isLocked ? (() => {
+            const pages = (files || []).filter(f => f.kind !== 'proof').reduce((n, f) => n + (Number(f.page_count) || 0), 0);
+            return { code: order.code, paidAt: order.paid_at, clientName: order.client_name, clientFirm: order.client_firm, caseNumber: order.case_number,
+                court: order.court, tierName: TIERS[order.tier]?.name || order.tier, tierCents: TIERS[order.tier]?.cents ?? null,
+                addons: (order.addons || []).filter(k => ADDONS[k]).map(k => ({ name: ADDONS[k].name, cents: ADDONS[k].cents })),
+                printingPages: pages, printingFeeCents: printingFeeCents(pages), totalCents: order.amount_due_cents, stripeRef: order.stripe_session_id };
+        })() : null,
         actionNote: order.status === 'action_required' && !isLocked ? order.action_note : null,
         docLock: !!order.doc_lock,
         unlocked: !isLocked,
@@ -147,7 +163,7 @@ export function canMarkPaid(order, amountCents, sessionId) {
 
 export async function markPaid(orderId, amountCents, sessionId) {
     uuid(orderId, 'Order');
-    const { data: order, error } = await db().from('orders').select('id, status, paid_at, stripe_session_id, amount_due_cents, legal_hold').eq('id', orderId).maybeSingle();
+    const { data: order, error } = await db().from('orders').select('id, code, status, paid_at, stripe_session_id, amount_due_cents, legal_hold').eq('id', orderId).maybeSingle();
     if (error) throw error;
     if (!canMarkPaid(order, amountCents, sessionId)) return false;
     // Paying after the job was served (Nick serves first for some clients): record the money, keep the status "Served".
@@ -159,6 +175,7 @@ export async function markPaid(orderId, amountCents, sessionId) {
     if (uErr) throw uErr;
     if (!changed?.length) return false;
     await addEvent(orderId, 'payment', `Payment received: ${money(Number(amountCents))}`);
+    await logClientAction(null, order, 'payment_confirmed', `${money(Number(amountCents))} · Stripe ${sessionId}`);
     return true;
 }
 

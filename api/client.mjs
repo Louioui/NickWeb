@@ -1,10 +1,10 @@
 // Passwordless client accounts. No admin actions and no client-supplied ownership filters.
-import { db, handle, json, readJson, rateLimit, clientIp, siteOrigin, email, text, cleanOrderCode, randomToken, addEvent, sha256, hashPin, verifyPin, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
+import { db, handle, json, readJson, rateLimit, clientIp, siteOrigin, email, text, cleanOrderCode, randomToken, addEvent, logClientAction, signedDownload, sha256, hashPin, verifyPin, HttpError, ADMIN_EMAILS } from './_lib/core.mjs';
 import { clientAuth, clientCookie, savedClientSession, requireClient, verifiedClient, clientProfile,
          getClientSecurity, pinLocked, recordPinFailure, clearPinFailures,
          rememberDevice, isTrustedDevice, forgetDevices, DEVICE_COOKIE, isFreshSignIn } from './_lib/clients.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, dropPasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
-import { STATUSES, TIERS, money, sendEmail, sendSecurityAlert } from './_lib/orders.mjs';
+import { STATUSES, TIERS, money, sendEmail, sendSecurityAlert, clientView } from './_lib/orders.mjs';
 
 const PIN_LOCKED_MESSAGE = 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.';
 const ASK_FOR_PIN = { ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' };
@@ -289,11 +289,39 @@ export const POST = handle(async request => {
         })));
         return json({ ok: true, code: order.code }, 200, headers);
     }
+    if (action === 'receipt') {
+        // The itemized receipt for one of this client's paid requests (same data the tracking page shows when unlocked).
+        await rateLimit(`client-receipt:${user.id}`, 30, 900);
+        const code = cleanOrderCode(body.code);
+        const { data: order, error } = await db().from('orders').select('*').eq('client_email', clientEmail).eq('code', code).maybeSingle();
+        if (error || !order) throw new HttpError(404, 'Order not found.');
+        if (!order.paid_at) throw new HttpError(409, 'This request has not been paid yet.');
+        return json({ receipt: (await clientView(order, { unlocked: true })).receipt }, 200, headers);
+    }
+    if (action === 'proof-links') {
+        // Short-lived (60-second) download links for every Proof of Service on this client's requests, with each file's
+        // SHA-256 fingerprint so the browser can check it. Each one is logged as a download.
+        await rateLimit(`client-proof-links:${user.id}`, 6, 900);
+        const { data: mine, error } = await db().from('orders').select('id, code').eq('client_email', clientEmail).limit(100);
+        if (error) throw error;
+        const byId = new Map((mine || []).map(o => [o.id, o]));
+        if (!byId.size) return json({ files: [] }, 200, headers);
+        const { data: proofs, error: fErr } = await db().from('order_files').select('id, order_id, filename, storage_path, sha256')
+            .in('order_id', [...byId.keys()]).eq('kind', 'proof').eq('uploaded', true).limit(50);
+        if (fErr) throw fErr;
+        const files = [];
+        for (const f of proofs || []) {
+            const o = byId.get(f.order_id);
+            files.push({ code: o.code, name: f.filename, sha256: f.sha256 || null, url: await signedDownload(f.storage_path, f.filename) });
+            await logClientAction(request, o, 'download', [f.filename, f.sha256 && `SHA-256 ${f.sha256}`, 'from client portal'].filter(Boolean).join(' · '));
+        }
+        return json({ files }, 200, headers);
+    }
     if (action === 'list') {
         await rateLimit(`client-list:${user.id}`, 90, 60);
         const sec = await getClientSecurity(clientEmail);
         // Exact equality, not ilike: '+' addresses and wildcard characters cannot widen the query.
-        let { data, error } = await db().from('orders').select('code,status,recipient_name,doc_type,tier,created_at,estimated_total_cents,amount_due_cents,paid_at,track_token,doc_lock,legal_hold')
+        let { data, error } = await db().from('orders').select('code,status,recipient_name,doc_type,tier,created_at,estimated_total_cents,amount_due_cents,paid_at,track_token,doc_lock,legal_hold,client_reference')
             .eq('client_email', clientEmail).order('created_at', { ascending: false }).limit(100);
         if (error) {
             const fallback = await db().from('orders').select('code,status,recipient_name,doc_type,tier,created_at,estimated_total_cents,amount_due_cents,paid_at,track_token')
@@ -313,6 +341,8 @@ export const POST = handle(async request => {
                 created: o.created_at,
                 amount: money(o.amount_due_cents ?? o.estimated_total_cents),
                 paid: !!o.paid_at,
+                paidAt: o.paid_at || null,
+                reference: o.client_reference || '',
                 docLock: !!o.doc_lock,
                 legalHold: o.status === 'served' || !!o.legal_hold,
                 trackUrl: `/track.html#t=${encodeURIComponent(o.track_token)}`,

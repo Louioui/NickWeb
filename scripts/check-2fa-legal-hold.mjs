@@ -44,7 +44,11 @@ await call('admin', { action: 'send-code', email: NICK });
 let login = await call('admin', { action: 'verify-code', email: NICK, code: MOCK_ADMIN_CODE });
 check('email-code login works before 2FA is on', login.status === 200 && login.cookie.startsWith('nps_admin='));
 let nick = login.cookie;
-const setup = await call('admin', { action: 'totp-setup' }, nick);
+// F-09: turning the authenticator on for the first time needs the emailed confirmation code (the demo code).
+const setupNoStepUp = await call('admin', { action: 'totp-setup' }, nick);
+check('F-09 first-time authenticator setup asks for the emailed step-up', setupNoStepUp.status === 403 && setupNoStepUp.data.requiresEmailStepUp === true);
+await call('admin', { action: 'send-stepup-code' }, nick);
+const setup = await call('admin', { action: 'totp-setup', totp: '12345678' }, nick);
 check('setup returns a scannable otpauth link', setup.status === 200 && /^otpauth:\/\/totp\//.test(setup.data.otpauthUrl));
 const secret = setup.data.secret;
 check('wrong confirmation code does not turn 2FA on', (await call('admin', { action: 'totp-enable', totp: '000000' }, nick)).status === 400);

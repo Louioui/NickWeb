@@ -1,10 +1,11 @@
 // POST /api/admin { action, ... } — Nick's dashboard. Everything except the two login steps needs his session cookie.
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
-         sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
-         HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
+         sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid, uuidList,
+         HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash, printingFeeCents } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
+import { refreshPaymentLink } from './_lib/payments.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 
 const COOKIE = 'nps_admin';
@@ -23,6 +24,7 @@ export const POST = handle(async (request) => {
     if (a === 'logout') return logout(request, admin);
     if (a === 'logout-all') return logoutAll(request, admin);
     if (a === 'sessions') return sessions(request, admin);
+    if (a === 'send-stepup-code') return sendStepUpCode(request, admin);
     if (a === 'revoke-session') return revokeSession(request, body, admin);
     if (a === 'passkeys') return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
     if (a === 'passkey-register-options') return passkeyRegisterOptions(request, body, admin);
@@ -39,10 +41,14 @@ export const POST = handle(async (request) => {
     if (a === 'toggle-doc-lock') return toggleDocLock(request, body, admin);
     if (a === 'unlock-legal-hold') return unlockLegalHold(request, body, admin);
     if (a === 'payment-link') return paymentLink(request, body, admin);
+    if (a === 'refresh-payment-link') return refreshLink(request, body, admin);
+    if (a === 'bulk-close') return bulkClose(request, body, admin);
+    if (a === 'safe-walk-alert') return safeWalkAlert(request, body, admin);
     if (a === 'proof-upload') return proofUpload(body);
     if (a === 'proof-finish') return proofFinish(request, body);
     if (a === 'file-url') return fileUrl(request, body, admin);
     if (a === 'export') return exportOrder(request, body, admin);
+    if (a === 'evidence-pack') return evidencePack(request, body, admin);
     if (a === 'delete') return deleteOrder(request, body, admin);
     throw new HttpError(400, 'Unknown action.');
 });
@@ -111,10 +117,21 @@ async function checkTotp(addr, secretEnc, code, bucket) {
 }
 
 // Step-up check before sensitive actions. With an authenticator on, a fresh code is required; returns whether one was checked.
-// A fresh authenticator code, or (phone lost) one single-use recovery code, confirms a sensitive action.
-async function requireStepUp(admin, code) {
+// Sensitive actions need more than the session cookie. With the authenticator on: a fresh authenticator code, or (phone
+// lost) one single-use recovery code. With it off (F-09): an 8-digit code emailed to Nick for this session, which then
+// covers sensitive actions on this session for 5 minutes. Returns 'totp' or 'email' (what was used).
+const STEPUP_WINDOW_MS = 5 * 60e3;
+const EMAIL_STEPUP = (message) => new HttpError(403, message, { requiresEmailStepUp: true });
+const sessionHash = (request) => {
+    const token = getCookie(request, COOKIE);
+    return typeof token === 'string' && /^[A-Za-z0-9_-]{40,64}$/.test(token) ? sha256(token) : null;
+};
+async function requireStepUp(admin, code, request) {
     const row = await getAdminTotp(admin);
-    if (!row?.enabled) return false;
+    if (!row?.enabled) {
+        await requireEmailStepUp(admin, code, request);
+        return 'email';
+    }
     const typed = String(code || '').trim().toUpperCase();
     const recovery = typed.replace(/[^A-Z0-9]/g, '');
     if (!/^\d{6}$/.test(typed.replace(/\s+/g, '')) && recovery.length === 8) {
@@ -122,12 +139,48 @@ async function requireStepUp(admin, code) {
         const { data, error } = await db().rpc('use_admin_recovery_code', { p_email: admin, p_hash: recoveryHash(admin, recovery) });
         if (error) throw error;
         if (!data) throw new HttpError(403, 'That recovery code is wrong or already used.');
-        return true;
+        return 'totp';
     }
     if (!(await checkTotp(admin, row.secret_enc, typed, 'admin-stepup'))) {
         throw new HttpError(403, 'Enter the current 6-digit code from your authenticator app, or one of your recovery codes.');
     }
-    return true;
+    return 'totp';
+}
+async function requireEmailStepUp(admin, code, request) {
+    const hash = sessionHash(request);
+    if (!hash) throw new HttpError(401, 'Please log in.');
+    const { data: s, error } = await db().from('admin_sessions').select('email, last_step_up_at').eq('token_hash', hash).maybeSingle();
+    if (error) throw error;
+    if (!s || s.email !== admin) throw new HttpError(401, 'Please log in.');
+    if (s.last_step_up_at && Date.now() - new Date(s.last_step_up_at).getTime() < STEPUP_WINDOW_MS) return;
+    const digits = String(code || '').replace(/[\s-]+/g, '');
+    if (!/^\d{8}$/.test(digits)) throw EMAIL_STEPUP('To confirm this, enter the 8-digit code we email you.');
+    await rateLimit(`admin-stepup:${sha256(admin)}`, 10, 900);
+    const { data: ok, error: rErr } = await db().rpc('use_admin_stepup_code', { p_token_hash: hash, p_code_hash: sha256(`stepup:${admin}:${digits}`) });
+    if (rErr) throw rErr;
+    if (!ok) throw EMAIL_STEPUP('That code is wrong or expired. Request a new one.');
+}
+// Emails a step-up code for this session. A new code replaces any earlier one and resets its guess count.
+async function sendStepUpCode(request, admin) {
+    await rateLimit(`admin-stepup-send:${sha256(admin)}`, 3, 600);
+    const hash = sessionHash(request);
+    if (!hash) throw new HttpError(401, 'Please log in.');
+    const code = String(randomInt(0, 100000000)).padStart(8, '0');
+    const { data, error } = await db().from('admin_sessions').update({
+        stepup_code_hash: sha256(`stepup:${admin}:${code}`), stepup_expires_at: new Date(Date.now() + 10 * 60e3).toISOString(), stepup_attempts: 0,
+    }).eq('token_hash', hash).eq('email', admin).select('token_hash');
+    if (error) throw error;
+    if (!data?.length) throw new HttpError(401, 'Please log in.');
+    await sendEmail({
+        to: admin,
+        subject: `Your dashboard confirmation code: ${code}`,
+        heading: `Your confirmation code is ${code}`,
+        lines: ['Enter this code on the dashboard to confirm a sensitive change (for example deleting a request). It expires in 10 minutes.',
+            "If you didn't try this, someone may be using your dashboard: use Log Out All Devices and turn on the authenticator app."],
+    });
+    if (!IS_PROD && !process.env.RESEND_API_KEY) console.log(`[dev] admin step-up code for ${admin}: ${code}`);
+    await auditAdmin(request, admin, 'stepup_code_sent');
+    return json({ ok: true });
 }
 
 const recoveryHash = (addr, code) => keyedHash('admin-recovery-v1', `${addr}:${code}`);
@@ -249,7 +302,7 @@ async function passkeyLoginVerify(request, body) {
 async function passkeyRegisterOptions(request, body, admin) {
     await rateLimit(`admin-passkey:${sha256(admin)}`, 10, 900);
     if (!(await getAdminTotp(admin))?.enabled) throw new HttpError(400, 'Turn on the authenticator app first, then add a passkey.');
-    await requireStepUp(admin, body?.totp);
+    await requireStepUp(admin, body?.totp, request);
     // A stable id that isn't the email address (the passkey shows the email as its name).
     const { options, cookie } = await registrationOptions(request, 'admin', admin, keyedHash('admin-passkey-user-v1', admin).slice(0, 32), "Nick's dashboard");
     return json({ ok: true, options }, 200, { 'set-cookie': cookie });
@@ -269,11 +322,73 @@ async function passkeyRegisterVerify(request, body, admin) {
 
 async function passkeyRemove(request, body, admin) {
     await rateLimit(`admin-passkey:${sha256(admin)}`, 10, 900);
-    await requireStepUp(admin, body?.totp);
+    await requireStepUp(admin, body?.totp, request);
     await removePasskey('admin', admin, body.id);
     await auditAdmin(request, admin, 'passkey_removed');
     await sendSecurityAlert(admin, 'A passkey was removed from your dashboard', ['That passkey can no longer be used to sign in.']);
     return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
+}
+
+// A new link for the same amount once the client's 24-hour link has expired; the client gets it by email.
+async function refreshLink(request, body, admin) {
+    await rateLimit(`admin-paylink:${sha256(admin)}`, 20, 900);
+    const order = await getOrder(body.id);
+    await rateLimit(`paylink-refresh:${order.id}`, 6, 3600);
+    const { url, fresh } = await refreshPaymentLink(order, siteOrigin(request));
+    await auditAdmin(request, admin, 'payment_link_refreshed', order.code, fresh ? 'new link' : 'previous link still open');
+    await sendEmail({
+        to: order.client_email, subject: `${order.code}: your payment link`,
+        heading: 'Here is your payment link',
+        lines: [`Amount due: ${money(order.amount_due_cents)}.`, 'Pay securely by card or Apple Pay. The link works for 24 hours.'],
+        button: { label: `Pay ${money(order.amount_due_cents)}`, url },
+    });
+    return json({ ...(await detail(order.id)), paymentUrl: url, fresh });
+}
+
+// Closes finished jobs in one go. Only served or cancelled requests are closed; anything else is left alone and listed.
+async function bulkClose(request, body, admin) {
+    await rateLimit(`admin-bulk:${sha256(admin)}`, 10, 900);
+    const ids = uuidList(body.ids).slice(0, 50);
+    if (!ids.length) throw new HttpError(400, 'Choose at least one finished request.');
+    const { data: rows, error } = await db().from('orders').select('id, code, status').in('id', ids);
+    if (error) throw error;
+    const closed = [], skipped = [];
+    for (const o of rows || []) {
+        if (!['served', 'cancelled'].includes(o.status)) { skipped.push(o.code); continue; }
+        const { data: changed, error: uErr } = await db().from('orders').update({ status: 'closed' }).eq('id', o.id).in('status', ['served', 'cancelled']).select('id');
+        if (uErr) throw uErr;
+        if (!changed?.length) { skipped.push(o.code); continue; }
+        await addEvent(o.id, 'status', STATUSES.closed.label, null, true);
+        closed.push(o.code);
+    }
+    if (closed.length) await auditAdmin(request, admin, 'bulk_close', null, closed.join(', ').slice(0, 300));
+    return json({ ok: true, closed, skipped });
+}
+
+// Who a missed safe-walk check-in alerts: SAFE_WALK_EMAILS (a trusted contact) if set, otherwise the dashboard addresses.
+function safeWalkRecipients() {
+    const to = (process.env.SAFE_WALK_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e));
+    return { recipients: to.length ? to : ADMIN_EMAILS, configured: to.length > 0 };
+}
+
+// Safe-walk check-in: Nick's phone calls this if he doesn't tap "I'm safe" before his timer runs out. It emails the
+// job he was on (code, address, time) to the emergency address (SAFE_WALK_EMAILS, or the admin addresses).
+async function safeWalkAlert(request, body, admin) {
+    await rateLimit(`admin-safewalk:${sha256(admin)}`, 6, 3600);
+    const order = await getOrder(body.id);
+    const minutes = Math.min(Math.max(Math.round(Number(body.minutes) || 15), 1), 240);
+    const { recipients } = safeWalkRecipients();
+    const where = [order.address, order.unit, order.city, order.zip].filter(Boolean).join(', ');
+    const results = await Promise.all(recipients.map(r => sendEmail({
+        to: r, subject: `URGENT: safe-walk check-in missed on ${order.code}`,
+        heading: 'Safe-walk check-in missed',
+        lines: [`${admin} started a ${minutes}-minute safe-walk timer and did not check in before it ran out.`,
+            `Job: ${order.code} (serving ${order.recipient_name})`, `Address: ${where}`, `Alert time (UTC): ${new Date().toISOString()}`,
+            'Try calling them now. If you can\'t reach them, consider calling 911 with this address.'],
+    }).catch(() => false)));
+    await auditAdmin(request, admin, 'safe_walk_alert', order.code, `${minutes} min timer`);
+    await addEvent(order.id, 'note', 'Safe-walk check-in missed; alert emailed', null, false);
+    return json({ ok: true, sent: results.filter(Boolean).length });
 }
 
 async function requireAdmin(request) {
@@ -296,7 +411,9 @@ async function me(admin) {
     const { count } = await db().from('admin_recovery_codes').select('id', { count: 'exact', head: true }).eq('email', admin).eq('used', false);
     const { data: auditLogs } = await db().from('admin_audit_logs').select('action, target_code, detail, created_at')
         .eq('email', admin).order('created_at', { ascending: false }).limit(10);
-    return json({ email: admin, recoveryRemaining: count || 0, totpEnabled: !!totpRow?.enabled, auditLogs: auditLogs || [] });
+    const walk = safeWalkRecipients();
+    return json({ email: admin, recoveryRemaining: count || 0, totpEnabled: !!totpRow?.enabled, auditLogs: auditLogs || [],
+        safeWalk: { recipients: walk.recipients, configured: walk.configured } });
 }
 
 async function logout(request, admin) {
@@ -352,7 +469,7 @@ async function revokeSession(request, body, admin) {
 const RECOVERY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 async function generateRecoveryCodes(request, body, admin) {
     await rateLimit(`admin-recovery-gen:${sha256(admin)}`, 3, 3600);
-    await requireStepUp(admin, body?.totp);
+    await requireStepUp(admin, body?.totp, request);
     const codes = [];
     const rows = [];
     for (let i = 0; i < 8; i++) {
@@ -374,7 +491,7 @@ async function generateRecoveryCodes(request, body, admin) {
 async function totpSetup(request, body, admin) {
     await rateLimit(`admin-totp:${sha256(admin)}`, 6, 900);
     const row = await getAdminTotp(admin);
-    if (row?.enabled) await requireStepUp(admin, body?.totp);
+    await requireStepUp(admin, body?.totp, request);
     const secret = generateTotpSecret(20);
     const enc = encryptSecret(secret);
     const { error } = row
@@ -416,7 +533,7 @@ async function totpDisable(request, body, admin) {
 // --- Jobs ---
 async function list() {
     const { data, error } = await db().from('orders')
-        .select('id, code, status, created_at, updated_at, client_name, client_firm, client_email, recipient_name, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
+        .select('id, code, status, created_at, updated_at, client_name, client_firm, client_email, recipient_name, address, unit, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
         .order('created_at', { ascending: false }).limit(500);
     if (error) throw error;
     return json({ orders: await withClientReplied(data), statuses: STATUSES, tiers: TIERS });
@@ -426,15 +543,21 @@ async function list() {
 // Only "received" jobs can be in that state (answering sets it), which keeps the id list short enough for one query.
 const NICK_KINDS = ['action', 'status', 'attempt', 'payment', 'proof'];
 async function withClientReplied(list) {
-    const ids = list.filter(o => o.status === 'received').map(o => o.id).slice(0, 150);
-    if (!ids.length) return list.map(o => ({ ...o, client_replied: false }));
-    const { data: evs, error } = await db().from('order_events').select('order_id, kind')
+    // Any open request whose latest client-or-Nick entry is the client's (an answer or a message) shows "Client replied".
+    const ids = list.filter(o => !['served', 'closed', 'cancelled'].includes(o.status)).map(o => o.id).slice(0, 150);
+    if (!ids.length) return list.map(o => ({ ...o, client_replied: false, last_activity_at: o.updated_at }));
+    const { data: evs, error } = await db().from('order_events').select('order_id, kind, created_at')
         .in('order_id', ids).in('kind', [...NICK_KINDS, 'action_response'])
         .order('created_at', { ascending: false }).limit(5000);
     if (error) throw error;
     const latest = new Map();
-    for (const e of evs) if (!latest.has(e.order_id)) latest.set(e.order_id, e.kind);
-    return list.map(o => ({ ...o, client_replied: latest.get(o.id) === 'action_response' }));
+    for (const e of evs) if (!latest.has(e.order_id)) latest.set(e.order_id, e);
+    // "Days since last update" counts attempts, notes to the client, payments and replies, not just changes to the order row.
+    return list.map(o => {
+        const last = latest.get(o.id);
+        const activity = [o.updated_at, last?.created_at].filter(Boolean).sort().pop() || o.created_at;
+        return { ...o, client_replied: last?.kind === 'action_response', last_activity_at: activity };
+    });
 }
 
 async function getOrder(id) {
@@ -449,14 +572,19 @@ async function detail(id) {
     const order = await getOrder(id);
     const [{ data: events }, fileRes] = await Promise.all([
         db().from('order_events').select('*').eq('order_id', id).order('created_at', { ascending: true }),
-        db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at, uploaded').eq('order_id', id).order('created_at'),
+        db().from('order_files').select('id, kind, filename, size_bytes, sha256, page_count, created_at, uploaded').eq('order_id', id).order('created_at'),
     ]);
     let files = fileRes.data;
-    if (fileRes.error) {
+    if (fileRes.error) {   // before the page_count migration: same list without page counts
+        const noPages = await db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at, uploaded').eq('order_id', id).order('created_at');
+        files = noPages.data;
+    }
+    if (!files) {
         const fallback = await db().from('order_files').select('id, kind, filename, size_bytes, created_at, uploaded').eq('order_id', id).order('created_at');
         files = fallback.data;
     }
     const uploadedFiles = (files || []).filter(f => f.uploaded);
+    const pdfPages = uploadedFiles.filter(f => f.kind !== 'proof').reduce((n, f) => n + (Number(f.page_count) || 0), 0);
     const integritySeal = await orderSeal(order.id);
     return {
         order: {
@@ -467,6 +595,7 @@ async function detail(id) {
         },
         events,
         files: uploadedFiles,
+        printing: { pages: pdfPages, feeCents: printingFeeCents(pdfPages), freePages: 100, centsPerPage: 15 },
         integritySeal,
         statuses: STATUSES,
     };
@@ -559,7 +688,7 @@ async function unlockLegalHold(request, body, admin) {
     const order = await getOrder(body.id);
     const hold = !!body.hold;
     if (!hold) {
-        const usedTotp = await requireStepUp(admin, body.totp);
+        const usedTotp = (await requireStepUp(admin, body.totp, request)) === 'totp';
         if (!usedTotp && String(body.confirm || '').trim().toUpperCase() !== order.code) {
             throw new HttpError(400, `Type ${order.code} to confirm unlocking legal hold.`);
         }
@@ -655,9 +784,35 @@ async function fileUrl(request, body, admin) {
 
 // --- Privacy requests: a client asks for a copy of their data, or for it to be deleted ---
 // Nick finds their requests by searching their email in the dashboard, then exports or deletes each one.
+// Dispute & court evidence pack: everything that shows what was agreed, paid, attempted and delivered, in one place.
+// Facts only, straight from the records: the client's attestation, the Stripe reference, every attempt, each file's
+// SHA-256 fingerprint, the timeline seal check, and the client's own actions (client_audit_logs).
+async function evidencePack(request, body, admin) {
+    await rateLimit(`admin-export:${sha256(admin)}`, 15, 900);
+    const { order, events, files, integritySeal } = await detail(body.id);
+    const { data: clientLog, error } = await db().from('client_audit_logs').select('action, detail, ip_hash, user_agent, created_at')
+        .eq('order_id', order.id).order('created_at', { ascending: true }).limit(500);
+    await auditAdmin(request, admin, 'evidence_pack', order.code);
+    return json({
+        generated_at: new Date().toISOString(),
+        order: { code: order.code, status: order.status, created_at: order.created_at, served_at: order.served_at || null, client_name: order.client_name,
+            client_firm: order.client_firm, client_email: order.client_email, recipient_name: order.recipient_name, case_number: order.case_number,
+            court: order.court, address: [order.address, order.unit, order.city, order.zip].filter(Boolean).join(', '), tier: order.tier_name,
+            addons: order.addon_names, amount_due_cents: order.amount_due_cents, paid_at: order.paid_at, stripe_session_id: order.stripe_session_id },
+        attestation: events.filter(e => e.kind === 'attestation').map(e => ({ created_at: e.created_at, title: e.title, detail: e.detail })),
+        payments: events.filter(e => e.kind === 'payment').map(e => ({ created_at: e.created_at, title: e.title, detail: e.detail })),
+        attempts: events.filter(e => e.kind === 'attempt').map(e => ({ created_at: e.created_at, title: e.title, detail: e.detail, shown_to_client: e.client_visible })),
+        files: files.map(f => ({ filename: f.filename, kind: f.kind, size_bytes: f.size_bytes, sha256: f.sha256 || null, created_at: f.created_at })),
+        timeline_seal: integritySeal,
+        client_actions: error ? null : (clientLog || []),
+    });
+}
+
 async function exportOrder(request, body, admin) {
     await rateLimit(`admin-export:${sha256(admin)}`, 15, 900);
     const { order, events, files, integritySeal } = await detail(body.id);
+    const { data: clientLog, error: logErr } = await db().from('client_audit_logs').select('action, detail, created_at')
+        .eq('order_id', order.id).order('created_at', { ascending: true }).limit(500);
     await auditAdmin(request, admin, 'export_order', order.code);
     const { track_token, payment_url, stripe_session_id, tier_name, addon_names, ...fields } = order;   // keys, not personal data
     return json({
@@ -667,6 +822,8 @@ async function exportOrder(request, body, admin) {
         request: { ...fields, tier: tier_name, addons: addon_names },
         timeline: events.map(({ created_at, title, detail: d, client_visible }) => ({ created_at, title, detail: d, shown_to_client: client_visible })),
         files: files.map(({ filename, kind, size_bytes, sha256: h, created_at }) => ({ filename, kind, size_bytes, sha256: h || null, created_at })),
+        // What the client did on the request (views, downloads, replies). Network addresses are only stored as hashes.
+        client_activity: logErr ? null : (clientLog || []),
     });
 }
 
@@ -677,7 +834,7 @@ async function deleteOrder(request, body, admin) {
     if (order.legal_hold) {
         throw new HttpError(423, 'This order is under legal hold and cannot be deleted. Unlock legal hold first (that step is logged and emailed to you).');
     }
-    await requireStepUp(admin, body.totp);
+    await requireStepUp(admin, body.totp, request);
     if (String(body.confirm || '').trim().toUpperCase() !== order.code) throw new HttpError(400, `Type ${order.code} to confirm.`);
     const { data: fileRows, error } = await db().from('order_files').select('storage_path').eq('order_id', order.id);
     if (error) throw error;

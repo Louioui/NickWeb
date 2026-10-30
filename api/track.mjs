@@ -3,18 +3,22 @@
 //   POST { t, action: 'view' }                     -> order status, timeline, files
 //   POST { t, action: 'download', fileId }         -> short-lived download link
 //   POST { t, action: 'confirm-payment', session } -> checks Stripe after the client returns from paying
+//   POST { t, action: 'refresh-payment-link' }     -> a new 24-hour payment link once the old one has expired
 //   POST { t, action: 'respond', ...fields, files }-> answers "Action required"; returns upload links
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, hitRateLimit, peekRateLimit, text, longText, cleanFileList,
-         prepareUploads, confirmUploads, addEvent, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
+         prepareUploads, confirmUploads, addEvent, logClientAction, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
 import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, flagUnappliedPayment, sendEmail } from './_lib/orders.mjs';
 import { getClientSecurity, pinLocked } from './_lib/clients.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
+import { refreshPaymentLink } from './_lib/payments.mjs';
 
 // Unlocking a document-locked tracking page gives the browser a signed token that expires after 12 hours. It is tied
 // to this order and this link, so it stops working at once if the link is replaced, and it can't be reused elsewhere.
 const UNLOCK_HOURS = 12;
+// Open requests the client can still message Nick about.
+const OPEN_FOR_MESSAGES = ['received', 'awaiting_payment', 'paid', 'accepted', 'attempting', 'action_required'];
 const unlockSubject = (order) => `${order.id}|${order.track_token}`;
 const makeUnlockToken = (order) => signToken('track-unlock-v1', unlockSubject(order), UNLOCK_HOURS * 3600);
 function isOrderUnlocked(order, body) {
@@ -29,6 +33,7 @@ export const POST = handle(async (request) => {
     const unlocked = isOrderUnlocked(order, body);
 
     if (body.action === 'view') {
+        if (unlocked && order.doc_lock) await logClientAction(request, order, 'view_unlocked');
         return json(await clientView(order, { unlocked }));
     }
 
@@ -87,6 +92,7 @@ export const POST = handle(async (request) => {
         }
         const unlockToken = makeUnlockToken(order);
         const view = await clientView(order, { unlocked: true });
+        await logClientAction(request, order, 'unlock');
         return json({ ok: true, unlockToken, ...view });
     }
 
@@ -102,6 +108,7 @@ export const POST = handle(async (request) => {
         const updatedOrder = { ...order, doc_lock: nextLock };
         const unlockToken = nextLock ? makeUnlockToken(updatedOrder) : null;
         const view = await clientView(updatedOrder, { unlocked: true });
+        await logClientAction(request, order, 'unlock');
         return json({ ok: true, unlockToken, ...view });
     }
 
@@ -125,6 +132,16 @@ export const POST = handle(async (request) => {
         return json({ ok: true, token: newToken, trackUrl: `/track.html#t=${encodeURIComponent(newToken)}` });
     }
 
+    if (body.action === 'refresh-payment-link') {
+        // A fresh link for the amount already due, once the old 24-hour link has expired.
+        await rateLimit(`track-pay:${sha256(body.t)}`, 10, 900);
+        await rateLimit(`paylink-refresh-ip:${clientIp(request)}`, 10, 3600);
+        await rateLimit(`paylink-refresh:${order.id}`, 6, 3600);
+        const { url, fresh } = await refreshPaymentLink(order, siteOrigin(request));
+        if (fresh) await logClientAction(request, order, 'payment_link_refreshed');
+        return json({ ...await clientView(await orderByToken(body.t), { unlocked }), paymentUrl: url, fresh });
+    }
+
     if (body.action === 'download') {
         if (order.doc_lock && !unlocked) {
             throw new HttpError(403, '2-Step Document Protection is active. Verify your email code or Security PIN to download case documents.');
@@ -136,6 +153,7 @@ export const POST = handle(async (request) => {
         fileSha256 = fRow?.sha256 || null;
         // Chain of custody: every document opened from the tracking page is recorded (privately) in the sealed timeline.
         await addEvent(order.id, 'note', 'Document downloaded from tracking page', fRow?.filename || null, false);
+        await logClientAction(request, order, 'download', [fRow?.filename, fRow?.sha256 && `SHA-256 ${fRow.sha256}`].filter(Boolean).join(' · '));
         return json({ url, sha256: fileSha256, expiresInSeconds: 60 });
     }
 
@@ -190,14 +208,40 @@ export const POST = handle(async (request) => {
             `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
         ].filter(Boolean).join(' · ');
         await addEvent(order.id, 'action_response', 'You sent the requested information', summary || null);
+        await logClientAction(request, order, 'reply', `after ${attemptCount} attempt(s)`);
         const uploads = await prepareUploads(order.id, 'action_upload', files);
+        return json({ ok: true, uploads });
+    }
+
+    if (body.action === 'message') {
+        // A message (and optional files) to Nick on any open request, at any time. It doesn't change the status; Nick's
+        // list shows "Client replied" until he logs something after it.
+        await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
+        if (!OPEN_FOR_MESSAGES.includes(order.status)) throw new HttpError(409, 'This request is finished. Call Nick at (209) 922-6817 if you need anything.');
+        if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
+        const message = longText(body.message, { max: 2000, label: 'Your message' });
+        const files = cleanFileList(body.files);
+        if (!message && !files.length) throw new HttpError(400, 'Write a message or attach a file.');
+        const { count } = await db().from('order_events').select('id', { count: 'exact', head: true }).eq('order_id', order.id).eq('kind', 'attempt');
+        const attempts = typeof count === 'number' ? count : 0;
+        await addEvent(order.id, 'action_response', 'You sent a message', [message, `[Sent after ${attempts} attempt(s)]`].filter(Boolean).join(' · '));
+        await logClientAction(request, order, 'reply', `message after ${attempts} attempt(s)`);
+        const uploads = files.length ? await prepareUploads(order.id, 'action_upload', files) : [];
+        if (!uploads.length) {
+            await addEvent(order.id, 'note', 'Reply emailed', null, false);
+            await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
+                to, subject: `${order.code}: new message from ${order.client_name}`, heading: `${order.client_name} sent a message`,
+                lines: [`Request ${order.code} (${order.recipient_name}).`, message],
+                button: { label: 'Open in your dashboard', url: `${siteOrigin(request)}/admin.html#${order.id}` },
+            })));
+        }
         return json({ ok: true, uploads });
     }
 
     if (body.action === 'respond-finish') {
         if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Unlock it first.');
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
-        if (order.status !== 'received') return json(await clientView(order, { unlocked }));
+        if (!OPEN_FOR_MESSAGES.includes(order.status)) return json(await clientView(order, { unlocked }));
         const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
         // Told to the client too, so the page doesn't say "sent" for a file that isn't on the request yet.
         const fileStatus = { filesStillChecking: stillChecking, filesMissing: missing };
@@ -213,7 +257,7 @@ export const POST = handle(async (request) => {
         const origin = siteOrigin(request);
         await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
             to,
-            subject: `${order.code}: client sent the information you asked for`,
+            subject: `${order.code}: ${order.client_name} sent you something`,
             heading: `${order.client_name} responded`,
             lines: [`Request ${order.code} (${order.recipient_name}) is back in your queue.`, uploaded.length ? `${uploaded.length} new file(s) attached.` : 'No new files.',
                 ...(stillChecking ? [`${stillChecking} more file(s) could not be checked yet; they will appear on the order once checked.`] : []),

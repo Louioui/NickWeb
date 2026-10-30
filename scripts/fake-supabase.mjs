@@ -114,6 +114,17 @@ export function createFakeSupabase() {
             r.used = true;
             return true;
         },
+        // Same rules as the SQL function: one session's code, 5 guesses, 10 minutes; a correct code opens a 5-minute window.
+        use_admin_stepup_code: ({ p_token_hash, p_code_hash }) => {
+            const r = rows('admin_sessions').find(x => x.token_hash === p_token_hash);
+            if (!r || !r.stepup_code_hash || !r.stepup_expires_at || r.stepup_expires_at <= new Date().toISOString() || (r.stepup_attempts || 0) >= 5) return false;
+            if (r.stepup_code_hash === p_code_hash) {
+                Object.assign(r, { stepup_code_hash: null, stepup_expires_at: null, stepup_attempts: 0, last_step_up_at: new Date().toISOString() });
+                return true;
+            }
+            r.stepup_attempts = (r.stepup_attempts || 0) + 1;
+            return false;
+        },
         use_admin_totp_step: ({ p_email, p_step }) => {
             const r = rows('admin_totp').find(t => t.email === p_email);
             if (!r || (r.last_used_step || 0) >= p_step) return false;
@@ -133,6 +144,11 @@ export function createFakeSupabase() {
         download: async (p) => {
             if (state.failDownload.has(p) || !state.storage.has(p)) return { data: null, error: { message: 'download failed' } };
             return { data: new Blob([state.storage.get(p)]), error: null };
+        },
+        failUpdate: false,
+        update: async (p, bytes) => {
+            if (bucket.failUpdate) return { data: null, error: { message: 'update failed' } };
+            state.storage.set(p, new Uint8Array(bytes)); return { data: { path: p }, error: null };
         },
         remove: async (paths) => { paths.forEach(p => state.storage.delete(p)); return { data: [], error: null }; },
         createSignedUploadUrl: async (p) => ({ data: { signedUrl: `https://storage.test/upload/${p}` }, error: null }),

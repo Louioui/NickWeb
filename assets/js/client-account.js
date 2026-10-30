@@ -188,9 +188,9 @@
     function renderOrders() {
         const q = $('client-search').value.trim().toLowerCase();
         const done = o => ['served', 'closed', 'cancelled'].includes(o.status);
-        const shown = orders.filter(o => (filter === 'all' || (filter === 'done' ? done(o) : !done(o))) && (!q || [o.code, o.recipient, o.document].some(v => (v || '').toLowerCase().includes(q))));
+        const shown = orders.filter(o => (filter === 'all' || (filter === 'done' ? done(o) : !done(o))) && (!q || [o.code, o.recipient, o.document, o.label, o.reference].some(v => (v || '').toLowerCase().includes(q))));
         $('client-count').textContent = `${shown.length} ${shown.length === 1 ? 'request' : 'requests'}`;
-        $('client-orders').innerHTML = shown.length ? shown.map(o => `<a class="client-request" href="${esc(o.trackUrl)}"><div class="flex flex-wrap justify-between gap-3"><span class="text-xs text-muted">${esc(o.code)}</span><span class="status-pill ${done(o) || o.paid ? 'status-done' : o.status === 'action_required' ? 'status-alert' : 'status-live'}">${esc(o.label)}</span></div><h2 class="font-serif text-lg text-primary mt-3">${esc(o.recipient)}</h2><p class="text-sm text-muted mt-1">${esc(o.document)}</p><div class="flex flex-wrap justify-between gap-3 text-xs mt-4"><span>${esc(NPS.fmtDate(o.created, false))} · ${esc(o.service || '')}</span><span class="font-semibold text-primary">${esc(o.amount)} ${o.paid ? 'paid' : 'estimate / due'} · View request →</span></div></a>`).join('') : `<div class="p-8 text-center"><h2 class="font-serif text-xl text-primary mb-3">${orders.length ? 'No matching requests' : 'Your first request starts here'}</h2><p class="text-sm text-muted mb-5">${orders.length ? 'Try another name, reference or filter.' : 'Submit a service request using your verified email. It will appear here for updates, payment and proof.'}</p>${orders.length ? '<button id="clear-client-filter" type="button" class="btn btn-outline btn-sm">Show all requests</button>' : '<a href="/?client=1#checkout" class="btn btn-pine btn-sm">Start a request</a>'}</div>`;
+        $('client-orders').innerHTML = shown.length ? shown.map(o => `<a class="client-request" href="${esc(o.trackUrl)}"><div class="flex flex-wrap justify-between gap-3"><span class="text-xs text-muted">${esc(o.code)}</span><span class="status-pill ${done(o) || o.paid ? 'status-done' : o.status === 'action_required' ? 'status-alert' : 'status-live'}">${esc(o.label)}</span></div><h2 class="font-serif text-lg text-primary mt-3">${esc(o.recipient)}</h2><p class="text-sm text-muted mt-1">${esc(o.document)}</p><div class="flex flex-wrap justify-between gap-3 text-xs mt-4"><span>${esc(NPS.fmtDate(o.created, false))} · ${esc(o.service || '')}</span><span class="font-semibold text-primary">${esc(o.amount)} ${o.paid ? 'paid' : 'estimate / due'} · View request →</span></div></a>${o.paid ? `<button type="button" class="btn btn-outline btn-sm min-h-[44px] mx-5 mb-4" data-receipt="${esc(o.code)}" aria-label="Print or save the receipt for ${esc(o.code)}">Print / Save Receipt</button>` : ''}${o.reference ? `<p class="text-xs text-muted px-5 pb-3">Your matter / reference: ${esc(o.reference)}</p>` : ''}`).join('') : `<div class="p-8 text-center"><h2 class="font-serif text-xl text-primary mb-3">${orders.length ? 'No matching requests' : 'Your first request starts here'}</h2><p class="text-sm text-muted mb-5">${orders.length ? 'Try another name, reference or filter.' : 'Submit a service request using your verified email. It will appear here for updates, payment and proof.'}</p>${orders.length ? '<button id="clear-client-filter" type="button" class="btn btn-outline btn-sm">Show all requests</button>' : '<a href="/?client=1#checkout" class="btn btn-pine btn-sm">Start a request</a>'}</div>`;
         $('clear-client-filter')?.addEventListener('click', () => { filter = 'all'; $('client-search').value = ''; setFilterButtons(); renderOrders(); });
     }
     function setFilterButtons() { document.querySelectorAll('[data-client-filter]').forEach(btn => { btn.setAttribute('aria-pressed', String(btn.dataset.clientFilter === filter)); btn.classList.toggle('is-active', btn.dataset.clientFilter === filter); }); }
@@ -221,6 +221,48 @@
         catch (err) { $('client-feedback').textContent = 'Sign-out did not finish. Please try again.'; $('client-feedback').classList.remove('hidden'); }
         finally { $('client-logout').disabled = false; }
     };
+    // --- Records for a law firm's files: CSV export, every Proof of Service (each checked against its SHA-256), receipts ---
+    const recordsFeedback = (m, ok) => { const b = $('records-feedback'); b.textContent = m || ''; b.className = `result-box ${ok ? 'result-ok' : 'result-err'} text-sm`; b.classList.toggle('hidden', !m); };
+    $('client-csv').onclick = () => {
+        const csv = NPSField.ordersCsv(orders.map(o => ({ ...o, created: NPS.fmtDate(o.created, false), paidAt: o.paidAt ? NPS.fmtDate(o.paidAt, false) : '' })));
+        const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+        const a = Object.assign(document.createElement('a'), { href: url, download: `nicks-process-services-orders-${new Date().toISOString().slice(0, 10)}.csv` });
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+    };
+    $('client-proofs').onclick = async () => {
+        recordsFeedback(''); $('client-proofs').disabled = true;
+        try {
+            const { files } = await post('proof-links');
+            if (!files.length) { recordsFeedback('No Proof of Service files yet.', true); return; }
+            $('client-proof-list').replaceChildren(...files.map(f => {
+                const li = document.createElement('li');
+                li.className = 'flex flex-wrap items-center gap-3 rule-b pb-2';
+                const a = Object.assign(document.createElement('a'), { href: f.url, textContent: `${f.code} · ${f.name}`, className: 'text-primary underline underline-offset-2 min-h-[44px] inline-flex items-center' });
+                a.setAttribute('download', f.name);
+                const result = document.createElement('span');
+                result.setAttribute('role', 'status');
+                result.className = 'text-xs text-muted';
+                result.textContent = f.sha256 ? `SHA-256 ${f.sha256.slice(0, 16)}… · checking…` : 'No fingerprint recorded';
+                li.append(a, result);
+                if (f.sha256) NPS.verifyFileSha256(f.url, f.sha256).then(r => {
+                    result.textContent = r.ok ? 'Verified: matches sealed record (SHA-256)' : 'Does NOT match the sealed record. Call Nick.';
+                    result.className = `text-xs font-semibold ${r.ok ? 'text-primary' : 'text-[#7a1f1c]'}`;
+                }, (err) => { result.textContent = err.message; });
+                return li;
+            }));
+            recordsFeedback(`${files.length} file${files.length === 1 ? '' : 's'} ready. Links work for 60 seconds; tap each to save it.`, true);
+        } catch (err) { recordsFeedback(err.message); }
+        finally { $('client-proofs').disabled = false; }
+    };
+    $('client-orders').addEventListener('click', async (e) => {
+        const btn = e.target.closest('[data-receipt]');
+        if (!btn) return;
+        e.preventDefault();
+        try { NPS.printDocument(NPSField.receiptHtml((await post('receipt', { code: btn.dataset.receipt })).receipt)); }
+        catch (err) { recordsFeedback(err.message); }
+    });
+    $('client-logout-this').onclick = () => $('client-logout').click();
     NPS.onChange(() => { if (signedIn && !document.hidden) load(); });
     document.addEventListener('visibilitychange', () => { if (signedIn && !document.hidden) load(); });
     addEventListener('pageshow', e => { if (e.persisted) load(); });

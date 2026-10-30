@@ -428,6 +428,55 @@
     </div>
   </div>
 
+  <!-- New in this release -->
+  <p class="section-title">New: Field Tools &amp; Evidence (try these in the side-by-side view)</p>
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-green">📍</div>
+        <div><h2>9 · Nick in the Field</h2><div class="sub">Priority list, one-tap attempts, attempt windows, route</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>Open the dashboard and choose "Due today / Priority".</strong> NP-730264 (overdue) and NP-517309 (expedited, due within 48 hours) are pinned at the top with red badges. Every active job shows how many days since its last update.</span></li><li><span class="step-num">2</span><span class="step-text"><strong>Tap "Open route in Google Maps"</strong> to start turn-by-turn directions through up to 9 active jobs.</span></li><li><span class="step-num">3</span><span class="step-text"><strong>Open NP-517309.</strong> The attempt-window badges show morning and afternoon done, night still missing. In "Log attempt", tap a one-tap outcome (No answer, Served, Refused, Left with co-resident, Wrong / bad address); the time fills in for you.</span></li><li><span class="step-num">4</span><span class="step-text"><strong>Open NP-730264.</strong> It was left with a co-resident, so a "Substituted Service: mail a copy" reminder appears with a one-tap "Log copy mailed today".</span></li><li><span class="step-num">5</span><span class="step-text"><strong>Field timers:</strong> a stakeout timer that logs minutes to the timeline, and a 15-minute safe-walk check-in that emails an urgent alert if "I'm Safe" isn't tapped in time (keep the page open on the phone).</span></li>
+        </ul>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-gold">🧾</div>
+        <div><h2>10 · Billing, Receipts &amp; Proof Files</h2><div class="sub">Printing fee, fresh payment links, receipts, SHA-256 check</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>Open NP-218940 → Payment link.</strong> Its PDF has 130 pages, so the printing fee helper offers $4.50 (first 100 pages free, then $0.15/page). Page counts come from the PDF's structure and can be low for some files; check before billing.</span></li><li><span class="step-num">2</span><span class="step-text"><strong>"Send Fresh Payment Link"</strong> makes a new 24-hour Stripe link for the same amount once the old one expires, and reuses the old one while it still works. Clients have the same button on their tracking page.</span></li><li><span class="step-num">3</span><span class="step-text"><strong>Paid requests get "Print / Save Receipt"</strong> on the dashboard, the tracking page and the client portal, itemized by service, add-ons and printing.</span></li><li><span class="step-num">4</span><span class="step-text"><strong>On a tracking page with a Proof of Service (NP-894771)</strong>, tap "Verify File": the browser downloads the file, computes its SHA-256 and shows "Verified: matches sealed record (SHA-256)".</span></li><li><span class="step-num">5</span><span class="step-text"><strong>Clients can message Nick on any open request</strong>, with files. Nick's list shows "Client replied".</span></li>
+        </ul>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-blue">⚖️</div>
+        <div><h2>11 · Court Prep &amp; Disputes</h2><div class="sub">Evidence pack, diligence log, POS-010 review sheet</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>Open NP-894771 → Privacy → "Dispute &amp; Court Evidence Pack".</strong> One printout with the client's attestation, the Stripe payment reference, every attempt, each file's SHA-256 fingerprint, the timeline seal check, and when the client viewed and downloaded the proof.</span></li><li><span class="step-num">2</span><span class="step-text"><strong>"Print Diligence Log"</strong> lists every attempt (date, time, window, address, outcome, notes) for a Declaration of Due Diligence.</span></li><li><span class="step-num">3</span><span class="step-text"><strong>"Print POS-010 Draft Sheet"</strong> gathers the case number, court, party, address, date/time and manner of service in one place. It is a review aid; Nick still completes and signs the official Judicial Council form.</span></li>
+        </ul>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon icon-green">🔐</div>
+        <div><h2>12 · Security Hardening</h2><div class="sub">Emailed step-up, whole-file PDF scan, server-side photo cleaning</div></div>
+      </div>
+      <div class="card-body">
+        <ul class="steps">
+          <li><span class="step-num">1</span><span class="step-text"><strong>Sensitive actions confirm it's really Nick.</strong> With the authenticator app off, deleting a request, unlocking legal hold, new recovery codes, authenticator setup and passkey removal ask for an 8-digit code emailed to him (demo code 12345678). It then covers that device for 5 minutes.</span></li><li><span class="step-num">2</span><span class="step-text"><strong>PDF uploads are scanned end to end</strong> for code-running, program-launching, embedded-file and form-submit features, including names disguised with #xx escapes, and for hidden HTML/script.</span></li><li><span class="step-num">3</span><span class="step-text"><strong>Photos are cleaned on the server too.</strong> GPS and camera data are removed from JPEG, PNG, WebP and HEIC files even if someone uploads straight to storage, and the SHA-256 fingerprint is taken of the cleaned file.</span></li><li><span class="step-num">4</span><span class="step-text"><strong>"Secure your dashboard"</strong> walks Nick through the authenticator app, 8 recovery codes and Face ID; an amber banner appears when 3 or fewer recovery codes are left.</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
   <!-- Security summary -->
   <p class="section-title">Security Summary — What's Protected</p>
   <div class="grid grid-2">
