@@ -374,6 +374,7 @@ const handlers = {
     async client(req, body) {
         const action = body.action;
         if (String(action).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
+        if (action === 'get-notify' || action === 'set-notify') fail(503, 'Email preferences are not available in the demo.');
         if (action === 'send-code') {
             const addr = cleanEmail(body.email);
             const signup = body.intent === 'signup';
@@ -669,6 +670,9 @@ const handlers = {
     async admin(req, body) {
         const a = body.action;
         if (String(a).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
+        // Saved to their own database tables in production; the demo has none, so these say so (as production does
+        // before the Phase 3 migration is applied).
+        if (String(a).startsWith('safewalk') || String(a).startsWith('expense')) fail(503, 'This is not available in the demo.');
         if (a === 'send-code') {
             const addr = cleanEmail(body.email);
             if (MOCK_ADMIN_EMAILS.includes(addr)) {
@@ -896,6 +900,17 @@ const handlers = {
                 const window = hour < 12 ? 'morning' : hour < 19 ? 'afternoon/evening' : 'night';
                 if (['received', 'paid', 'accepted'].includes(o.status)) updateOrder(o, { status: 'attempting' });
                 addEvent(o.id, 'attempt', `Attempt (${window}): ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
+            } else if (body.kind === 'mailing') {
+                // Same as api/admin.mjs: the follow-up mailing after substituted service.
+                const date = String(body.date || '');
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) fail(400, 'Enter the mailing date.');
+                const city = cleanText(body.city, 80, true, 'City mailed from');
+                addEvent(o.id, 'note', 'Substituted service: follow-up mailing sent', `Mailed by first-class mail on ${date} from ${city}.`, true);
+            } else if (body.kind === 'stakeout') {
+                const start = Date.parse(body.start), end = Date.parse(body.end);
+                if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - start > 12 * 3600e3) fail(400, 'Check the stakeout start and end times.');
+                const minutes = Math.round((end - start) / 60e3);
+                addEvent(o.id, 'note', `Stakeout: ${minutes} min`, minutes > 60 ? `${minutes - 60} min past the first hour.` : null, body.clientVisible !== false);
             } else if (body.kind === 'note') {
                 if (!note) fail(400, 'Write a note first.');
                 addEvent(o.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);
