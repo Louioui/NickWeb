@@ -5,7 +5,7 @@ import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal, prefersDigest } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
-import { saveNickAnswers, listAnswers, ownAnswers, SURVEY_BODY_BYTES } from './_lib/surveys.mjs';
+import { saveNickAnswers, listAnswers, ownAnswers } from './_lib/surveys.mjs';
 import { getContact, setContact, activeWalk, startWalk, checkIn, alertOverdueWalks } from './_lib/safewalk.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 
@@ -13,7 +13,7 @@ const COOKIE = 'nps_admin';
 const SESSION_DAYS = 14;
 
 export const POST = handle(async (request) => {
-    const body = await readJson(request, SURVEY_BODY_BYTES);   // the largest request is Nick's 30 survey answers
+    const body = await readJson(request);
     const a = body.action;
     if (a === 'send-code') return sendCode(request, body);
     if (a === 'verify-code') return verifyCode(request, body);

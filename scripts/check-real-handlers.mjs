@@ -821,10 +821,11 @@ await check('S2 the feedback form traps bots, is rate limited, and refuses other
 });
 await check('S3 Nick has one set of answers he can update; reading answers needs his login', async () => {
     reset(); const cookie = adminCookie();
-    await adminAct({ action: 'survey-save', answers: { n01: 'Up at 6', c01: 'no' }, consent: true }, cookie);
-    await adminAct({ action: 'survey-save', answers: { n01: 'Up at 6, coffee first', n25: 'Route planning' }, consent: true }, cookie);
+    await adminAct({ action: 'survey-save', answers: { n01: 'Up at 6', n02: 'Phone', c01: 'no' }, consent: true, replace: true }, cookie);
+    await adminAct({ action: 'survey-save', answers: { n01: 'Up at 6, coffee first', n25: 'Route planning' }, consent: true, replace: true, cleared: ['n02'] }, cookie);
+    await adminAct({ action: 'survey-save', answers: { n30: 'Second batch' }, consent: true }, cookie);   // a later batch adds to the set
     const mine = surveyRows().filter(r => r.form === 'nick-v1');
-    expect(mine.length === 1 && mine[0].answers.n25 === 'Route planning' && !mine[0].answers.c01, JSON.stringify(mine));
+    expect(mine.length === 1 && mine[0].answers.n25 === 'Route planning' && mine[0].answers.n30 === 'Second batch' && !mine[0].answers.n02 && !mine[0].answers.c01, JSON.stringify(mine));
     expect((await adminAct({ action: 'survey-save', answers: { n01: 'x' }, consent: false }, cookie)).status === 400, 'saved without permission');
     await feedback({ answers: { c19: 'Great' }, consent: true });
     const list = await (await adminAct({ action: 'survey-list' }, cookie)).json();

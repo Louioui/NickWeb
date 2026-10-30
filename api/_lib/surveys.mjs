@@ -6,6 +6,8 @@ import { db, HttpError, text, email as cleanEmail } from './core.mjs';
 export const FORMS = { 'nick-v1': /^n(0[1-9]|[12]\d|30)$/, 'client-v1': /^c(0[1-9]|[12]\d|30)$/ };
 // The database allows 150,000 bytes of answers; a little under that leaves room for the JSON around them.
 const MAX_ANSWER_BYTES = 140000;
+// The public client form may send up to 200 KB (30 long answers pass the usual 64 KB). Nick's dashboard keeps 64 KB and
+// saves long answers in batches instead.
 export const SURVEY_BODY_BYTES = 200 * 1024;
 const PAGE = 100;
 const UNAVAILABLE = 'Saving answers is not set up yet. Please try again later.';
@@ -36,17 +38,23 @@ export async function saveClientAnswers({ answers, consent, name, email, ipHash 
     if (error) throw error;
 }
 
-// Nick has one set of answers, which he can come back and update.
-export async function saveNickAnswers(admin, { answers, consent }) {
+// Nick has one set of answers, which he can come back and update. Long answers arrive in several smaller saves (the
+// dashboard API takes at most 64 KB a request): each save replaces the questions it carries; `cleared` lists questions
+// he emptied, and `replace: true` (the first batch) starts the set again from just this batch.
+export async function saveNickAnswers(admin, { answers, consent, cleared, replace }) {
     if (consent !== true) throw new HttpError(400, 'Please tick the box to give permission to use your answers.');
     const now = new Date().toISOString();
-    const clean = cleanAnswers('nick-v1', answers);
-    const { data: existing, error: rErr } = await db().from('survey_responses').select('id').eq('form', 'nick-v1').eq('respondent', admin).maybeSingle();
+    const { data: existing, error: rErr } = await db().from('survey_responses').select('id, answers').eq('form', 'nick-v1').eq('respondent', admin).maybeSingle();
     if (missing(rErr)) throw new HttpError(503, UNAVAILABLE);
     if (rErr) throw rErr;
+    const merged = { ...(replace || !existing ? {} : existing.answers || {}) };
+    for (const id of Array.isArray(cleared) ? cleared : []) if (FORMS['nick-v1'].test(id)) delete merged[id];
+    Object.assign(merged, answers && Object.keys(answers).length ? cleanAnswers('nick-v1', answers) : {});
+    if (!Object.keys(merged).length) throw new HttpError(400, 'Please answer at least one question.');
+    if (Buffer.byteLength(JSON.stringify(merged), 'utf8') > MAX_ANSWER_BYTES) throw new HttpError(400, 'Your answers are too long to save. Please shorten the longest ones.');
     const { error } = existing
-        ? await db().from('survey_responses').update({ answers: clean, consent: true, updated_at: now }).eq('id', existing.id)
-        : await db().from('survey_responses').insert({ form: 'nick-v1', respondent: admin, answers: clean, consent: true });
+        ? await db().from('survey_responses').update({ answers: merged, consent: true, updated_at: now }).eq('id', existing.id)
+        : await db().from('survey_responses').insert({ form: 'nick-v1', respondent: admin, answers: merged, consent: true });
     if (error) throw error;
 }
 

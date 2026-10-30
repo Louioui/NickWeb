@@ -108,10 +108,20 @@
         }
         if (e.target.closest('[data-sv-save]')) {
             const b = e.target.closest('[data-sv-save]'), msg = $('sv-msg');
-            const answers = Object.fromEntries([...document.querySelectorAll('[data-sv]')].map(el => [el.dataset.sv, el.value.trim()]).filter(([, v]) => v));
+            const all = [...document.querySelectorAll('[data-sv]')].map(el => [el.dataset.sv, el.value.trim()]);
+            const answers = Object.fromEntries(all.filter(([, v]) => v));
+            const cleared = all.filter(([, v]) => !v).map(([k]) => k);
+            // The dashboard takes requests up to 64 KB, so long answers go in batches of about 40 KB.
+            const batches = [];
+            for (const [k, v] of Object.entries(answers)) {
+                const last = batches.at(-1);
+                if (!last || new Blob([JSON.stringify({ ...last, [k]: v })]).size > 40000) batches.push({ [k]: v }); else last[k] = v;
+            }
             b.disabled = true;
             try {
-                await api('survey-save', { answers, consent: $('sv-consent').checked });
+                const consent = $('sv-consent').checked;
+                if (!batches.length) await api('survey-save', { answers: {}, consent, cleared, replace: true });
+                for (let i = 0; i < batches.length; i++) await api('survey-save', { answers: batches[i], consent, replace: i === 0, ...(i === 0 ? { cleared } : {}) });
                 await load();
                 typed = null;   // saved: the form now shows what's on the server
                 msg.className = 'result-box result-ok text-sm'; const n = Object.keys(answers).length; msg.textContent = `Saved ${n} answer${n === 1 ? '' : 's'}. Your developer can read them now.`;

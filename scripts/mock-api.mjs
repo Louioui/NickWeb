@@ -849,9 +849,11 @@ const handlers = {
         }
         if (a === 'survey-save') {
             if (body.consent !== true) fail(400, 'Please tick the box to give permission to use your answers.');
-            const answers = cleanMockAnswers(/^n(0[1-9]|[12]\d|30)$/, body.answers);
-            if (!Object.keys(answers).length) fail(400, 'Please answer at least one question.');
             const mine = mockSurveys.find(r => r.form === 'nick-v1' && r.respondent === adminEmail);
+            // Same as saveNickAnswers: batches add to the set; the first batch (replace) starts it again.
+            const answers = { ...(body.replace || !mine ? {} : mine.answers), ...cleanMockAnswers(/^n(0[1-9]|[12]\d|30)$/, body.answers) };
+            for (const id of Array.isArray(body.cleared) ? body.cleared : []) delete answers[id];
+            if (!Object.keys(answers).length) fail(400, 'Please answer at least one question.');
             if (mine) Object.assign(mine, { answers, updated_at: now() });
             else mockSurveys.push({ id: randomUUID(), form: 'nick-v1', respondent: adminEmail, answers, created_at: now(), updated_at: now() });
             return json({ ok: true });
