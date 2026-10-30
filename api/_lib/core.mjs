@@ -1,6 +1,7 @@
 // Shared server code for the /api functions: database client, HTTP helpers, tokens, rate limits.
 // Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
 import { createClient } from '@supabase/supabase-js';
+import { stripPhotoBytes } from './photo-metadata.mjs';
 import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
@@ -443,7 +444,18 @@ export async function inspectStoredFile(path, filename) {
         const { data: blob, error: dErr } = await db().storage.from(BUCKET).download(path);
         if (dErr || !blob) return { state: 'unknown' };
         const buf = Buffer.from(await blob.arrayBuffer());
-        return verifyFileMagic(buf, filename) ? { state: 'ok', sha256: sha256(buf) } : { state: 'bad' };
+        if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
+        const ext = filename.split('.').pop().toLowerCase();
+        const type = TYPE_BY_EXT[ext];
+        if (!type?.startsWith('image/')) return { state: 'ok', sha256: sha256(buf) };
+        const scrubbed = stripPhotoBytes(buf, type);
+        if (!scrubbed || !verifyFileMagic(scrubbed, filename)) return { state: 'bad' };
+        const clean = Buffer.from(scrubbed);
+        if (!clean.equals(buf)) {
+            const { error: uploadErr } = await db().storage.from(BUCKET).upload(path, clean, { contentType: type, upsert: true });
+            if (uploadErr) return { state: 'unknown' };
+        }
+        return { state: 'ok', sha256: sha256(clean) };
     } catch {
         return { state: 'unknown' };
     }

@@ -278,6 +278,26 @@ await check('F-04 a good file is still confirmed with its fingerprint', async ()
     const done = await core.confirmUploads(o.id, [f.id]);
     expect(done.files.length === 1 && done.stillChecking === 0 && fileRow(f.id).uploaded && /^[0-9a-f]{64}$/.test(fileRow(f.id).sha256 || ''), 'good file not confirmed');
 });
+await check('F-11 direct JPEG upload is scrubbed in Storage before fingerprinting', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'photo.jpg' });
+    const payload = Buffer.from('Exif\0\0GPS 37.9577N');
+    const image = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0, payload.length + 2]), payload,
+        Buffer.from([0xff, 0xda, 1, 2, 3, 0xff, 0xd9])]);
+    db.__state.storage.set(f.storage_path, image);
+    const done = await core.confirmUploads(o.id, [f.id]);
+    const stored = Buffer.from(db.__state.storage.get(f.storage_path));
+    expect(done.files.length === 1 && !stored.includes(Buffer.from('GPS')), 'GPS metadata remained in stored image');
+    expect(fileRow(f.id).sha256 === core.sha256(stored), 'fingerprint does not match scrubbed bytes');
+});
+await check('F-11 failed Storage replacement keeps a photo unconfirmed for retry', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'photo.jpg' });
+    const payload = Buffer.from('Exif\0\0GPS');
+    db.__state.storage.set(f.storage_path, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0, payload.length + 2]), payload,
+        Buffer.from([0xff, 0xda, 1, 2, 3, 0xff, 0xd9])]));
+    db.__state.failUpload.add(f.storage_path);
+    const done = await core.confirmUploads(o.id, [f.id]);
+    expect(done.stillChecking === 1 && !fileRow(f.id).uploaded, 'photo was confirmed although metadata rewrite failed');
+});
 await check('F-04 a file that never reached storage is counted as missing, not "still being checked"', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o);
     db.__state.storage.delete(f.storage_path);
@@ -392,6 +412,16 @@ await check('F-10 HTML appended to the end of a PNG is refused', async () => {
 });
 const cron = () => keepaliveGET(new Request('https://site.test/api/keepalive', { headers: { authorization: 'Bearer test-cron' } }));
 const dayOld = new Date(Date.now() - 2 * 864e5).toISOString();
+await check('F-11 daily recovery also scrubs direct photo uploads before confirmation', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'photo.jpg', created_at: dayOld });
+    const payload = Buffer.from('Exif\0\0GPS 37.9577N');
+    db.__state.storage.set(f.storage_path, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0, payload.length + 2]), payload,
+        Buffer.from([0xff, 0xda, 1, 2, 3, 0xff, 0xd9])]));
+    const response = await cron();
+    const stored = Buffer.from(db.__state.storage.get(f.storage_path));
+    expect(response.status === 200 && fileRow(f.id)?.uploaded, 'daily recovery did not confirm cleaned photo');
+    expect(!stored.includes(Buffer.from('GPS')) && fileRow(f.id).sha256 === core.sha256(stored), 'daily recovery kept GPS data or wrong hash');
+});
 await check('F-04 daily cleanup keeps a file row when storage cannot be reached', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o, { created_at: dayOld });
     db.__state.failExists.add(f.storage_path);

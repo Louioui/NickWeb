@@ -4,6 +4,7 @@
 import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken } from '../api/_lib/orders.mjs';
 import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
+import { stripPhotoBytes } from '../api/_lib/photo-metadata.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
 export const MOCK_CLIENT_CODE = '123456';
@@ -290,6 +291,13 @@ function confirmUploads(orderId, ids) {
         if (!verifyFileMagic(f.data, f.filename)) {
             files.delete(f.id);
             continue;
+        }
+        const ext = f.filename.split('.').pop().toLowerCase();
+        const type = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif' }[ext];
+        if (type) {
+            const clean = stripPhotoBytes(f.data, type);
+            if (!clean || !verifyFileMagic(clean, f.filename)) { files.delete(f.id); continue; }
+            f.data = clean;
         }
         f.uploaded = true;
         if (!f.sha256) f.sha256 = sha256Hex(f.data);

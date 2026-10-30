@@ -10,6 +10,7 @@ export function createFakeSupabase() {
         tables: {},
         storage: new Map(),          // path -> Uint8Array
         failDownload: new Set(),     // paths whose download returns an error
+        failUpload: new Set(),       // paths whose scrubbed replacement upload fails
         failExists: new Set(),       // paths whose info() fails with an auth error (storage unusable, not "missing")
         noBucket: new Set(),         // paths whose info() fails with "Bucket not found"
         rateHits: new Map(),
@@ -143,6 +144,8 @@ export function createFakeSupabase() {
             return { data: new Blob([state.storage.get(p)]), error: null };
         },
         remove: async (paths) => { paths.forEach(p => state.storage.delete(p)); return { data: [], error: null }; },
+        upload: async (p, data) => state.failUpload.has(p) ? { data: null, error: { message: 'upload failed' } }
+            : (state.storage.set(p, Buffer.from(data)), { data: { path: p }, error: null }),
         createSignedUploadUrl: async (p) => ({ data: { signedUrl: `https://storage.test/upload/${p}` }, error: null }),
         createSignedUrl: async (p) => ({ data: { signedUrl: `https://storage.test/download/${p}` }, error: null }),
     };

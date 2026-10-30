@@ -8,6 +8,7 @@ const source = await readFile(new URL('../assets/js/nps.js', import.meta.url), '
 const context = { window: {}, TextDecoder, TextEncoder, DataView, Uint8Array, File, fetch: () => {} };
 vm.runInNewContext(`${source}\nthis.NPS = NPS;`, context);
 const { stripPhotoBytes } = context.NPS;
+const { stripPhotoBytes: stripServerPhotoBytes } = await import('../api/_lib/photo-metadata.mjs');
 
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -91,6 +92,22 @@ check('JPEG: EXIF and comment segments removed, image data kept', () => {
 check('Unexpected structure uploads the original instead of a damaged file', () => {
     assert.equal(stripPhotoBytes(bytes('not a png at all'), 'image/png'), null);
     assert.equal(stripPhotoBytes(bytes('RIFF\x04\0\0\0XXXX'), 'image/webp'), null);
+});
+check('server scrubber matches browser scrubber for JPEG, PNG, WebP and HEIC', () => {
+    for (const [input, type] of [[jpeg, 'image/jpeg'], [png, 'image/png'], [webp, 'image/webp'], [heic, 'image/heic']]) {
+        assert.deepEqual([...stripServerPhotoBytes(input, type)], [...stripPhotoBytes(input, type)], type);
+    }
+});
+check('server scrubber fails closed on truncated JPEG and PNG containers', () => {
+    assert.equal(stripServerPhotoBytes(bytes([0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff]), 'image/jpeg'), null);
+    assert.equal(stripServerPhotoBytes(png.subarray(0, png.length - 5), 'image/png'), null);
+});
+check('server scrubber rejects malformed HEIC GPS offsets', () => {
+    const malformed = heic.slice();
+    const t = 24 + 6;
+    malformed[t + 4] = 0xff;
+    malformed[t + 5] = 0xff;
+    assert.equal(stripServerPhotoBytes(malformed, 'image/heic'), null);
 });
 
 console.log(`${passed} photo metadata checks passed`);
