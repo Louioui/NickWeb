@@ -83,6 +83,8 @@ const proofFile = detailData.files.find(f => f.kind === 'proof');
 check('Proof of Service has a verified 64-char SHA-256 chain-of-custody fingerprint in admin view', () => {
     assert.ok(proofFile && /^[0-9a-f]{64}$/.test(proofFile.sha256));
 });
+// Orders start with the document lock on, so Nick turns it off for this order before reading the client's view.
+await call({ action: 'toggle-doc-lock', id: servedOrder.id, locked: false }, nickCookie, 'admin');
 const trackData = await (await call({ action: 'view', t: detailData.order.track_token }, '', 'track')).json();
 check('Proof of Service exposes matching SHA-256 fingerprint on client tracking view', () => {
     const clientProof = trackData.files.find(f => f.kind === 'proof');

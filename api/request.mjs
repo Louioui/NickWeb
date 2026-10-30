@@ -49,6 +49,8 @@ export const POST = handle(async (request) => {
         tier: body.tier,
         addons,
         estimated_total_cents: cents,
+        // Document lock is on by default: a forwarded tracking link shows status only until the client enters a code.
+        doc_lock: true,
     };
 
     await rateLimit(`request-email:${sha256(row.client_email)}`, 5, 3600);

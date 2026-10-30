@@ -1050,7 +1050,7 @@ function createOrder(fields, createdAt = now()) {
     const o = {
         id: randomUUID(), code: 'NP-' + randomInt(100000, 1000000), track_token: token(), status: 'received',
         created_at: createdAt, updated_at: createdAt, amount_due_cents: null, payment_url: null, stripe_session_id: null,
-        paid_at: null, action_note: null, served_at: null, ...fields,
+        paid_at: null, action_note: null, served_at: null, doc_lock: true, ...fields,
     };
     orders.set(o.id, o);
     return o;

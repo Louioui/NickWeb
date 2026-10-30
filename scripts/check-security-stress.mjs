@@ -159,7 +159,8 @@ await step('/api/track rejects all SQLi & PostgREST payloads in token, fileId, s
             assert.equal(res.status, 404, `Track token SQLi must return 404, got ${res.status} for ${payload}`);
             totalAssertions++;
         }
-        // Valid token + SQLi in fileId (download)
+        // Valid token + SQLi in fileId (download). Orders start locked, so Nick unlocks this one first.
+        await callMock('admin', { action: 'toggle-doc-lock', id: actionOrder.id, locked: false }, adminCookie);
         const dl = await callMock('track', { t: validToken, action: 'download', fileId: payload });
         assert.equal(dl.status, 404, `Track download fileId SQLi must return 404, got ${dl.status}`);
         // Valid token + SQLi in Stripe session ID (confirm-payment)
@@ -331,7 +332,9 @@ await step('/api/request blocks SQLi in structured fields and stores SQLi string
     const trackRes = await callMock('track', { t: created.token, action: 'view' });
     assert.equal(trackRes.status, 200);
     const tracked = await trackRes.json();
-    assert.equal(tracked.recipient, sqliText);
+    // The order starts locked, so the client's view shows only the first word of the name, followed by a mask.
+    // That word must still be the literal text (no SQL was executed).
+    assert.equal(tracked.recipient, "O'Connor'; ••••");
     assert.equal(tracked.estimate, '$90.00'); // Standard ($75) + Photo ($15), injected addons ignored
 });
 
@@ -651,8 +654,9 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
 
     const viewAfterUpload = await (await callMock('track', { t: createRes.token, action: 'view' })).json();
     assert.equal(viewAfterUpload.files.length, 1, 'Disguised HTML-as-PDF must be purged and only genuine PDF kept');
-    assert.equal(viewAfterUpload.files[0].name, 'genuine-summons.pdf');
-    assert.match(viewAfterUpload.files[0].sha256, /^[0-9a-f]{64}$/);
+    // Orders start locked: the client sees a generic file label and no fingerprint until they unlock.
+    assert.equal(viewAfterUpload.files[0].name, 'Document (locked)');
+    assert.equal(viewAfterUpload.files[0].sha256, null);
     totalAssertions += 4;
 
     // 11c. Admin concurrent session cap (max 5 active sessions per admin; 6th login evicts the 1st)

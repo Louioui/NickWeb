@@ -269,6 +269,15 @@ await check('P27 Nick sees his signed-in devices and can sign out another one, b
     expect(gone.status === 401, `revoked device still signed in (${gone.status})`);
     expect(tables().admin_sessions.some(s => s.email === 'someone@else.test'), "another admin's session was touched");
 });
+await check('Option 2: a new request starts with the document lock on', async () => {
+    reset();
+    const { POST: requestPOST } = await import('../api/request.mjs');
+    const res = await requestPOST(post('/api/request', { step: 'create', clientName: 'Lock Default', clientEmail: CLIENT, clientPhone: '209-555-0100', recipientName: 'Lock Target', docType: 'Other Legal Document', address: '1 Test Rd', city: 'Stockton', zip: '95202', tier: 'standard', addons: [], acceptTerms: true, files: [] }));
+    const body = await res.json();
+    expect(res.status === 200 && body.code, `create failed (${res.status} ${JSON.stringify(body)})`);
+    const row = tables().orders.find(o => o.code === body.code);
+    expect(row && row.doc_lock === true, `doc_lock = ${row?.doc_lock}`);
+});
 await check('F-04 the tracking page is told when a reply file is still being checked', async () => {
     reset(); const o = seedOrder({ status: 'received' }); const slow = seedFile(o, { kind: 'action_upload' });
     db.__state.failDownload.add(slow.storage_path);
