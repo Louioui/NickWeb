@@ -894,6 +894,10 @@ const handlers = {
             const cents = Math.round(Number(body.amount) * 100);
             if (!Number.isFinite(cents) || cents < 100 || cents > 1000000) fail(400, 'Enter an amount between $1 and $10,000.');
             if (o.paid_at) fail(409, 'This order is already paid.');
+            if (o.stripe_session_id?.startsWith('cs_') &&
+                (!o.payment_url || new URL(o.payment_url, 'http://localhost').searchParams.get('s') !== o.stripe_session_id)) {
+                fail(503, 'The current payment link could not be verified. Contact support before replacing it.');
+            }
             const description = cleanText(body.description, 300, false, 'Description');
             const session = `cs_mock_${randomBytes(6).toString('hex')}`;
             updateOrder(o, { ...(o.legal_hold ? {} : { status: 'awaiting_payment' }), amount_due_cents: cents, stripe_session_id: session,
@@ -1014,6 +1018,9 @@ export async function handleMockRoute(req) {
     if (route === '__mock-pay') {
         const o = [...orders.values()].find(o => o.track_token === url.searchParams.get('t'));
         if (!o) return new Response('Unknown order', { status: 404 });
+        if (url.searchParams.get('s') !== o.stripe_session_id || o.paid_at) {
+            return new Response('This payment link has expired. Open your tracking page for the current link.', { status: 410 });
+        }
         const back = `/track.html#t=${encodeURIComponent(o.track_token)}`;
         const paidBack = (s) => `/track.html?paid=${encodeURIComponent(s)}#t=${encodeURIComponent(o.track_token)}`;   // same shape as api/_lib/stripe.mjs
         return page(`Test checkout`, `

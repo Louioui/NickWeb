@@ -12,7 +12,12 @@ const stripeSessions = new Map();
 class FakeStripe {
     constructor() {
         this.webhooks = { constructEventAsync: async (raw) => JSON.parse(raw) };
-        this.checkout = { sessions: { retrieve: async (id) => stripeSessions.get(id) || { id, payment_status: 'unpaid', metadata: {} }, expire: async () => ({}) } };
+        this.checkout = { sessions: { retrieve: async (id) => { const row = stripeSessions.get(id); if (row instanceof Error) throw row; return row || { id, payment_status: 'unpaid', metadata: {} }; },
+            expire: async (id) => { const row = stripeSessions.get(id); if (row?.expireError) throw new Error('Stripe expiry failed'); if (row) row.status = 'expired'; return row || {}; },
+            create: async (params) => { const id = `cs_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+                const row = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid',
+                    metadata: params.metadata, amount_total: params.line_items[0].price_data.unit_amount };
+                stripeSessions.set(id, row); return row; } } };
     }
 }
 mock.module('@supabase/supabase-js', { namedExports: { createClient: () => db } });
@@ -375,6 +380,32 @@ const adminCookie = () => {
     (tables().admin_sessions ||= []).push({ token_hash: core.sha256(token), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString() });
     return `nps_admin=${token}`;
 };
+await check('payment link replacement stops when Stripe cannot verify or close the old link', async () => {
+    for (const failure of ['lookup', 'expire', 'mismatch']) {
+        reset(); const id = 'cs_test_oldlink123';
+        const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+            payment_url: 'https://checkout.stripe.com/c/pay/old' });
+        stripeSessions.set(id, failure === 'lookup' ? new Error('Stripe unavailable') :
+            { id, status: 'open', payment_status: 'unpaid', metadata: { order_id: failure === 'mismatch' ? randomUUID() : o.id },
+                expireError: failure === 'expire' });
+        const res = await adminPOST(post('/api/admin', { action: 'payment-link', id: o.id, amount: '75.00' }, { cookie: adminCookie() }));
+        expect(res.status === 503, `${failure} returned ${res.status}`);
+        expect(o.stripe_session_id === id && o.amount_due_cents === 7500 && emails.length === 0, `${failure} replaced the old link`);
+    }
+});
+await check('concurrent payment-link replacements keep only one new session payable', async () => {
+    reset(); const id = 'cs_test_oldlink123';
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+        payment_url: 'https://checkout.stripe.com/c/pay/old' });
+    stripeSessions.set(id, { id, status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    const cookie = adminCookie();
+    const results = await Promise.all(['80.00', '90.00'].map(amount => adminPOST(post('/api/admin',
+        { action: 'payment-link', id: o.id, amount }, { cookie }))));
+    expect(results.filter(r => r.status === 200).length === 1 && results.filter(r => r.status === 409).length === 1,
+        `concurrent results ${results.map(r => r.status)}`);
+    const open = [...stripeSessions.values()].filter(s => s.status === 'open');
+    expect(open.length === 1 && open[0].id === o.stripe_session_id, 'orphaned session remained payable');
+});
 await check('dashboard last-contact date follows the latest client exchange', async () => {
     reset();
     const created = new Date(Date.now() - 5 * 864e5).toISOString();

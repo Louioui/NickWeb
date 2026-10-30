@@ -617,18 +617,34 @@ async function paymentLink(request, body, admin) {
     // A new link replaces the old one. If the client already paid the old one, record that and stop;
     // otherwise close it, so they can't end up paying twice.
     if (order.stripe_session_id?.startsWith('cs_')) {
-        const old = await stripeClient().checkout.sessions.retrieve(order.stripe_session_id).catch(() => null);
+        let old;
+        try { old = await stripeClient().checkout.sessions.retrieve(order.stripe_session_id); }
+        catch { throw new HttpError(503, 'Stripe could not confirm the current payment link. Try again shortly.'); }
+        if (!old || old.id !== order.stripe_session_id || old.metadata?.order_id !== order.id) {
+            throw new HttpError(503, 'The current payment link could not be verified. Contact support before replacing it.');
+        }
         if (old?.payment_status === 'paid') {
             await markPaid(order.id, old.amount_total, old.id);
             throw new HttpError(409, 'The client already paid the previous link. Refresh to see it.');
         }
-        if (old?.status === 'open') await stripeClient().checkout.sessions.expire(old.id).catch(() => {});
+        if (old.status === 'open') {
+            try { await stripeClient().checkout.sessions.expire(old.id); }
+            catch { throw new HttpError(503, 'Stripe could not close the current payment link. Try again shortly.'); }
+        } else if (old.status !== 'expired') {
+            throw new HttpError(409, 'The current payment link has a pending payment. Check Stripe before replacing it.');
+        }
     }
     const session = await createCheckout(order, cents, description, origin);
     // A served order (under legal hold) keeps its "Served" status while it's billed; the Pay button still shows.
-    const { error: linkErr } = await db().from('orders').update({ amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id,
-        ...(order.legal_hold ? {} : { status: 'awaiting_payment' }) }).eq('id', order.id);
-    if (linkErr) throw linkErr;   // never email a payment link the system didn't record
+    let save = db().from('orders').update({ amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id,
+        ...(order.legal_hold ? {} : { status: 'awaiting_payment' }) }).eq('id', order.id).is('paid_at', null);
+    save = order.stripe_session_id ? save.eq('stripe_session_id', order.stripe_session_id) : save.is('stripe_session_id', null);
+    const { data: saved, error: linkErr } = await save.select('id').maybeSingle();
+    if (linkErr || !saved) {
+        await stripeClient().checkout.sessions.expire(session.id).catch(() => {});
+        if (linkErr) throw linkErr;
+        throw new HttpError(409, 'The payment link changed while this one was being prepared. Refresh and try again.');
+    }
     await addEvent(order.id, 'payment', `Payment requested: ${money(cents)}`, description);
     await auditAdmin(request, admin, 'payment_link', order.code, money(cents));
     await sendEmail({

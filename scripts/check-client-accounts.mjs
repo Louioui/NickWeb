@@ -1,6 +1,6 @@
 // Account boundaries in the isolated mock plus the production identity/cookie helpers. No network or live data.
 import assert from 'node:assert/strict';
-import { handleMockApi } from './mock-api.mjs';
+import { handleMockApi, handleMockRoute } from './mock-api.mjs';
 import { verifiedClient, clientCookie, savedClientSession, clientProfile } from '../api/_lib/clients.mjs';
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -88,6 +88,15 @@ check('logout-all invalidates all active admin sessions for that admin', () => {
 
 const nickLogin = await call({ action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '12345678' }, '', 'admin');
 const nickCookie = nickLogin.headers.get('set-cookie').split(';')[0];
+const brokenLink = await (await call({ action: 'list' }, nickCookie, 'admin')).json();
+const paymentJob = brokenLink.orders.find(o => o.code === 'NP-403182');
+const firstLink = await (await call({ action: 'get', id: paymentJob.id }, nickCookie, 'admin')).json();
+const replacedLink = await call({ action: 'payment-link', id: paymentJob.id, amount: '175.00' }, nickCookie, 'admin');
+assert.equal(replacedLink.status, 200);
+const afterReplace = await (await call({ action: 'get', id: paymentJob.id }, nickCookie, 'admin')).json();
+assert.notEqual(firstLink.order.stripe_session_id, afterReplace.order.stripe_session_id);
+assert.equal((await handleMockRoute(new Request(`http://localhost${firstLink.order.payment_url}`))).status, 410);
+passed++; console.log('PASS mock payment link replacement invalidates the old session');
 const listData = await (await call({ action: 'list' }, nickCookie, 'admin')).json();
 check('mock active jobs include a last client contact date', () => {
     assert.ok(listData.orders.filter(o => !['served', 'closed', 'cancelled'].includes(o.status)).every(o =>
