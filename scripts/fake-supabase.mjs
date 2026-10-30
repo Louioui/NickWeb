@@ -11,6 +11,7 @@ export function createFakeSupabase() {
         storage: new Map(),          // path -> Uint8Array
         failDownload: new Set(),     // paths whose download returns an error
         failUpload: new Set(),       // paths whose scrubbed replacement upload fails
+        failEventInsert: false,      // fail the next timeline insert to exercise transaction recovery
         failExists: new Set(),       // paths whose info() fails with an auth error (storage unusable, not "missing")
         noBucket: new Set(),         // paths whose info() fails with "Bucket not found"
         rateHits: new Map(),
@@ -49,6 +50,10 @@ export function createFakeSupabase() {
             const match = all.filter(r => this.filters.every(f => f(r)));
             let out;
             if (this.op === 'insert' || this.op === 'upsert') {
+                if (this.op === 'insert' && this.table === 'order_events' && state.failEventInsert) {
+                    state.failEventInsert = false;
+                    return { data: null, error: { message: 'simulated timeline insert failure' } };
+                }
                 // Like Postgres, a plain insert of an existing primary key fails with 23505 and writes nothing.
                 const key = PRIMARY_KEY[this.table];
                 if (this.op === 'insert' && key && this.payload.some(p => all.some(r => r[key] === p[key]))) {
@@ -129,6 +134,22 @@ export function createFakeSupabase() {
             r.last_used_step = p_step;
             return true;
         },
+        record_paid_order: ({ p_order, p_amount_cents, p_session_id }) => {
+            const r = rows('orders').find(o => o.id === p_order);
+            if (!r || r.paid_at || (r.stripe_session_id && r.stripe_session_id !== p_session_id) ||
+                (r.amount_due_cents != null && p_amount_cents < r.amount_due_cents) ||
+                !Number.isSafeInteger(p_amount_cents) || p_amount_cents <= 0 || !/^cs_[A-Za-z0-9_]{8,128}$/.test(p_session_id)) return false;
+            if (state.failEventInsert) {
+                state.failEventInsert = false;
+                throw new Error('simulated timeline insert failure');
+            }
+            r.paid_at = new Date().toISOString();
+            r.stripe_session_id = p_session_id;
+            if (!r.legal_hold) r.status = 'paid';
+            rows('order_events').push({ id: randomUUID(), order_id: p_order, kind: 'payment',
+                title: `Payment received: $${(p_amount_cents / 100).toFixed(2)}`, client_visible: true, created_at: new Date().toISOString() });
+            return true;
+        },
     };
 
     const bucket = {
@@ -153,7 +174,10 @@ export function createFakeSupabase() {
     const authError = (message, code) => ({ message, code, status: 401 });
     const client = {
         from: (t) => new Query(t),
-        rpc: async (name, args) => ({ data: rpcs[name](args), error: null }),
+        rpc: async (name, args) => {
+            try { return { data: rpcs[name](args), error: null }; }
+            catch (error) { return { data: null, error }; }
+        },
         storage: { from: () => bucket },
         auth: {
             signInWithOtp: async () => ({ data: {}, error: null }),
@@ -210,8 +234,9 @@ export function createFakeSupabase() {
     client.__state = state;
     client.__reset = () => {
         state.tables = {};
-        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
+        for (const k of ['storage', 'failDownload', 'failUpload', 'failExists', 'noBucket', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
         state.revoked = [];
+        state.failEventInsert = false;
     };
     client.__addUser = (email) => {
         const user = { id: randomUUID(), email, email_confirmed_at: new Date().toISOString(), user_metadata: {} };

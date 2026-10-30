@@ -147,19 +147,12 @@ export function canMarkPaid(order, amountCents, sessionId) {
 
 export async function markPaid(orderId, amountCents, sessionId) {
     uuid(orderId, 'Order');
-    const { data: order, error } = await db().from('orders').select('id, status, paid_at, stripe_session_id, amount_due_cents, legal_hold').eq('id', orderId).maybeSingle();
+    const cents = Number(amountCents);
+    if (!Number.isSafeInteger(cents) || cents <= 0 || typeof sessionId !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(sessionId)) return false;
+    // The row lock and sealed event insert live in one Postgres transaction. If either fails, Stripe can retry safely.
+    const { data, error } = await db().rpc('record_paid_order', { p_order: orderId, p_amount_cents: cents, p_session_id: sessionId });
     if (error) throw error;
-    if (!canMarkPaid(order, amountCents, sessionId)) return false;
-    // Paying after the job was served (Nick serves first for some clients): record the money, keep the status "Served".
-    // The legal hold would refuse moving a served order back to "Paid", and the webhook would then fail for days.
-    const patch = { paid_at: new Date().toISOString(), stripe_session_id: sessionId, ...(order.legal_hold ? {} : { status: 'paid' }) };
-    // Only the call that actually flips paid_at writes the timeline entry, so the webhook and the client's return from
-    // Stripe arriving together can't log the payment twice (timeline entries can never be removed).
-    const { data: changed, error: uErr } = await db().from('orders').update(patch).eq('id', orderId).is('paid_at', null).select('id');
-    if (uErr) throw uErr;
-    if (!changed?.length) return false;
-    await addEvent(orderId, 'payment', `Payment received: ${money(Number(amountCents))}`);
-    return true;
+    return !!data;
 }
 
 // A paid Stripe session that markPaid would not apply: an older link Nick replaced, less than the amount due, or a
