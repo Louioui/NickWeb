@@ -286,3 +286,32 @@ export async function logClientAction(request, orderId, action, detail = null) {
         }).then(() => {}, () => {});
     } catch { /* never block the client */ }
 }
+
+// A client who chose the daily summary gets no per-update status emails; the daily job sends one digest instead.
+export async function prefersDigest(emailAddr) {
+    const { data, error } = await db().from('client_preferences').select('notify_mode').eq('email', String(emailAddr || '').toLowerCase()).maybeSingle();
+    return !error && data?.notify_mode === 'daily';
+}
+
+// The daily summary: for each client who chose it, one email listing what changed on their requests in the last day.
+export async function sendDailyDigests(origin) {
+    const { data: prefs, error } = await db().from('client_preferences').select('email').eq('notify_mode', 'daily').limit(500);
+    if (error || !prefs?.length) return 0;
+    const since = new Date(Date.now() - 864e5).toISOString();
+    let sent = 0;
+    for (const { email: to } of prefs) {
+        const { data: ords } = await db().from('orders').select('id, code, recipient_name, status').eq('client_email', to).limit(100);
+        if (!ords?.length) continue;
+        const { data: evs } = await db().from('order_events').select('order_id, title, created_at')
+            .in('order_id', ords.map(o => o.id)).eq('client_visible', true).gte('created_at', since).order('created_at', { ascending: true }).limit(500);
+        if (!evs?.length) continue;
+        const byOrder = new Map(ords.map(o => [o.id, o]));
+        const lines = [...new Set(evs.map(e => e.order_id))].map(id => {
+            const o = byOrder.get(id);
+            return `${o.code} (${o.recipient_name}): ${evs.filter(e => e.order_id === id).map(e => e.title).join('; ')}. Now: ${STATUSES[o.status]?.label || o.status}.`;
+        });
+        if (await sendEmail({ to, subject: "Your daily update from Nick's Process Services", heading: 'What changed today',
+            lines: [...lines, 'Open your account to see each request.'], button: { label: 'Open your account', url: `${origin}/account.html` } }).catch(() => false)) sent++;
+    }
+    return sent;
+}

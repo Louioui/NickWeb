@@ -57,10 +57,10 @@
         <div class="desk-heading"><div><p class="eyebrow mb-2">Client portal</p><h1 class="font-display text-3xl text-primary">My requests</h1><p id="client-identity" class="text-sm text-muted mt-2 break-all"></p></div><div class="flex flex-wrap gap-3"><a href="/?client=1#checkout" class="btn btn-gold btn-sm">New request</a><button id="client-logout" type="button" class="btn btn-outline btn-sm">Sign out</button></div></div>
         <p id="client-feedback" class="hidden result-box result-warn text-sm" role="status"></p>
         <section class="panel overflow-hidden" aria-label="Your service requests">
-            <div class="p-5 rule-b space-y-4"><label for="client-search" class="field-label">Find a request</label><input id="client-search" type="search" class="field" placeholder="Name, reference number or document…"><div class="flex flex-wrap items-center justify-between gap-3"><div class="flex gap-1" role="group" aria-label="Filter your requests"><button type="button" class="tab-btn is-active" data-client-filter="all" aria-pressed="true">All</button><button type="button" class="tab-btn" data-client-filter="active" aria-pressed="false">Active</button><button type="button" class="tab-btn" data-client-filter="done" aria-pressed="false">Completed</button></div><span id="client-count" class="text-xs text-muted" role="status"></span></div></div>
+            <div class="p-5 rule-b space-y-4"><label for="client-search" class="field-label">Find a request</label><input id="client-search" type="search" class="field" placeholder="Name, reference, your matter or case number, document…"><div class="flex flex-wrap items-center justify-between gap-3"><div class="flex gap-1" role="group" aria-label="Filter your requests"><button type="button" class="tab-btn is-active" data-client-filter="all" aria-pressed="true">All</button><button type="button" class="tab-btn" data-client-filter="active" aria-pressed="false">Active</button><button type="button" class="tab-btn" data-client-filter="done" aria-pressed="false">Completed</button></div><span id="client-count" class="text-xs text-muted" role="status"></span></div></div>
             <div id="client-orders"></div>
         </section>
-        <div class="flex flex-wrap justify-between gap-3"><p id="client-sync" class="text-xs text-muted" role="status"></p><button id="client-refresh" class="text-sm text-primary underline underline-offset-2" type="button">Refresh requests</button></div>
+        <div class="flex flex-wrap justify-between gap-3"><p id="client-sync" class="text-xs text-muted" role="status"></p><div class="flex flex-wrap gap-4"><button id="client-export" type="button" class="text-sm text-primary underline underline-offset-2">Download list (CSV)</button><button id="client-refresh" class="text-sm text-primary underline underline-offset-2" type="button">Refresh requests</button></div></div>
         <p class="text-xs text-muted leading-relaxed">Requests made with another email won’t appear here. Existing private tracking links still work. Showing your latest 100 requests.</p>
         <section class="panel p-5 space-y-4" aria-labelledby="security-title">
             <div><h2 id="security-title" class="font-display text-2xl text-primary">Security</h2><p id="pin-status" class="text-sm text-muted mt-1"></p></div>
@@ -79,6 +79,14 @@
                     <button id="passkey-add" type="button" class="btn btn-pine btn-sm">Add a passkey</button>
                 </div>
                 <p id="passkey-pin-help" class="text-xs text-muted"></p>
+            </div>
+            <div id="notify-section" class="hidden pt-4 rule-t space-y-2">
+                <h3 class="font-serif text-lg text-primary">Email updates</h3>
+                <p class="text-sm text-muted">Questions from Nick, payment links and proof of service always arrive straight away.</p>
+                <div class="flex flex-wrap gap-4 text-sm" role="radiogroup" aria-label="How often to email status updates">
+                    <label class="flex items-center gap-2"><input type="radio" name="notify-mode" value="instant" class="accent-primary"> An email for each update</label>
+                    <label class="flex items-center gap-2"><input type="radio" name="notify-mode" value="daily" class="accent-primary"> One summary a day</label>
+                </div>
             </div>
             <p id="security-feedback" class="hidden result-box text-sm" role="status"></p>
             <div class="pt-4 rule-t flex flex-wrap items-center justify-between gap-3"><p class="text-sm text-muted">Signed in on a computer or phone you no longer use?</p><button id="client-logout-all" type="button" class="btn btn-outline btn-sm">Sign out all devices</button></div>

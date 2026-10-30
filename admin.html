@@ -71,6 +71,7 @@
         </div>
         <p id="dashboard-error" class="result-box result-err hidden mb-5" role="alert"></p>
         <p id="save-feedback" class="desk-feedback result-box result-ok hidden" role="status" aria-live="polite"></p>
+        <div id="safewalk-banner" class="hidden result-box result-err text-sm mb-5" role="alert"></div>
         <div id="setup-card" class="hidden panel p-5 mb-5" role="region" aria-label="Secure your dashboard"></div>
         <div id="recovery-banner" class="hidden result-box result-warn text-sm mb-5" role="status"></div>
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-7" id="stats"></div>
@@ -82,6 +83,7 @@
                     <div class="flex items-center justify-between gap-3"><h2 class="font-serif text-lg text-primary">Service requests</h2><span id="list-count" class="text-xs text-muted" role="status"></span></div>
                     <input id="search" type="search" placeholder="Search name, email, reference, city…" aria-label="Search jobs" class="field">
                     <div id="filters" class="flex flex-wrap gap-1" role="group" aria-label="Filter service requests"></div>
+                    <div id="route-bar" class="hidden flex flex-wrap items-center justify-between gap-2 text-xs"><span id="route-text" class="text-muted"></span><button type="button" data-click="openRoute" class="btn btn-pine btn-sm"><i class="fa-solid fa-route" aria-hidden="true"></i> Open today's route in Google Maps</button></div>
                     <div id="bulk-bar" class="hidden flex flex-wrap items-center justify-between gap-2 text-xs"><span id="bulk-text" class="text-muted"></span><button type="button" data-click="bulkCloseShown" class="btn btn-outline btn-sm">Close them all</button></div>
                 </div>
                 <div id="job-list" class="max-h-[70vh] overflow-y-auto"></div>
