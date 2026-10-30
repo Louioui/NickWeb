@@ -166,6 +166,8 @@ function maskMockAddress(o) {
     return street + (o.city ? `, ${o.city}` : '') + (o.zip ? ` ${o.zip}` : '');
 }
 
+// Same as api/track.mjs: open requests that take a note at any time, besides answering Nick's question.
+const MOCK_OPEN_FOR_NOTES = ['action_required', 'received', 'awaiting_payment', 'paid', 'accepted', 'attempting'];
 function clientView(o, { unlocked = false } = {}) {
     const visibleEvents = events.filter(e => e.order_id === o.id && e.client_visible).sort((a, b) => a.created_at.localeCompare(b.created_at))
         .map(({ created_at, kind, title, detail }) => ({ created_at, kind, title, detail }));
@@ -185,6 +187,10 @@ function clientView(o, { unlocked = false } = {}) {
         payUrl: (o.status === 'awaiting_payment' || (o.legal_hold && !o.paid_at)) ? o.payment_url : null,
         // Same as api/_lib/orders.mjs: a locked view keeps status and dates, not what was said or sent.
         paidAt: o.paid_at, actionNote: o.status === 'action_required' && !isLocked ? o.action_note : null,
+        receipt: o.paid_at && !isLocked ? { code: o.code, caseNumber: o.case_number || null, court: o.court || null, clientReference: o.client_reference || null,
+            tier: TIERS[o.tier]?.name, addons: o.addons.map(k => ADDONS[k]?.name).filter(Boolean), amountPaid: money(o.amount_due_cents),
+            paidAt: o.paid_at, clientName: o.client_name, clientFirm: o.client_firm || null } : null,
+        canReply: !isLocked && MOCK_OPEN_FOR_NOTES.includes(o.status),
         docLock: !!o.doc_lock,
         unlocked: !isLocked,
         legalHold: !!o.legal_hold,
@@ -600,7 +606,8 @@ const handlers = {
             return json(clientView(o, { unlocked }));
         }
         if (body.action === 'respond') {
-            if (o.status !== 'action_required') fail(409, 'Nothing is needed from you right now.');
+            const answering = o.status === 'action_required';
+            if (!MOCK_OPEN_FOR_NOTES.includes(o.status)) fail(409, 'This request is finished. Call or text Nick if you need anything.');
             if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
             const changes = {};
             const address = cleanText(body.address, 200, false, 'Street address');
@@ -616,11 +623,12 @@ const handlers = {
             }
             const access = cleanLongText(body.accessNotes, 500, 'Access notes');
             if (access) changes.access_notes = access;
+            if (!answering && Object.keys(changes).length) fail(409, 'To change the address or access details, call or text Nick, or wait for him to ask.');
             const reply = cleanLongText(body.reply, 2000, 'Your reply');
             const fileList = Array.isArray(body.files) ? body.files : [];
             if (!Object.keys(changes).length && !reply && !fileList.length) fail(400, 'Please add the missing information, a reply, or a file.');
             const uploads = prepareUploads(o.id, 'action_upload', fileList);
-            updateOrder(o, { ...changes, status: 'received', action_note: null, updated_at: now() });
+            updateOrder(o, answering ? { ...changes, status: 'received', action_note: null, updated_at: now() } : { updated_at: now() });
             const attemptCount = events.filter(e => e.order_id === o.id && e.kind === 'attempt').length;
             const amendDigest = sha256Hex(`${o.code}|${changes.address || ''}|${changes.unit || ''}|${changes.city || ''}|${changes.zip || ''}|${changes.access_notes || ''}|${reply || ''}`).slice(0, 16);
             const summary = [
@@ -629,12 +637,13 @@ const handlers = {
                 reply,
                 `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
             ].filter(Boolean).join(' · ');
-            addEvent(o.id, 'action_response', 'You sent the requested information', summary || null);
+            addEvent(o.id, 'action_response', answering ? 'You sent the requested information' : 'You sent Nick a note', summary || null);
             return json({ ok: true, uploads });
         }
+        if (body.action === 'renew-payment') fail(409, 'In the demo, payment links never expire.');
         if (body.action === 'respond-finish') {
             if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Unlock it first.');
-            if (o.status !== 'received') return json(clientView(o, { unlocked }));
+            if (!MOCK_OPEN_FOR_NOTES.includes(o.status)) return json(clientView(o, { unlocked }));
             const up = confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
             const orderEvents = events.filter(e => e.order_id === o.id);
@@ -810,9 +819,23 @@ const handlers = {
             const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response'];
             const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(o => {
                 const last = events.filter(e => e.order_id === o.id && kinds.includes(e.kind)).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                return { ...o, client_replied: last?.kind === 'action_response' };
+                const contact = events.filter(e => e.order_id === o.id && e.client_visible && e.kind !== 'action_response' && [...kinds, 'note'].includes(e.kind))
+                    .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+                return { ...o, client_replied: last?.kind === 'action_response', last_contact_at: contact?.created_at || null };
             });
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
+        }
+        if (a === 'bulk-close') {
+            const ids = (Array.isArray(body.ids) ? body.ids : []).slice(0, 50);
+            const closed = [];
+            for (const id of ids) {
+                const o = orders.get(id);
+                if (!o || !['served', 'cancelled'].includes(o.status)) continue;
+                updateOrder(o, { status: 'closed' });
+                addEvent(o.id, 'status', STATUSES.closed.label, null, true);
+                closed.push(o.code);
+            }
+            return json({ ok: true, closed, skipped: ids.length - closed.length });
         }
         if (a === 'file-url') {
             const fid = cleanUuid(body.fileId, 'File');
@@ -820,7 +843,7 @@ const handlers = {
             if (!f?.uploaded) fail(404, 'File not found.');
             return json({ url: `/__mock-file/${f.id}` });
         }
-        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'export', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
+        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'export', 'evidence-pack', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
         const oid = cleanUuid(body.id, 'Order');
         const o = orders.get(oid);
         if (!o) fail(404, 'Order not found.');
@@ -863,8 +886,12 @@ const handlers = {
             } else if (body.kind === 'attempt') {
                 const outcome = cleanText(body.outcome, 120, true, 'Outcome');
                 const when = cleanText(body.when, 40, false, 'When');
+                const t = body.at ? Date.parse(body.at) : Date.now();
+                if (!Number.isFinite(t) || t > Date.now() + 3600e3 || t < Date.now() - 60 * 864e5) fail(400, 'Check the attempt time.');
+                const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', hourCycle: 'h23' }).format(t));
+                const window = hour < 12 ? 'morning' : hour < 19 ? 'afternoon/evening' : 'night';
                 if (['received', 'paid', 'accepted'].includes(o.status)) updateOrder(o, { status: 'attempting' });
-                addEvent(o.id, 'attempt', `Attempt: ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
+                addEvent(o.id, 'attempt', `Attempt (${window}): ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
             } else if (body.kind === 'note') {
                 if (!note) fail(400, 'Write a note first.');
                 addEvent(o.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);
@@ -889,6 +916,22 @@ const handlers = {
             auditAdmin(adminEmail, 'payment_link', o.code, money(cents));
             email(o.client_email, `${o.code}: confirmed, ${money(cents)} due to start service`, o.payment_url);
             return json(adminDetail(o));
+        }
+        if (a === 'evidence-pack') {
+            const d = adminDetail(o);
+            const pick = (ks) => d.events.filter(e => ks.includes(e.kind)).map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible }));
+            return json({
+                generated_at: now(),
+                order: { code: o.code, status: STATUSES[o.status]?.label, created_at: o.created_at, client: { name: o.client_name, firm: o.client_firm || null, email: o.client_email },
+                    case_number: o.case_number || null, court: o.court || null, client_reference: o.client_reference || null, recipient: o.recipient_name, document: o.doc_type,
+                    tier: TIERS[o.tier]?.name, addons: o.addons.map(k => ADDONS[k]?.name).filter(Boolean), served_at: o.served_at || null, legal_hold: !!o.legal_hold },
+                attestation: pick(['attestation']),
+                payment: { amount_due: o.amount_due_cents != null ? money(o.amount_due_cents) : null, paid_at: o.paid_at || null, stripe_session_id: o.stripe_session_id || null, entries: pick(['payment']) },
+                attempts: pick(['attempt']),
+                client_activity: [],
+                files: d.files.map(({ filename, kind, size_bytes, sha256, created_at }) => ({ filename, kind, size_bytes, sha256: sha256 || null, stored_at: created_at })),
+                timeline_seal: orderSeal(o.id),
+            });
         }
         if (a === 'export') {
             auditAdmin(adminEmail, 'export_order', o.code);

@@ -10,14 +10,27 @@ const FILTERS = {
     review: { label: 'New', test: o => o.status === 'received' },
     waiting: { label: 'Waiting on client', test: o => ['action_required', 'awaiting_payment'].includes(o.status) },
     working: { label: 'In progress', test: o => ['paid', 'accepted', 'attempting'].includes(o.status) },
+    today: { label: 'Due today', test: o => isOpen(o) && ((o.deadline && daysUntil(o.deadline) <= 2) || (o.tier === 'sameday' && !o.deadline)) },
     urgent: { label: 'Due soon', test: o => isOpen(o) && o.deadline && daysUntil(o.deadline) <= 7 },
     done: { label: 'Done', test: o => ['served', 'closed', 'cancelled'].includes(o.status) },
     all: { label: 'All', test: () => true },
 };
 // Some timeline entries are written for the client ("You sent..."); on Nick's screen they read from his side.
 const NICK_WORDING = { 'You sent the requested information': 'Client sent the requested information' };
-const ATTEMPT_OUTCOMES = ['No answer', 'Subject not home', 'Spoke with resident, subject not there', 'Refused / evading', 'Gated, no access',
-    'Wrong address / moved', 'Business closed', 'Other'];
+const ATTEMPT_OUTCOMES = ['No answer', 'Served', 'Subject not home', 'Spoke with resident, subject not there', 'Left with co-resident (substituted service)',
+    'Refused / evading', 'Gated, no access', 'Wrong address / moved', 'Business closed', 'Other'];
+// One tap fills the outcome; the time is "now" unless Nick picks another.
+const QUICK_OUTCOMES = ['No answer', 'Served', 'Wrong address / moved', 'Refused / evading', 'Left with co-resident (substituted service)'];
+// Saved messages for the note and "Ask client" tabs.
+const TEMPLATES = {
+    action: ['Please confirm the unit or apartment number.', 'Please send the gate code or building access instructions.',
+        'No answer on the first attempt. Is there a best time of day to reach them?', 'The address looks out of date. Do you have a newer one?',
+        'Please send a recent photo or description of the person to serve.'],
+    note: ['First attempt made, no answer. I will try again at a different time of day.', 'Served. I am preparing the proof of service now.',
+        'Attempts are on schedule. I will update you after the next one.'],
+};
+// Days since Nick last contacted the client (an entry the client can see), shown on open jobs.
+const daysSince = iso => iso ? Math.floor((Date.now() - new Date(iso).getTime()) / 864e5) : null;
 
 let orders = [];
 let statuses = {};
@@ -26,6 +39,7 @@ let current = null;           // { order, events, files } for the open job
 let actionTab = 'attempt';
 let openJobVersion = 0;
 let actionBusy = false;
+let bulkIds = [];             // served/cancelled jobs shown under "Done", for one-tap closing
 const drafts = new Map();
 const draftKey = () => current ? `${current.order.id}:${actionTab}` : '';
 
@@ -175,6 +189,12 @@ function renderList() {
     const q = $('search').value.trim().toLowerCase();
     const shown = orders.filter(FILTERS[filter].test).filter(o => !q ||
         [o.code, o.client_name, o.client_firm, o.client_email, o.recipient_name, o.city, o.zip].some(v => (v || '').toLowerCase().includes(q)));
+    // "Due today": overdue first, then soonest deadline, Same-Day Rush jobs without a date at the top of the rest.
+    if (filter === 'today') shown.sort((a, b) => (a.deadline ? daysUntil(a.deadline) : -0.5) - (b.deadline ? daysUntil(b.deadline) : -0.5));
+    const closable = filter === 'done' ? shown.filter(o => ['served', 'cancelled'].includes(o.status)) : [];
+    bulkIds = closable.map(o => o.id);
+    $('bulk-bar').classList.toggle('hidden', !closable.length);
+    $('bulk-text').textContent = closable.length ? `${closable.length} served or cancelled ${closable.length === 1 ? 'job is' : 'jobs are'} ready to close.` : '';
     $('list-count').textContent = `${shown.length} ${shown.length === 1 ? 'request' : 'requests'}`;
     $('job-list').innerHTML = shown.length ? shown.map(o => {
         const days = daysUntil(o.deadline);
@@ -187,7 +207,7 @@ function renderList() {
                 ? '<span class="status-pill status-alert"><i class="fa-solid fa-reply mr-1"></i>Client replied</span>'
                 : `<span class="status-pill ${PILL[o.status]}">${esc(statuses[o.status]?.label || o.status)}</span>`}
             <span class="text-xs text-muted truncate">${esc(o.code)} · ${esc(o.city || '')} · ${esc(o.client_firm || o.client_name)}</span>
-            <span class="text-xs text-right">${due}</span>
+            <span class="text-xs text-right">${due}${isOpen(o) && o.last_contact_at !== undefined ? ` <span class="${daysSince(o.last_contact_at) >= 3 || o.last_contact_at === null ? 'text-[#7a1f1c]' : 'text-muted'}" title="Last update the client can see">· ${o.last_contact_at ? `contact ${daysSince(o.last_contact_at)}d ago` : 'no contact yet'}</span>` : ''}</span>
         </button>`;
     }).join('') : `<div class="p-8 text-center text-sm text-muted"><p class="font-semibold text-primary mb-2">${q ? 'No matching requests' : 'You’re all caught up here'}</p><p>${q ? 'Try a name, reference number, email, or city.' : 'Requests in this category will appear here.'}</p><button type="button" class="btn btn-outline btn-sm mt-4" data-click="setFilter" data-arg="all">Show all requests</button></div>`;
 }
@@ -290,9 +310,10 @@ function renderDetail() {
                 <span class="status-pill ${PILL[o.status]}">${esc(statuses[o.status]?.label || o.status)}</span>
             </div>
             ${o.action_note ? `<div class="result-box result-warn mt-5 text-sm"><strong>You asked the client:</strong> ${esc(o.action_note)}</div>` : ''}
+            ${attemptWindowsHtml(o, events)}
             <div class="grid sm:grid-cols-2 gap-x-8 gap-y-6 mt-6">
                 <dl class="review-recap content-start">
-                    ${row('Address', `<a href="${mapUrl}" target="_blank" rel="noopener noreferrer" class="text-primary font-semibold underline underline-offset-2">${esc(fullAddress)}</a>`)}
+                    ${row('Address', `<a href="${mapUrl}" target="_blank" rel="noopener noreferrer" class="text-primary font-semibold underline underline-offset-2">${esc(fullAddress)}</a> <button type="button" class="text-xs text-primary font-semibold ml-1" data-click="copyAddress"><i class="fa-regular fa-copy" aria-hidden="true"></i> Copy</button>`)}
                     ${row('Access', esc(o.access_notes || ''))}
                     ${row('Description', esc(o.physical_notes || ''))}
                     ${row('Instructions', esc(o.instructions || ''))}
@@ -379,6 +400,8 @@ function actionForm(o) {
                 ${seal.head ? `<br><span class="font-mono text-muted break-all">Seal: ${esc(seal.head)}</span>` : ''}</p>
             <div class="flex flex-wrap gap-2">
                 <button type="button" class="btn btn-outline btn-sm" data-click="printRecord"><i class="fa-solid fa-print"></i> Print record</button>
+                <button type="button" class="btn btn-outline btn-sm" data-click="evidencePack"><i class="fa-solid fa-scale-balanced"></i> Dispute evidence pack</button>
+                ${o.paid_at ? '<button type="button" class="btn btn-outline btn-sm" data-click="printReceiptJob"><i class="fa-solid fa-receipt"></i> Receipt</button>' : ''}
                 <button type="button" class="btn btn-outline btn-sm" data-click="toggleDocLockJob"><i class="fa-solid ${o.doc_lock ? 'fa-lock-open' : 'fa-lock'}"></i> ${o.doc_lock ? 'Turn off document lock' : 'Lock documents on tracking page'}</button>
                 <button type="button" class="btn btn-outline btn-sm" data-click="rotateLink"><i class="fa-solid fa-link-slash"></i> Replace client's tracking link</button>
             </div>
@@ -408,6 +431,8 @@ function actionForm(o) {
         </div>`;
     }
     if (actionTab === 'attempt') return `
+        <div class="flex flex-wrap gap-2" role="group" aria-label="Quick outcome">${QUICK_OUTCOMES.map(x =>
+            `<button type="button" class="tab-btn" data-click="quickOutcome" data-arg="${esc(x)}">${esc(x.replace(' (substituted service)', ''))}</button>`).join('')}</div>
         <div class="grid sm:grid-cols-2 gap-4">
             <div><label for="f-outcome" class="field-label">Outcome</label><select id="f-outcome" class="field">${ATTEMPT_OUTCOMES.map(x => `<option>${x}</option>`).join('')}</select></div>
             <div><label for="f-when" class="field-label">When (leave blank for now)</label><input id="f-when" type="datetime-local" class="field"></div>
@@ -423,11 +448,13 @@ function actionForm(o) {
         ${check('f-notify', 'Email the client about it', false)}
         ${submitBtn('Update Status')}`;
     if (actionTab === 'note') return `
+        ${templatePicker('note')}
         <div><label for="f-note" class="field-label">Note</label><textarea id="f-note" class="field h-24 resize-none"></textarea></div>
         ${check('f-visible', 'Client can see this note (otherwise only you can)', false)}
         ${submitBtn('Save Note')}`;
     if (actionTab === 'action') return `
         <p class="text-sm text-muted">The client gets an email and a form on their tracking page to answer, fix the address, or upload a file.</p>
+        ${templatePicker('action')}
         <div><label for="f-note" class="field-label">What do you need?</label><textarea id="f-note" class="field h-24 resize-none" placeholder="e.g. The apartment number is missing. Which unit does the subject live in?"></textarea></div>
         ${submitBtn('Send to Client')}`;
     if (actionTab === 'payment') {
@@ -438,6 +465,7 @@ function actionForm(o) {
             <div><label for="f-amount" class="field-label">Amount ($)</label><input id="f-amount" type="number" min="1" step="0.01" class="field" value="${((o.amount_due_cents ?? o.estimated_total_cents) / 100).toFixed(2)}"></div>
             <div class="sm:col-span-2"><label for="f-desc" class="field-label">What it covers (shown to client)</label><input id="f-desc" class="field" value="${esc(o.tier_name + (o.addon_names.length ? ' + ' + o.addon_names.join(', ') : ''))}"></div>
         </div>
+        ${printingFeeNote()}
         <p class="text-xs text-muted">The client gets an email with a secure Stripe link (card or Apple Pay). The job moves to "Paid" by itself when they pay.</p>
         ${submitBtn('Send Payment Link')}`;
     }
@@ -470,7 +498,8 @@ async function submitAction(e) {
     try {
         if (actionTab === 'attempt') {
             const when = v('f-when') ? new Date(v('f-when')).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
-            current = await api('update', { id, kind: 'attempt', outcome: v('f-outcome'), when, note: v('f-note'), clientVisible: on('f-visible') });
+            const at = v('f-when') ? new Date(v('f-when')).toISOString() : '';
+            current = await api('update', { id, kind: 'attempt', outcome: v('f-outcome'), when, at, note: v('f-note'), clientVisible: on('f-visible') });
         } else if (actionTab === 'status') {
             current = await api('update', { id, kind: 'status', status: v('f-status'), note: v('f-note'), clientVisible: on('f-visible'), notify: on('f-notify') });
         } else if (actionTab === 'note') {
@@ -549,6 +578,100 @@ async function rotateLink() {
         renderDetail();
     } catch (err) { protectionError(err); }
 }
+// --- Field tools ---
+function quickOutcome(outcome) {
+    const sel = $('f-outcome');
+    if (!sel) return;
+    sel.value = outcome;
+    document.querySelectorAll('[data-click="quickOutcome"]').forEach(b => b.classList.toggle('is-active', b.dataset.arg === outcome));
+    formDirty = true;
+    $('f-note')?.focus();
+}
+function templatePicker(kind) {
+    return `<div><label for="f-template" class="field-label">Saved message</label><select id="f-template" class="field" data-template="${kind}">
+        <option value="">Choose one to fill in, or type your own below</option>${TEMPLATES[kind].map((t, i) => `<option value="${i}">${esc(t)}</option>`).join('')}</select></div>`;
+}
+document.addEventListener('change', (e) => {
+    const sel = e.target.closest('[data-template]');
+    if (!sel || sel.value === '') return;
+    const note = $('f-note');
+    if (note) { note.value = TEMPLATES[sel.dataset.template][Number(sel.value)]; formDirty = true; note.focus(); }
+});
+// Printing: first 100 pages free, $0.15 a page after (Nick's price list). Counted from the client's PDFs.
+function printingFeeNote() {
+    const pdfs = (current.files || []).filter(f => f.kind !== 'proof' && /\.pdf$/i.test(f.filename));
+    if (!pdfs.length) return '';
+    const counted = pdfs.filter(f => Number.isInteger(f.page_count));
+    const pages = counted.reduce((n, f) => n + f.page_count, 0);
+    const fee = Math.max(0, pages - 100) * 15;
+    const unknown = pdfs.length - counted.length;
+    return `<p class="result-box ${fee ? 'result-warn' : 'result-ok'} text-sm">Printing: ${pages} page${pages === 1 ? '' : 's'} in ${counted.length} PDF${counted.length === 1 ? '' : 's'}${unknown ? ` (${unknown} not counted)` : ''}. ${fee ? `Printing fee: ${NPS.money(fee)} (pages over 100 at $0.15). Add it to the amount if it applies.` : 'Within the 100 free pages.'}</p>`;
+}
+// Which time-of-day windows have been tried (Standard and Expedited promise morning, evening and night attempts).
+function attemptWindowsHtml(o, events) {
+    if (!['standard', 'expedited'].includes(o.tier)) return '';
+    const tried = new Set(events.filter(e => e.kind === 'attempt').map(e => /^Attempt \(([^)]+)\)/.exec(e.title)?.[1]).filter(Boolean));
+    const label = { morning: 'Morning (before 12)', 'afternoon/evening': 'Afternoon/evening (12–7 PM)', night: 'Night (after 7 PM)' };
+    return `<div class="flex flex-wrap items-center gap-2 mt-4"><span class="text-xs text-muted">Attempt windows:</span>${Object.entries(label).map(([k, l]) =>
+        `<span class="status-pill ${tried.has(k) ? 'status-done' : 'status-muted'}"><i class="fa-solid ${tried.has(k) ? 'fa-check' : 'fa-clock'} mr-1" aria-hidden="true"></i>${l}</span>`).join('')}</div>`;
+}
+async function copyAddress(_, btn) {
+    const o = current.order;
+    const text = `${o.address}${o.unit ? ', ' + o.unit : ''}, ${o.city} ${o.zip}`;
+    try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
+    catch { btn.textContent = 'Copy failed'; }
+    setTimeout(() => { btn.innerHTML = '<i class="fa-regular fa-copy" aria-hidden="true"></i> Copy'; }, 2000);
+}
+async function bulkCloseShown() {
+    if (!bulkIds.length || !confirm(`Close ${bulkIds.length} finished ${bulkIds.length === 1 ? 'job' : 'jobs'}? Clients can still open their tracking pages.`)) return;
+    try {
+        const r = await api('bulk-close', { ids: bulkIds });
+        const fb = $('save-feedback');
+        fb.textContent = `Closed ${r.closed.length} ${r.closed.length === 1 ? 'job' : 'jobs'}.${r.skipped ? ` ${r.skipped} changed in the meantime and were left as they are.` : ''}`;
+        fb.className = 'desk-feedback result-box result-ok';
+        await refreshJobs();
+    } catch (err) { if (err.status !== 401) alert(err.message); }
+}
+async function evidencePack() {
+    try { NPS.printEvidencePack(await api('evidence-pack', { id: current.order.id })); }
+    catch (err) { if (err.status !== 401) alert(err.message); }
+}
+function printReceiptJob() {
+    const o = current.order;
+    NPS.printReceipt({ code: o.code, caseNumber: o.case_number, court: o.court, clientReference: o.client_reference, tier: o.tier_name,
+        addons: o.addon_names, amountPaid: NPS.money(o.amount_due_cents), paidAt: o.paid_at, clientName: o.client_name, clientFirm: o.client_firm });
+}
+
+// --- Security setup card (first logins) and the low recovery-codes banner ---
+async function renderSecurityNudges(me) {
+    let passkeyCount = 0;
+    try { passkeyCount = (await api('passkeys')).passkeys.length; } catch { passkeyCount = -1; }   // -1: passkeys not set up on the server yet
+    let dismissed = false;
+    try { dismissed = sessionStorage.getItem('nps_setup_card_hidden') === '1'; } catch { /* storage off */ }
+    const steps = [
+        ['Turn on the authenticator app', me.totpEnabled],
+        ['Save your recovery codes', (me.recoveryRemaining || 0) > 0],
+        ...(passkeyCount >= 0 && window.PublicKeyCredential ? [['Add Face ID / Touch ID (passkey)', passkeyCount > 0]] : []),
+    ];
+    const todo = steps.filter(([, done]) => !done).length;
+    const card = $('setup-card');
+    card.classList.toggle('hidden', !todo || dismissed);
+    card.innerHTML = todo ? `<div class="flex flex-wrap items-start justify-between gap-3">
+        <div><p class="font-serif text-lg text-primary"><i class="fa-solid fa-shield-halved text-bronze mr-1" aria-hidden="true"></i> Secure your dashboard</p>
+        <p class="text-xs text-muted mt-1">So someone who gets into your email still can't get in. It takes about two minutes.</p>
+        <ol class="mt-3 space-y-1 text-sm">${steps.map(([l, done]) => `<li><i class="fa-solid ${done ? 'fa-circle-check text-primary' : 'fa-circle text-muted'} mr-2" aria-hidden="true"></i>${esc(l)}</li>`).join('')}</ol></div>
+        <div class="flex flex-wrap gap-2"><button type="button" data-click="openSecurityModal" class="btn btn-pine btn-sm">Set it up</button>
+        <button type="button" data-click="hideSetupCard" class="btn btn-outline btn-sm">Later</button></div></div>` : '';
+    const low = me.totpEnabled && (me.recoveryRemaining || 0) <= 3;
+    const banner = $('recovery-banner');
+    banner.classList.toggle('hidden', !low);
+    banner.innerHTML = low ? `<i class="fa-solid fa-key mr-1" aria-hidden="true"></i> Only ${me.recoveryRemaining || 0} recovery code${me.recoveryRemaining === 1 ? '' : 's'} left. <button type="button" data-click="openSecurityModal" class="underline underline-offset-2 font-semibold">Make a new set</button>` : '';
+}
+function hideSetupCard() {
+    $('setup-card').classList.add('hidden');
+    try { sessionStorage.setItem('nps_setup_card_hidden', '1'); } catch { /* storage off */ }
+}
+
 function printRecord() {
     const o = current.order;
     NPS.printChainOfCustody({
@@ -854,6 +977,7 @@ async function start() {
         $('security-modal-email').textContent = me.email;
         updateRecoveryBadge(me.recoveryRemaining);
         updateSecurityState(me.totpEnabled);
+        renderSecurityNudges(me);
         await refreshJobs();
         const hashId = location.hash.slice(1);
         if (hashId) openJob(hashId);
@@ -873,6 +997,7 @@ const CLICK_ACTIONS = {
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
     emailStepUp: (arg, el) => emailStepUp(arg, el),
+    quickOutcome: (arg) => quickOutcome(arg), copyAddress: (arg, el) => copyAddress(arg, el), bulkCloseShown, evidencePack, printReceiptJob, hideSetupCard,
     setLegalHold: (arg) => setLegalHold(arg === 'true'),
     setActionTab: (arg) => setActionTab(arg),
     setFilter: (arg) => setFilter(arg),

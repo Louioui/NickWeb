@@ -440,6 +440,20 @@ function isMissingObject(err) {
 // Reads a stored upload and checks it. Returns { state: 'ok', sha256 }, 'bad' (the bytes are not what the name claims),
 // 'missing' (storage confirms it never arrived), or 'unknown' (anything else: retried later, never deleted). Like the rest
 // of supabase-js, these calls report failures as { error } instead of throwing, so each one is checked.
+// Page count of a PDF, for the printing fee. Counts page objects, and also reads the page tree's /Count (which stays
+// visible when pages sit in compressed object streams). Returns null when neither can be found.
+export function countPdfPages(bytes) {
+    const s = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1');
+    const objects = (s.match(/\/Type\s*\/Page(?![s\w])/g) || []).length;
+    let tree = 0;
+    for (const m of s.matchAll(/<<(?:(?!<<|>>)[\s\S]){0,400}?\/Type\s*\/Pages\b(?:(?!<<|>>)[\s\S]){0,400}?>>/g)) {
+        const c = /\/Count\s+(\d{1,6})/.exec(m[0]);
+        if (c) tree = Math.max(tree, Number(c[1]));
+    }
+    const pages = Math.max(objects, tree);
+    return pages > 0 && pages <= 100000 ? pages : null;
+}
+
 export async function inspectStoredFile(path, filename) {
     try {
         const { data: info, error: iErr } = await db().storage.from(BUCKET).info(path);
@@ -459,7 +473,8 @@ export async function inspectStoredFile(path, filename) {
             buf = Buffer.from(clean);
             if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
         }
-        return { state: 'ok', sha256: sha256(buf) };
+        const pages = /\.pdf$/i.test(String(filename)) ? countPdfPages(buf) : null;
+        return { state: 'ok', sha256: sha256(buf), pages };
     } catch {
         return { state: 'unknown' };
     }
@@ -489,9 +504,11 @@ export async function confirmUploads(orderId, fileIds) {
         }
         if (check.state === 'missing') { missing++; continue; }
         if (check.state !== 'ok') { stillChecking++; continue; }
-        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id);
+        let { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256, page_count: check.pages ?? null }).eq('id', r.id);
+        // Before the page_count column exists (migration not applied yet), confirm the file without it.
+        if (uErr && /page_count/.test(uErr.message || '')) ({ error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256 }).eq('id', r.id));
         if (uErr) throw uErr;
-        done.push({ ...r, sha256: check.sha256 });
+        done.push({ ...r, sha256: check.sha256, page_count: check.pages ?? null });
     }
     return { files: done, stillChecking, missing, rejected };
 }

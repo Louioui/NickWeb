@@ -10,7 +10,11 @@ const stripeSessions = new Map();
 class FakeStripe {
     constructor() {
         this.webhooks = { constructEventAsync: async (raw) => JSON.parse(raw) };
-        this.checkout = { sessions: { retrieve: async (id) => stripeSessions.get(id) || { id, payment_status: 'unpaid', metadata: {} }, expire: async () => ({}) } };
+        this.checkout = { sessions: {
+            retrieve: async (id) => stripeSessions.get(id) || { id, payment_status: 'unpaid', metadata: {} },
+            expire: async () => ({}),
+            create: async () => { const id = `cs_test_${randomUUID().replace(/-/g, '')}`; const ses = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid' }; stripeSessions.set(id, ses); return ses; },
+        } };
     }
 }
 mock.module('@supabase/supabase-js', { namedExports: { createClient: () => db } });
@@ -581,8 +585,93 @@ await check('F-11 if the cleaned photo cannot be stored back, it is not confirme
     expect(r.stillChecking === 1 && !fileRow(f.id).uploaded, 'confirmed with GPS still inside');
 });
 
-// --- F-09: with two-step off, sensitive actions need an emailed step-up code, not just the session cookie ---
+// --- Phase 2: field tools, evidence and payments ---
 const adminAct = (body, cookie) => adminPOST(post('/api/admin', body, { cookie }));
+const track = (o, body) => trackPOST(post('/api/track', { t: o.track_token, ...body }));
+const evs = (o) => (tables().order_events || []).filter(e => e.order_id === o.id);
+await check('P2 PDF pages are counted (page objects, or the page tree when pages are compressed)', async () => {
+    const three = new TextEncoder().encode('%PDF-1.7\n1 0 obj << /Type /Pages /Kids [2 0 R 3 0 R 4 0 R] /Count 3 >>\n2 0 obj << /Type /Page >>\n3 0 obj << /Type /Page >>\n4 0 obj << /Type /Page >>\n%%EOF');
+    expect(core.countPdfPages(three) === 3, `got ${core.countPdfPages(three)}`);
+    const compressed = new TextEncoder().encode('%PDF-1.7\n1 0 obj << /Type /Pages /Kids [5 0 R] /Count 150 >>\n5 0 obj << /Type /ObjStm /N 150 >>\n%%EOF');
+    expect(core.countPdfPages(compressed) === 150, `got ${core.countPdfPages(compressed)}`);
+    expect(core.countPdfPages(new TextEncoder().encode('%PDF-1.7\n%%EOF')) === null, 'invented a page count');
+    reset(); const o = seedOrder(); const f = seedFile(o); db.__state.storage.set(f.storage_path, three);
+    await core.confirmUploads(o.id, [f.id]);
+    expect(fileRow(f.id).page_count === 3, `stored ${fileRow(f.id).page_count}`);
+});
+await check('P2 each attempt is labelled with its time window, in California time', async () => {
+    reset(); const o = seedOrder(); const cookie = adminCookie();
+    const at = (h) => { const d = new Date(); d.setUTCHours(h + 8, 0, 0, 0); if (d > new Date()) d.setUTCDate(d.getUTCDate() - 1); return d.toISOString(); };   // PST = UTC-8 (PDT shifts it by 1h; 9am/9pm stay put)
+    for (const [h, w] of [[9, 'morning'], [21, 'night']]) {
+        const r = await adminAct({ action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', at: at(h) }, cookie);
+        expect(r.status === 200, `attempt ${r.status}`);
+        expect(evs(o).some(e => e.title === `Attempt (${w}): No answer`), `no ${w} label: ${evs(o).map(e => e.title).join(' | ')}`);
+    }
+    const bad = await adminAct({ action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', at: new Date(Date.now() + 864e5).toISOString() }, cookie);
+    expect(bad.status === 400, `future attempt accepted (${bad.status})`);
+});
+await check('P2 bulk close closes only served or cancelled jobs', async () => {
+    reset(); const cookie = adminCookie();
+    const a = seedOrder({ status: 'served', legal_hold: true }), b = seedOrder({ status: 'cancelled', code: 'NP-222222' }), c = seedOrder({ status: 'attempting', code: 'NP-333333' });
+    const r = await (await adminAct({ action: 'bulk-close', ids: [a.id, b.id, c.id] }, cookie)).json();
+    const st = (o) => tables().orders.find(x => x.id === o.id).status;
+    expect(st(a) === 'closed' && st(b) === 'closed' && st(c) === 'attempting', `${st(a)} ${st(b)} ${st(c)}`);
+    expect(r.closed.length === 2 && r.skipped === 1, JSON.stringify(r));
+});
+await check('P2 the tracking page logs views (once an hour), unlocks, downloads and replies for the evidence pack', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o); f.uploaded = true; f.sha256 = 'a'.repeat(64);
+    await track(o, { action: 'view' }); await track(o, { action: 'view' }); await track(o, { action: 'view' });
+    await track(o, { action: 'download', fileId: f.id });
+    const log = tables().client_audit_logs || [];
+    expect(log.filter(l => l.action === 'view').length === 1, `views logged: ${log.filter(l => l.action === 'view').length}`);
+    expect(log.some(l => l.action === 'download' && l.detail === 'a.pdf') && log.every(l => /^[0-9a-f]{64}$/.test(l.ip_hash)), 'download not logged, or IP not hashed');
+    const pack = await (await adminAct({ action: 'evidence-pack', id: o.id }, adminCookie())).json();
+    expect(pack.client_activity.length === 2 && pack.files[0].sha256 === 'a'.repeat(64) && pack.timeline_seal && pack.order.code === o.code, JSON.stringify(pack).slice(0, 300));
+});
+await check('P2 clients can send a note on any open request; it flags "Client replied" and leaves the status alone', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' });
+    const r = await track(o, { action: 'respond', reply: 'They work nights, try after 8 PM.' });
+    expect(r.status === 200, `note refused (${r.status} ${await r.clone().text()})`);
+    expect(tables().orders[0].status === 'attempting', 'status changed');
+    expect(evs(o).some(e => e.kind === 'action_response' && e.title === 'You sent Nick a note'), 'no note entry');
+    expect((tables().client_audit_logs || []).some(l => l.action === 'reply'), 'reply not logged');
+    const list = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(list.orders[0].client_replied === true, 'no Client replied flag');
+    const addr = await track(o, { action: 'respond', address: '9 Other St' });
+    expect(addr.status === 409 && tables().orders[0].address === '12 Main St', 'address changed without Nick asking');
+});
+await check('P2 a finished or locked request does not take notes', async () => {
+    reset(); const served = seedOrder({ status: 'served', legal_hold: true });
+    expect((await track(served, { action: 'respond', reply: 'hi' })).status === 409, 'served request took a note');
+    reset(); const locked = seedOrder({ status: 'attempting', doc_lock: true });
+    expect((await track(locked, { action: 'respond', reply: 'hi' })).status === 403, 'locked request took a note');
+});
+await check('P2 the list shows when Nick last contacted the client', async () => {
+    reset(); const o = seedOrder({ status: 'attempting' });
+    await adminAct({ action: 'update', id: o.id, kind: 'note', note: 'Private', clientVisible: false }, adminCookie());
+    let l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(l.orders[0].last_contact_at === null, 'a private note counted as contact');
+    await adminAct({ action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer' }, adminCookie());
+    l = await (await adminAct({ action: 'list' }, adminCookie())).json();
+    expect(typeof l.orders[0].last_contact_at === 'string', 'visible attempt not counted');
+});
+await check('P2 an expired, unpaid payment link can be renewed from the tracking page; a live one cannot', async () => {
+    reset(); const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_oldsession1', payment_url: 'https://checkout.stripe.com/c/pay/cs_test_oldsession1' });
+    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'open', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    expect((await track(o, { action: 'renew-payment' })).status === 409, 'renewed a link that still works');
+    stripeSessions.get('cs_test_oldsession1').status = 'expired';
+    const r = await (await track(o, { action: 'renew-payment' })).json();
+    expect(tables().orders[0].stripe_session_id !== 'cs_test_oldsession1' && /^https:\/\/checkout\.stripe\.com\//.test(r.payUrl || ''), `not renewed: ${JSON.stringify(r).slice(0, 200)}`);
+});
+await check('P2 the receipt appears once paid, and never on a locked page', async () => {
+    reset(); const paid = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 9000, status: 'paid', case_number: 'CV-1', court: 'LA Superior' });
+    const v = await (await track(paid, { action: 'view' })).json();
+    expect(v.receipt?.amountPaid === '$90.00' && v.receipt.caseNumber === 'CV-1', JSON.stringify(v.receipt));
+    reset(); const locked = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 9000, status: 'paid', doc_lock: true });
+    expect((await (await track(locked, { action: 'view' })).json()).receipt === null, 'receipt shown on a locked page');
+});
+
+// --- F-09: with two-step off, sensitive actions need an emailed step-up code, not just the session cookie ---
 async function emailedStepUp(cookie) {
     emails.length = 0;
     const res = await adminAct({ action: 'stepup-send-code' }, cookie);

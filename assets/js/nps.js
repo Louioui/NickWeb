@@ -300,9 +300,57 @@ const NPS = (() => {
         w.document.getElementById('print-record')?.addEventListener('click', () => w.print());
     }
 
+    // A plain printable page in a new tab, with a Print button wired by a listener (the pop-up inherits the page's
+    // Content Security Policy, so no inline script).
+    function printPage(title, bodyHtml) {
+        const w = window.open('', '_blank', 'width=900,height=800');
+        if (!w) { alert('Allow pop-ups for this site to print.'); return; }
+        w.opener = null;
+        w.document.write(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>${esc(title)}</title>
+            <style>body{font-family:Georgia,serif;color:#10221a;margin:32px;line-height:1.5}h1,h2{color:#0d422e;margin-bottom:6px}h2{font-size:17px;margin-top:24px}
+            table{width:100%;border-collapse:collapse;margin-top:8px;font-family:sans-serif;font-size:12px}th{background:#e6eee9;text-align:left;padding:8px;border:1px solid #cdd7d1}
+            td{padding:8px;border:1px solid #cdd7d1;vertical-align:top}.mono{font-family:monospace;font-size:11px;word-break:break-all}
+            @media print{.no-print{display:none}}</style></head><body>
+            <div class="no-print" style="text-align:right"><button id="print-page" type="button" style="padding:8px 16px;background:#0d422e;color:#fff;border:0;cursor:pointer;font-weight:600">Print / Save as PDF</button></div>
+            ${bodyHtml}</body></html>`);
+        w.document.close();
+        w.document.getElementById('print-page')?.addEventListener('click', () => w.print());
+    }
+    const rows = (pairs) => pairs.filter(([, v]) => v).map(([k, v]) => `<tr><th style="width:35%">${esc(k)}</th><td>${esc(v)}</td></tr>`).join('');
+
+    // Itemized receipt for a paid request (client's tracking page, or Nick's dashboard).
+    function printReceipt(r) {
+        printPage(`Receipt ${r.code}`, `<h1>Receipt</h1>
+            <p style="margin-top:0;color:#566860;font-size:13px">Nick's Process Services · printed ${esc(fmtDate(new Date().toISOString()))}</p>
+            <table><tbody>${rows([['Reference', r.code], ['Client', [r.clientName, r.clientFirm].filter(Boolean).join(', ')], ['Your reference', r.clientReference],
+                ['Case number', r.caseNumber], ['Court', r.court], ['Service', r.tier], ['Add-ons', (r.addons || []).join(', ')],
+                ['Amount paid', r.amountPaid], ['Date paid', fmtDate(r.paidAt)], ['Paid through', 'Stripe (card details are never seen by this site)']])}</tbody></table>`);
+    }
+
+    // Nick's dispute evidence pack: the record's own facts, laid out for a card dispute or a court question.
+    function printEvidencePack(p) {
+        const list = (items, cols) => items.length ? items.map(i => `<tr>${cols.map(c => `<td${c === 'sha256' ? ' class="mono"' : ''}>${esc(typeof c === 'function' ? c(i) : (i[c] ?? ''))}</td>`).join('')}</tr>`).join('')
+            : `<tr><td colspan="${cols.length}" style="color:#566860">None recorded</td></tr>`;
+        const o = p.order;
+        const activity = Array.isArray(p.client_activity) ? p.client_activity : [];
+        printPage(`Evidence pack ${o.code}`, `<h1>Evidence pack: ${esc(o.code)}</h1>
+            <p style="margin-top:0;color:#566860;font-size:13px">Generated ${esc(fmtDate(p.generated_at))} from the service record. Nothing here is added or edited by hand.</p>
+            <h2>Request</h2><table><tbody>${rows([['Client', [o.client.name, o.client.firm].filter(Boolean).join(', ')], ['Client email', o.client.email],
+                ['Case number', o.case_number], ['Court', o.court], ['Client reference', o.client_reference], ['Person served', o.recipient], ['Document', o.document],
+                ['Service', [o.tier, ...(o.addons || [])].filter(Boolean).join(' + ')], ['Requested', fmtDate(o.created_at)], ['Status', o.status], ['Served', o.served_at ? fmtDate(o.served_at) : '']])}</tbody></table>
+            <h2>Client's confirmation when submitting</h2><table><thead><tr><th>When</th><th>Entry</th><th>Details</th></tr></thead><tbody>${list(p.attestation, [i => fmtDate(i.created_at), 'title', 'detail'])}</tbody></table>
+            <h2>Payment</h2><table><tbody>${rows([['Amount', p.payment.amount_due], ['Paid at', p.payment.paid_at ? fmtDate(p.payment.paid_at) : 'Not paid'], ['Stripe checkout session', p.payment.stripe_session_id]])}</tbody></table>
+            <table><thead><tr><th>When</th><th>Payment entry</th><th>Details</th></tr></thead><tbody>${list(p.payment.entries, [i => fmtDate(i.created_at), 'title', 'detail'])}</tbody></table>
+            <h2>Service attempts</h2><table><thead><tr><th>Logged</th><th>Attempt</th><th>Details</th><th>Shown to client</th></tr></thead><tbody>${list(p.attempts, [i => fmtDate(i.created_at), 'title', 'detail', i => i.shown_to_client ? 'Yes' : 'No'])}</tbody></table>
+            <h2>Client activity on the tracking page</h2>${activity.length || !p.client_activity?.unavailable ? `<table><thead><tr><th>When</th><th>Action</th><th>Details</th><th>Network (hashed)</th></tr></thead><tbody>${list(activity, [i => fmtDate(i.created_at), 'action', 'detail', 'network'])}</tbody></table>` : `<p>${esc(p.client_activity.unavailable)}</p>`}
+            <h2>Files and SHA-256 fingerprints</h2><table><thead><tr><th>File</th><th>Type</th><th>Stored</th><th>SHA-256 (taken when stored)</th></tr></thead><tbody>${list(p.files, ['filename', 'kind', i => fmtDate(i.stored_at), 'sha256'])}</tbody></table>
+            <h2>Timeline seal</h2><p class="mono">${esc(p.timeline_seal?.verified ? 'Verified' : 'DOES NOT VERIFY')} · ${esc(String(p.timeline_seal?.entries || 0))} entries · ${esc(p.timeline_seal?.head || '')}</p>
+            <p style="font-size:11px;color:#566860;margin-top:20px">Network addresses are stored only as SHA-256 hashes (first 12 characters shown). Each file's fingerprint can be recomputed from the file itself (for example "shasum -a 256" on a Mac).</p>`);
+    }
+
     return {
         esc, post, get, onChange, fileMeta, checkFiles, uploadAll, stripPhotoBytes,
-        verifyFileSha256, printChainOfCustody,
+        verifyFileSha256, printChainOfCustody, printReceipt, printEvidencePack,
         money, fmtDate, fmtSize,
     };
 })();

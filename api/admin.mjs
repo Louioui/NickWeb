@@ -1,7 +1,7 @@
 // POST /api/admin { action, ... } — Nick's dashboard. Everything except the two login steps needs his session cookie.
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
-         sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
+         sha256, randomToken, cleanFileList, uuidList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
@@ -44,6 +44,8 @@ export const POST = handle(async (request) => {
     if (a === 'proof-finish') return proofFinish(request, body);
     if (a === 'file-url') return fileUrl(request, body, admin);
     if (a === 'export') return exportOrder(request, body, admin);
+    if (a === 'evidence-pack') return evidencePack(request, body, admin);
+    if (a === 'bulk-close') return bulkClose(request, body, admin);
     if (a === 'delete') return deleteOrder(request, body, admin);
     throw new HttpError(400, 'Unknown action.');
 });
@@ -306,6 +308,72 @@ async function passkeyRemove(request, body, admin) {
     return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
 }
 
+// Standard and Expedited service promise morning, evening and night attempts. Each attempt is labelled with its window,
+// in California time, from the time Nick gives (within the last 60 days) or now.
+const ATTEMPT_WINDOWS = ['morning', 'afternoon/evening', 'night'];
+function attemptWindow(at) {
+    let t = Date.now();
+    if (typeof at === 'string' && at) {
+        const parsed = Date.parse(at);
+        if (!Number.isFinite(parsed) || parsed > Date.now() + 3600e3 || parsed < Date.now() - 60 * 864e5) throw new HttpError(400, 'Check the attempt time.');
+        t = parsed;
+    }
+    const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', hourCycle: 'h23' }).format(t));
+    return hour < 12 ? ATTEMPT_WINDOWS[0] : hour < 19 ? ATTEMPT_WINDOWS[1] : ATTEMPT_WINDOWS[2];
+}
+
+// Close several finished jobs at once. Only Served or Cancelled jobs move to Closed; anything else is left alone.
+async function bulkClose(request, body, admin) {
+    await rateLimit(`admin-bulk:${sha256(admin)}`, 10, 900);
+    const ids = uuidList(body.ids).slice(0, 50);
+    if (!ids.length) throw new HttpError(400, 'Choose at least one finished job.');
+    const { data: rows, error } = await db().from('orders').select('id, code, status').in('id', ids);
+    if (error) throw error;
+    const closable = (rows || []).filter(o => ['served', 'cancelled'].includes(o.status));
+    const closed = [];
+    for (const o of closable) {
+        // Only if it's still Served or Cancelled now, so a job reopened in the meantime isn't closed by mistake.
+        const { data: changed, error: uErr } = await db().from('orders').update({ status: 'closed' })
+            .eq('id', o.id).eq('status', o.status).select('id');
+        if (uErr) throw uErr;
+        if (!changed?.length) continue;
+        await addEvent(o.id, 'status', STATUSES.closed.label, null, true);
+        closed.push(o.code);
+    }
+    if (closed.length) await auditAdmin(request, admin, 'bulk_close', null, `Closed ${closed.join(', ')}`.slice(0, 300));
+    return json({ ok: true, closed, skipped: ids.length - closed.length });
+}
+
+// One bundle for a card dispute or a court question: the client's attestation, payment, every attempt, what the client
+// opened and downloaded, file fingerprints and the timeline seal. Facts from the record only; no claims added.
+async function evidencePack(request, body, admin) {
+    await rateLimit(`admin-export:${sha256(admin)}`, 15, 900);
+    const { order, events, files, integritySeal } = await detail(body.id);
+    const { data: clientLog, error: cErr } = await db().from('client_audit_logs').select('created_at, action, detail, ip_hash')
+        .eq('order_id', order.id).order('created_at', { ascending: true }).limit(2000);
+    await auditAdmin(request, admin, 'evidence_pack', order.code);
+    const pick = (kinds) => events.filter(e => kinds.includes(e.kind)).map(({ created_at, title, detail: d, client_visible }) =>
+        ({ created_at, title, detail: d, shown_to_client: client_visible }));
+    return json({
+        generated_at: new Date().toISOString(),
+        order: {
+            code: order.code, status: STATUSES[order.status]?.label || order.status, created_at: order.created_at,
+            client: { name: order.client_name, firm: order.client_firm || null, email: order.client_email },
+            case_number: order.case_number || null, court: order.court || null, client_reference: order.client_reference || null,
+            recipient: order.recipient_name, document: order.doc_type, tier: order.tier_name, addons: order.addon_names,
+            served_at: order.served_at || null, legal_hold: !!order.legal_hold,
+        },
+        attestation: pick(['attestation']),
+        payment: { amount_due: order.amount_due_cents != null ? money(order.amount_due_cents) : null, paid_at: order.paid_at || null,
+            stripe_session_id: order.stripe_session_id || null, entries: pick(['payment']) },
+        attempts: pick(['attempt']),
+        client_activity: cErr ? { unavailable: 'The client activity log is not set up yet.' }
+            : (clientLog || []).map(({ created_at, action, detail: d, ip_hash }) => ({ created_at, action, detail: d, network: ip_hash ? ip_hash.slice(0, 12) : null })),
+        files: files.map(({ filename, kind, size_bytes, sha256: h, created_at }) => ({ filename, kind, size_bytes, sha256: h || null, stored_at: created_at })),
+        timeline_seal: integritySeal,
+    });
+}
+
 async function requireAdmin(request) {
     const token = getCookie(request, COOKIE);
     if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{40,64}$/.test(token)) throw new HttpError(401, 'Please log in.');
@@ -455,18 +523,22 @@ async function list() {
 // A job "has a client reply" when the client's answer is newer than anything Nick has done on it since.
 // Only "received" jobs can be in that state (answering sets it), which keeps the id list short enough for one query.
 const NICK_KINDS = ['action', 'status', 'attempt', 'payment', 'proof'];
+// For each job still in play: did the client reply after Nick's last move, and when did Nick last contact the client
+// (the newest entry the client can see that came from Nick). Closed and cancelled jobs are skipped.
 async function withClientReplied(list) {
-    const ids = list.filter(o => o.status === 'received').map(o => o.id).slice(0, 150);
-    if (!ids.length) return list.map(o => ({ ...o, client_replied: false }));
-    const { data: evs, error } = await db().from('order_events').select('order_id, kind')
-        .in('order_id', ids).in('kind', [...NICK_KINDS, 'action_response'])
-        .order('created_at', { ascending: false }).limit(5000);
+    const ids = list.filter(o => !['closed', 'cancelled'].includes(o.status)).map(o => o.id).slice(0, 300);
+    if (!ids.length) return list.map(o => ({ ...o, client_replied: false, last_contact_at: null }));
+    const { data: evs, error } = await db().from('order_events').select('order_id, kind, created_at, client_visible')
+        .in('order_id', ids).in('kind', [...NICK_KINDS, 'note', 'action_response'])
+        .order('created_at', { ascending: false }).limit(10000);
     if (error) throw error;
-    const latest = new Map();
-    for (const e of evs) if (!latest.has(e.order_id)) latest.set(e.order_id, e.kind);
-    return list.map(o => ({ ...o, client_replied: latest.get(o.id) === 'action_response' }));
+    const latest = new Map(), contact = new Map();
+    for (const e of evs) {
+        if (e.kind !== 'note' && !latest.has(e.order_id)) latest.set(e.order_id, e.kind);
+        if (e.kind !== 'action_response' && e.client_visible && !contact.has(e.order_id)) contact.set(e.order_id, e.created_at);
+    }
+    return list.map(o => ({ ...o, client_replied: latest.get(o.id) === 'action_response', last_contact_at: contact.get(o.id) || null }));
 }
-
 async function getOrder(id) {
     uuid(id, 'Order');
     const { data, error } = await db().from('orders').select('*').eq('id', id).maybeSingle();
@@ -479,10 +551,14 @@ async function detail(id) {
     const order = await getOrder(id);
     const [{ data: events }, fileRes] = await Promise.all([
         db().from('order_events').select('*').eq('order_id', id).order('created_at', { ascending: true }),
-        db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at, uploaded').eq('order_id', id).order('created_at'),
+        db().from('order_files').select('id, kind, filename, size_bytes, sha256, page_count, created_at, uploaded').eq('order_id', id).order('created_at'),
     ]);
     let files = fileRes.data;
     if (fileRes.error) {
+        const withoutPages = await db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at, uploaded').eq('order_id', id).order('created_at');
+        files = withoutPages.error ? null : withoutPages.data;
+    }
+    if (!files) {
         const fallback = await db().from('order_files').select('id, kind, filename, size_bytes, created_at, uploaded').eq('order_id', id).order('created_at');
         files = fallback.data;
     }
@@ -529,8 +605,9 @@ async function update(request, body, admin) {
     } else if (kind === 'attempt') {
         const outcome = text(body.outcome, { max: 120, required: true, label: 'Outcome' });
         const when = text(body.when, { max: 40 });   // blank means "now", which the entry's own timestamp already shows
+        const window = attemptWindow(body.at);
         if (['received', 'paid', 'accepted'].includes(order.status)) await db().from('orders').update({ status: 'attempting' }).eq('id', order.id);
-        await addEvent(order.id, 'attempt', `Attempt: ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
+        await addEvent(order.id, 'attempt', `Attempt (${window}): ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
     } else if (kind === 'note') {
         if (!note) throw new HttpError(400, 'Write a note first.');
         await addEvent(order.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);

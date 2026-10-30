@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS } from './core.mjs';
+import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS, clientIp, sha256 } from './core.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -107,6 +107,13 @@ export async function clientView(order, { unlocked = false } = {}) {
         // Held (served) orders keep their status when billed afterwards, so an unpaid link alone shows the Pay button.
         payUrl: (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
         paidAt: order.paid_at,
+        // Receipt details, once paid and unlocked (case details stay hidden on a locked page).
+        receipt: order.paid_at && !isLocked ? {
+            code: order.code, caseNumber: order.case_number || null, court: order.court || null, clientReference: order.client_reference || null,
+            tier: TIERS[order.tier]?.name || order.tier, addons: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
+            amountPaid: money(order.amount_due_cents), paidAt: order.paid_at, clientName: order.client_name, clientFirm: order.client_firm || null,
+        } : null,
+        canReply: !isLocked && ['action_required', 'received', 'awaiting_payment', 'paid', 'accepted', 'attempting'].includes(order.status),
         actionNote: order.status === 'action_required' && !isLocked ? order.action_note : null,
         docLock: !!order.doc_lock,
         unlocked: !isLocked,
@@ -259,4 +266,23 @@ ${button ? `<p style="margin:24px 0 8px"><a href="${escHtml(button.url)}" style=
 </td></tr>
 <tr><td style="padding:16px 28px;border-top:1px solid #e6e0d2;font-size:12px;color:#6b6b62">Questions? Call or text Nick at (209) 922-6817 or reply to this email.<br><br>You're receiving this because a service request was made at nicksprocessservices.dev with this email address. It's a message about that request only; we don't send marketing emails. If you didn't make this request, reply and let us know.</td></tr>
 </table></td></tr></table></body></html>`;
+}
+
+// Records what a client did on their tracking page, for Nick's dispute evidence. Never blocks the client: if the table
+// doesn't exist yet or the write fails, the action still goes ahead.
+const CLIENT_ACTIONS = new Set(['view', 'unlock', 'download', 'reply', 'payment', 'renew_payment']);
+export async function logClientAction(request, orderId, action, detail = null) {
+    if (!CLIENT_ACTIONS.has(action)) return;
+    try {
+        const ip = clientIp(request);
+        if (action === 'view') {
+            // A tracking page refreshes itself every 20 seconds; one view entry an hour per visitor is enough.
+            const { data: n } = await db().rpc('hit_rate_limit', { p_bucket: `audit-view:${orderId}:${sha256(ip)}`, p_window_seconds: 3600 });
+            if (n !== 1) return;
+        }
+        await db().from('client_audit_logs').insert({
+            order_id: orderId, action, detail: detail ? String(detail).slice(0, 300) : null, ip_hash: sha256(ip),
+            user_agent: String(request.headers.get('user-agent') || '').slice(0, 200) || null,
+        }).then(() => {}, () => {});
+    } catch { /* never block the client */ }
 }
