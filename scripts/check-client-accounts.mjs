@@ -95,6 +95,15 @@ check('mock active jobs include a last client contact date', () => {
 });
 const servedOrder = listData.orders.find(o => o.code === 'NP-894771');
 const detailData = await (await call({ action: 'get', id: servedOrder.id }, nickCookie, 'admin')).json();
+const accountReceipt = await (await call({ action: 'receipt', code: servedOrder.code }, a)).json();
+check('mock receipt is itemized and uses the recorded captured amount', () => {
+    assert.equal(accountReceipt.receipt.amountPaidCents, 14000);
+    assert.equal(accountReceipt.receipt.items.reduce((sum, item) => sum + item.cents, 0), 14000);
+    assert.equal(detailData.order.receipt.amountPaidCents, 14000);
+});
+const otherReceiptCookie = await signup('receipt-other@example.com');
+assert.equal((await call({ action: 'receipt', code: servedOrder.code }, otherReceiptCookie)).status, 404);
+passed++; console.log('PASS mock receipt cannot be fetched by another client');
 const proofFile = detailData.files.find(f => f.kind === 'proof');
 check('Proof of Service has a verified 64-char SHA-256 chain-of-custody fingerprint in admin view', () => {
     assert.ok(proofFile && /^[0-9a-f]{64}$/.test(proofFile.sha256));

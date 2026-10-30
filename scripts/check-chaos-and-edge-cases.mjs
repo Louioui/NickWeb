@@ -32,6 +32,7 @@ await check('ten simultaneous payment confirmations change the order and timelin
     const outcomes = await Promise.all(Array.from({ length: 10 }, () => markPaid(target.id, 7500, target.stripe_session_id)));
     assert.equal(outcomes.filter(Boolean).length, 1);
     assert.ok(target.paid_at);
+    assert.equal(target.paid_amount_cents, 7500);
     assert.equal(paymentEvents(target.id).length, 1);
 });
 
@@ -40,6 +41,7 @@ await check('a timeline insert failure cannot leave a paid order without its eve
     database.__state.failEventInsert = true;
     await assert.rejects(markPaid(target.id, 7500, target.stripe_session_id));
     assert.equal(target.paid_at, null);
+    assert.equal(target.paid_amount_cents ?? null, null);
     assert.equal(paymentEvents(target.id).length, 0);
 });
 

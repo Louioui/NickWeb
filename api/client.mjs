@@ -4,7 +4,7 @@ import { clientAuth, clientCookie, savedClientSession, requireClient, verifiedCl
          getClientSecurity, pinLocked, recordPinFailure, clearPinFailures,
          rememberDevice, isTrustedDevice, forgetDevices, DEVICE_COOKIE, isFreshSignIn } from './_lib/clients.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, dropPasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
-import { STATUSES, TIERS, money, sendEmail, sendSecurityAlert } from './_lib/orders.mjs';
+import { STATUSES, TIERS, money, receiptForOrder, sendEmail, sendSecurityAlert } from './_lib/orders.mjs';
 
 const PIN_LOCKED_MESSAGE = 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.';
 const ASK_FOR_PIN = { ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' };
@@ -318,6 +318,16 @@ export const POST = handle(async request => {
                 trackUrl: `/track.html#t=${encodeURIComponent(o.track_token)}`,
             })),
         }, 200, headers);
+    }
+    if (action === 'receipt') {
+        await rateLimit(`client-receipt:${user.id}`, 30, 900);
+        const code = cleanOrderCode(body.code);
+        const { data: order, error } = await db().from('orders').select('*').eq('client_email', clientEmail).eq('code', code).maybeSingle();
+        if (error) throw error;
+        if (!order) throw new HttpError(404, 'Order not found.');
+        const receipt = receiptForOrder(order);
+        if (!receipt) throw new HttpError(409, order.paid_at ? 'The payment amount for this earlier order needs review before a receipt can be shown.' : 'This order has not been paid.');
+        return json({ receipt }, 200, headers);
     }
     throw new HttpError(400, 'Unknown action.');
 });

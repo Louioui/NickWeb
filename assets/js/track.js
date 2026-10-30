@@ -49,6 +49,7 @@ function render(o) {
     $('o-service').textContent = o.tier + (o.addons.length ? ' + ' + o.addons.join(', ') : '');
     $('o-price-label').textContent = o.paidAt ? 'Paid' : o.amountDue ? 'Amount due' : 'Estimate';
     $('o-price').textContent = o.amountDue || o.estimate;
+    $('print-receipt').classList.toggle('hidden', !o.receipt);
     $('o-created').textContent = NPS.fmtDate(o.createdAt);
 
     const stage = STAGE_OF[o.status];
@@ -111,7 +112,7 @@ async function load() {
             render(o);
             const banner = $('paid-banner');
             banner.innerHTML = o.paidAt
-                ? '<i class="fa-solid fa-circle-check mr-1"></i> <strong>Thank you, your payment was received.</strong> A receipt is on its way to your email.'
+                ? '<i class="fa-solid fa-circle-check mr-1"></i> <strong>Thank you, your payment was received.</strong> Open your printable receipt below when available.'
                 : '<i class="fa-solid fa-clock mr-1"></i> Your payment is processing. This page will update once it clears.';
             banner.classList.remove('hidden');
             return;
@@ -121,6 +122,10 @@ async function load() {
         showNotFound(err.status === 404 ? null : `${err.message} Your tracking link has been kept. Please try again.`, err.status !== 404);
     }
 }
+
+document.addEventListener('click', async (e) => {
+    if (e.target.closest('#print-receipt') && order?.receipt) NPS.printReceipt(order.receipt);
+});
 
 document.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-file]');

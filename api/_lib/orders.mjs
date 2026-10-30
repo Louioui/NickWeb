@@ -40,6 +40,18 @@ export const STATUSES = {
 
 export const money = (cents) => '$' + (cents / 100).toFixed(2);
 
+// Only the amount captured from Stripe is suitable for a receipt. Older paid rows without that amount need review.
+export function receiptForOrder(order) {
+    if (!order?.paid_at || !Number.isSafeInteger(order.paid_amount_cents) || order.paid_amount_cents <= 0) return null;
+    const tier = TIERS[order.tier];
+    const items = tier ? [{ label: tier.name, cents: tier.cents }] : [];
+    for (const key of order.addons || []) if (Object.hasOwn(ADDONS, key)) items.push({ label: ADDONS[key].name, cents: ADDONS[key].cents });
+    const difference = order.paid_amount_cents - items.reduce((sum, item) => sum + item.cents, 0);
+    if (difference) items.push({ label: 'Other charges or adjustments', cents: difference });
+    return { code: order.code, caseNumber: order.case_number || null, court: order.court || null,
+        paidAt: order.paid_at, amountPaidCents: order.paid_amount_cents, items };
+}
+
 export function estimate(tier, addonKeys) {
     if (typeof tier !== 'string' || !Object.hasOwn(TIERS, tier)) throw new HttpError(400, 'Please choose a service tier.');
     const t = TIERS[tier];
@@ -116,6 +128,7 @@ export async function clientView(order, { unlocked = false } = {}) {
         // Held (served) orders keep their status when billed afterwards, so an unpaid link alone shows the Pay button.
         payUrl: (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
         paidAt: order.paid_at,
+        receipt: isLocked ? null : receiptForOrder(order),
         actionNote: order.status === 'action_required' && !isLocked ? order.action_note : null,
         docLock: !!order.doc_lock,
         unlocked: !isLocked,

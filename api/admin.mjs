@@ -3,7 +3,7 @@ import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
          sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
-import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal, attemptDetail } from './_lib/orders.mjs';
+import { STATUSES, TIERS, ADDONS, money, receiptForOrder, sendEmail, sendSecurityAlert, markPaid, orderSeal, attemptDetail } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 import { zipEvidencePack } from './_lib/evidence-pack.mjs';
@@ -495,6 +495,7 @@ async function detail(id) {
             integrity_seal: integritySeal,
             tier_name: TIERS[order.tier]?.name,
             addon_names: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
+            receipt: receiptForOrder(order),
         },
         events,
         files: uploadedFiles,

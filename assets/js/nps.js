@@ -268,6 +268,17 @@ const NPS = (() => {
     };
     const fmtSize = (bytes) => bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB';
 
+    function printReceipt(receipt, openedWindow = null) {
+        if (!receipt || !Number.isSafeInteger(receipt.amountPaidCents)) return;
+        const w = openedWindow || window.open('', '_blank', 'width=800,height=800');
+        if (!w) { alert('Allow pop-ups for this site to print the receipt.'); return; }
+        w.opener = null;
+        const items = (receipt.items || []).map(item => `<tr><td>${esc(item.label)}</td><td style="text-align:right">${esc(money(item.cents))}</td></tr>`).join('');
+        w.document.write(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Receipt ${esc(receipt.code)}</title><style>body{font-family:Georgia,serif;color:#10221a;margin:40px;line-height:1.5}h1{color:#0d422e}table{width:100%;border-collapse:collapse;margin-top:24px;font-family:Arial,sans-serif}td{padding:10px;border-bottom:1px solid #cdd7d1}.total td{font-weight:bold;border-top:2px solid #0d422e}.no-print{text-align:right}@media print{.no-print{display:none}}</style></head><body><div class="no-print"><button id="print-receipt" type="button">Print / Save as PDF</button></div><h1>Payment receipt</h1><p>Nick's Process Services</p><p><strong>Request:</strong> ${esc(receipt.code)}<br><strong>Case number:</strong> ${esc(receipt.caseNumber || 'Not provided')}<br><strong>Court:</strong> ${esc(receipt.court || 'Not provided')}<br><strong>Paid:</strong> ${esc(fmtDate(receipt.paidAt))}</p><table><tbody>${items}<tr class="total"><td>Amount paid</td><td style="text-align:right">${esc(money(receipt.amountPaidCents))}</td></tr></tbody></table></body></html>`);
+        w.document.close();
+        w.document.getElementById('print-receipt')?.addEventListener('click', () => w.print());
+    }
+
     // Printable service record for Nick (court files, disputes). It states what the system really does, nothing more:
     // SHA-256 fingerprints taken when each file was stored, and the timeline's hash-chain seal checked by the database.
     function printChainOfCustody(cert) {
@@ -310,7 +321,7 @@ const NPS = (() => {
 
     return {
         esc, post, get, onChange, fileMeta, checkFiles, uploadAll, stripPhotoBytes,
-        verifyFileSha256, printChainOfCustody,
+        verifyFileSha256, printChainOfCustody, printReceipt,
         money, fmtDate, fmtSize, fmtAttemptDetail,
     };
 })();

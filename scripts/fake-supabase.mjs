@@ -151,6 +151,7 @@ export function createFakeSupabase() {
                 throw new Error('simulated timeline insert failure');
             }
             r.paid_at = new Date().toISOString();
+            r.paid_amount_cents = p_amount_cents;
             r.stripe_session_id = p_session_id;
             if (!r.legal_hold) r.status = 'paid';
             rows('order_events').push({ id: randomUUID(), order_id: p_order, kind: 'payment',

@@ -191,7 +191,7 @@
         const done = o => ['served', 'closed', 'cancelled'].includes(o.status);
         const shown = orders.filter(o => (filter === 'all' || (filter === 'done' ? done(o) : !done(o))) && (!q || [o.code, o.recipient, o.document].some(v => (v || '').toLowerCase().includes(q))));
         $('client-count').textContent = `${shown.length} ${shown.length === 1 ? 'request' : 'requests'}`;
-        $('client-orders').innerHTML = shown.length ? shown.map(o => `<article class="client-request"><a class="block" href="${esc(o.trackUrl)}"><div class="flex flex-wrap justify-between gap-3"><span class="text-xs text-muted">${esc(o.code)}</span><span class="status-pill ${done(o) || o.paid ? 'status-done' : o.status === 'action_required' ? 'status-alert' : 'status-live'}">${esc(o.label)}</span></div><h2 class="font-serif text-lg text-primary mt-3">${esc(o.recipient)}</h2><p class="text-sm text-muted mt-1">${esc(o.document)}</p><div class="flex flex-wrap justify-between gap-3 text-xs mt-4"><span>${esc(NPS.fmtDate(o.created, false))} · ${esc(o.service || '')}</span><span class="font-semibold text-primary">${esc(o.amount)} ${o.paid ? 'paid' : 'estimate / due'} · View request →</span></div></a><button type="button" class="btn btn-outline btn-sm mt-3" data-account-files="${esc(o.code)}">Show documents and fingerprints</button><div data-account-files-result="${esc(o.code)}" class="mt-3 text-xs" role="status"></div></article>`).join('') : `<div class="p-8 text-center"><h2 class="font-serif text-xl text-primary mb-3">${orders.length ? 'No matching requests' : 'Your first request starts here'}</h2><p class="text-sm text-muted mb-5">${orders.length ? 'Try another name, reference or filter.' : 'Submit a service request using your verified email. It will appear here for updates, payment and proof.'}</p>${orders.length ? '<button id="clear-client-filter" type="button" class="btn btn-outline btn-sm">Show all requests</button>' : '<a href="/?client=1#checkout" class="btn btn-pine btn-sm">Start a request</a>'}</div>`;
+        $('client-orders').innerHTML = shown.length ? shown.map(o => `<article class="client-request"><a class="block" href="${esc(o.trackUrl)}"><div class="flex flex-wrap justify-between gap-3"><span class="text-xs text-muted">${esc(o.code)}</span><span class="status-pill ${done(o) || o.paid ? 'status-done' : o.status === 'action_required' ? 'status-alert' : 'status-live'}">${esc(o.label)}</span></div><h2 class="font-serif text-lg text-primary mt-3">${esc(o.recipient)}</h2><p class="text-sm text-muted mt-1">${esc(o.document)}</p><div class="flex flex-wrap justify-between gap-3 text-xs mt-4"><span>${esc(NPS.fmtDate(o.created, false))} · ${esc(o.service || '')}</span><span class="font-semibold text-primary">${esc(o.amount)} ${o.paid ? 'paid' : 'estimate / due'} · View request →</span></div></a><button type="button" class="btn btn-outline btn-sm mt-3" data-account-files="${esc(o.code)}">Show documents and fingerprints</button>${o.paid ? `<button type="button" class="btn btn-outline btn-sm mt-3 ml-2" data-account-receipt="${esc(o.code)}">Open printable receipt</button>` : ''}<div data-account-files-result="${esc(o.code)}" class="mt-3 text-xs" role="status"></div></article>`).join('') : `<div class="p-8 text-center"><h2 class="font-serif text-xl text-primary mb-3">${orders.length ? 'No matching requests' : 'Your first request starts here'}</h2><p class="text-sm text-muted mb-5">${orders.length ? 'Try another name, reference or filter.' : 'Submit a service request using your verified email. It will appear here for updates, payment and proof.'}</p>${orders.length ? '<button id="clear-client-filter" type="button" class="btn btn-outline btn-sm">Show all requests</button>' : '<a href="/?client=1#checkout" class="btn btn-pine btn-sm">Start a request</a>'}</div>`;
         $('clear-client-filter')?.addEventListener('click', () => { filter = 'all'; $('client-search').value = ''; setFilterButtons(); renderOrders(); });
     }
     const trackingAccess = (o) => {
@@ -203,16 +203,21 @@
     $('client-orders').addEventListener('click', async (event) => {
         const listButton = event.target.closest('[data-account-files]');
         const verifyButton = event.target.closest('[data-account-verify]');
-        const button = listButton || verifyButton;
+        const receiptButton = event.target.closest('[data-account-receipt]');
+        const button = listButton || verifyButton || receiptButton;
         if (!button) return;
-        const code = button.dataset.accountFiles || button.dataset.orderCode;
+        const code = button.dataset.accountFiles || button.dataset.accountReceipt || button.dataset.orderCode;
         const o = orders.find(item => item.code === code);
         const result = button.closest('article')?.querySelector('[data-account-files-result]');
         if (!o || !result) return;
         const { token, unlockToken } = trackingAccess(o);
+        const receiptWindow = receiptButton ? window.open('', '_blank', 'width=800,height=800') : null;
         button.disabled = true;
         try {
-            if (listButton) {
+            if (receiptButton) {
+                const { receipt } = await post('receipt', { code });
+                NPS.printReceipt(receipt, receiptWindow);
+            } else if (listButton) {
                 const view = await NPS.post('/api/track', { t: token, unlockToken, action: 'view' }, { notify: false });
                 if (view.docLock && !view.unlocked) {
                     result.innerHTML = `<p>Open the tracking page and unlock documents to see their fingerprints here.</p><a class="underline text-primary" href="${esc(o.trackUrl)}">Unlock documents →</a>`;
@@ -229,7 +234,7 @@
                 status.textContent = verification.ok ? 'Matches sealed record' : 'File does not match the recorded fingerprint. Contact Nick.';
                 status.className = verification.ok ? 'block mt-1 text-primary font-semibold' : 'block mt-1 text-[#7a1f1c] font-semibold';
             }
-        } catch (err) { result.textContent = err.message || 'Could not load the files. Please try again.'; }
+        } catch (err) { receiptWindow?.close(); result.textContent = err.message || 'Could not load the files. Please try again.'; }
         finally { button.disabled = false; }
     });
     function setFilterButtons() { document.querySelectorAll('[data-client-filter]').forEach(btn => { btn.setAttribute('aria-pressed', String(btn.dataset.clientFilter === filter)); btn.classList.toggle('is-active', btn.dataset.clientFilter === filter); }); }

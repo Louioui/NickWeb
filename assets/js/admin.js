@@ -335,7 +335,7 @@ function renderDetail() {
             </div>
             ${groups.length ? `<div class="mt-7 pt-5 rule-t space-y-4">${groups.map(([label, list]) => `
                 <div><p class="field-label">${label}</p><div class="flex flex-wrap gap-2">${list.map(fileChip).join('')}</div></div>`).join('')}</div>` : ''}
-            <div class="mt-7 pt-5 rule-t"><button type="button" class="btn btn-outline btn-sm" data-click="downloadDisputePack">Download Dispute Evidence Pack</button><p class="text-xs text-muted mt-2">Printable HTML and source JSON in one ZIP file.</p></div>
+            <div class="mt-7 pt-5 rule-t">${o.receipt ? '<button type="button" class="btn btn-outline btn-sm mr-2" data-click="printReceipt">Open printable receipt</button>' : ''}<button type="button" class="btn btn-outline btn-sm" data-click="downloadDisputePack">Download Dispute Evidence Pack</button><p class="text-xs text-muted mt-2">Printable HTML and source JSON in one ZIP file.</p></div>
         </div>
 
         <div class="panel">
@@ -582,6 +582,7 @@ function printRecord() {
         seal: o.integrity_seal, files: current.files, events: current.events,
     });
 }
+function printReceipt() { if (current?.order?.receipt) NPS.printReceipt(current.order.receipt); }
 async function exportJob() {
     const data = await api('export', { id: current.order.id });
     const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
@@ -950,7 +951,7 @@ async function copyAddress() {
 // Buttons say what they do with data-click (and data-arg) instead of inline onclick, so the page's Content Security
 // Policy can refuse inline scripts. Only the functions listed here can be triggered this way.
 const CLICK_ACTIONS = {
-    backToList, closeSecurityModal, refreshJobs, exportJob, downloadDisputePack, showEmailStep, rotateLink, toggleDocLockJob, printRecord, copyAddress,
+    backToList, closeSecurityModal, refreshJobs, exportJob, downloadDisputePack, showEmailStep, rotateLink, toggleDocLockJob, printRecord, printReceipt, copyAddress,
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes, sendStepUpCode,
     dismissSecuritySetup, openRecoverySetup,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,

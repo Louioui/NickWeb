@@ -122,6 +122,20 @@ await check('F-01 the cookie issued after sign-in (code + PIN) works for later r
 });
 
 const cookieFor = (session, userId) => clients.clientCookie(new Request('https://site.test/api/client'), session, userId).split(';')[0];
+await check('receipt uses captured Stripe amount and is scoped to the signed-in client', async () => {
+    reset(); const user = db.__addUser(CLIENT);
+    const paid = seedOrder({ status: 'paid', amount_due_cents: 7500, paid_at: new Date().toISOString(),
+        paid_amount_cents: 9000, case_number: 'CV-42', court: 'Superior Court', addons: ['photo'] });
+    const cookie = cookieFor({ access_token: db.__sessionFor(CLIENT), refresh_token: 'r' }, user.id);
+    const good = await clientPOST(post('/api/client', { action: 'receipt', code: paid.code }, { cookie }));
+    const data = await good.json();
+    expect(good.status === 200 && data.receipt.amountPaidCents === 9000, 'captured amount absent');
+    expect(data.receipt.items.reduce((sum, item) => sum + item.cents, 0) === 9000, 'receipt lines do not total captured amount');
+    expect(data.receipt.caseNumber === 'CV-42' && data.receipt.court === 'Superior Court', 'case metadata absent');
+    paid.client_email = 'other@example.com';
+    const denied = await clientPOST(post('/api/client', { action: 'receipt', code: paid.code }, { cookie }));
+    expect(denied.status === 404, 'another client could fetch the receipt');
+});
 await check('F-01 a signed cookie for one client is refused with another client\'s tokens', async () => {
     reset(); const a = db.__addUser(CLIENT); db.__addUser('other@example.com');
     const cookie = cookieFor({ access_token: db.__sessionFor('other@example.com'), refresh_token: 'r' }, a.id);

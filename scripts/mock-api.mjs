@@ -2,7 +2,7 @@
 // form, tracking page and dashboard can be clicked through before any keys exist. Orders live in memory and reset on restart.
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
 import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
-import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken, attemptDetail } from '../api/_lib/orders.mjs';
+import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken, receiptForOrder, attemptDetail } from '../api/_lib/orders.mjs';
 import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
 import { stripPhotoBytes } from '../api/_lib/photo-metadata.mjs';
 import { zipEvidencePack } from '../api/_lib/evidence-pack.mjs';
@@ -192,7 +192,7 @@ function clientView(o, { unlocked = false } = {}) {
         amountDue: o.amount_due_cents != null ? money(o.amount_due_cents) : null,
         payUrl: (o.status === 'awaiting_payment' || (o.legal_hold && !o.paid_at)) ? o.payment_url : null,
         // Same as api/_lib/orders.mjs: a locked view keeps status and dates, not what was said or sent.
-        paidAt: o.paid_at, actionNote: o.status === 'action_required' && !isLocked ? o.action_note : null,
+        paidAt: o.paid_at, receipt: isLocked ? null : receiptForOrder(o), actionNote: o.status === 'action_required' && !isLocked ? o.action_note : null,
         docLock: !!o.doc_lock,
         unlocked: !isLocked,
         legalHold: !!o.legal_hold,
@@ -208,7 +208,7 @@ function adminDetail(o) {
     const fls = [...files.values()].filter(f => f.order_id === o.id && f.uploaded).map(({ data, ...f }) => f);
     const seal = orderSeal(o.id);
     return {
-        order: { ...o, legal_hold: !!o.legal_hold, doc_lock: !!o.doc_lock, integrity_seal: seal, tier_name: TIERS[o.tier]?.name, addon_names: o.addons.map(k => ADDONS[k]?.name).filter(Boolean) },
+        order: { ...o, legal_hold: !!o.legal_hold, doc_lock: !!o.doc_lock, integrity_seal: seal, tier_name: TIERS[o.tier]?.name, addon_names: o.addons.map(k => ADDONS[k]?.name).filter(Boolean), receipt: receiptForOrder(o) },
         events: evs,
         files: fls,
         integritySeal: seal,
@@ -320,7 +320,7 @@ function markPaid(o, sessionId, amountCents = o?.amount_due_cents) {
     if (!Number.isSafeInteger(paidCents) || paidCents <= 0) return false;
     if (o.amount_due_cents != null && paidCents < o.amount_due_cents) return false;
     // Same as api/_lib/orders.mjs: a held (served) order records the payment and keeps its status.
-    updateOrder(o, { paid_at: now(), stripe_session_id: sessionId, ...(o.legal_hold ? {} : { status: 'paid' }) });
+    updateOrder(o, { paid_at: now(), paid_amount_cents: paidCents, stripe_session_id: sessionId, ...(o.legal_hold ? {} : { status: 'paid' }) });
     addEvent(o.id, 'payment', `Payment received: ${money(paidCents)}`);
     return true;
 }
@@ -480,6 +480,14 @@ const handlers = {
             return json({ profile, orders: list.map(o => ({ code: o.code, status: o.status, label: STATUSES[o.status].label, recipient: o.recipient_name, document: o.doc_type,
                 service: TIERS[o.tier]?.name, created: o.created_at, amount: money(o.amount_due_cents ?? o.estimated_total_cents), paid: !!o.paid_at,
                 docLock: !!o.doc_lock, legalHold: o.status === 'served' || !!o.legal_hold, trackUrl: `/track.html#t=${o.track_token}` })) });
+        }
+        if (action === 'receipt') {
+            const code = (cleanText(body.code, 20, true, 'Reference number') || '').toUpperCase().replace(/^(NP)?-?/, 'NP-');
+            const o = [...orders.values()].find(ord => ord.client_email.toLowerCase() === verifiedEmail && ord.code === code);
+            if (!o) fail(404, 'Order not found.');
+            const receipt = receiptForOrder(o);
+            if (!receipt) fail(409, o.paid_at ? 'The payment amount for this earlier order needs review before a receipt can be shown.' : 'This order has not been paid.');
+            return json({ receipt });
         }
         fail(400, 'Unknown action.');
     },
@@ -1163,14 +1171,14 @@ function sampleFile(orderId, kind, filename, at) {
     addEvent(c.id, 'created', 'Request received', 'Same-Day Rush Service · estimate $175.00', true, ago(6));
     addEvent(c.id, 'payment', 'Payment requested: $175.00', 'Same-Day Rush Service', true, ago(1));
 
-    const d = mk({ code: 'NP-517309', recipient_name: 'Kevin Tran', address: '3300 Atlantic Ave', zip: '90807', status: 'attempting', amount_due_cents: 14000, paid_at: ago(40), deadline: inDays(3) }, 50);
+    const d = mk({ code: 'NP-517309', recipient_name: 'Kevin Tran', address: '3300 Atlantic Ave', zip: '90807', status: 'attempting', amount_due_cents: 14000, paid_at: ago(40), paid_amount_cents: 14000, deadline: inDays(3) }, 50);
     addEvent(d.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(50));
     addEvent(d.id, 'payment', 'Payment received: $140.00', null, true, ago(40));
     addEvent(d.id, 'attempt', 'Attempt: No answer', 'Lights on, car in driveway, no answer after 3 knocks.', true, ago(26));
     addEvent(d.id, 'note', 'Internal note', 'Neighbor says he leaves around 7:15am. Try early.', false, ago(25));
     addEvent(d.id, 'attempt', 'Attempt: Subject not home', 'Spoke with roommate, said he works evenings.', true, ago(4));
 
-    const e = mk({ code: 'NP-894771', recipient_name: 'Alicia Moreno', address: '520 Pine Ave', status: 'served', amount_due_cents: 14000, paid_at: ago(100), stripe_session_id: 'cs_mock_paid_seed', served_at: ago(20), legal_hold: true }, 120);
+    const e = mk({ code: 'NP-894771', recipient_name: 'Alicia Moreno', address: '520 Pine Ave', status: 'served', amount_due_cents: 14000, paid_at: ago(100), paid_amount_cents: 14000, stripe_session_id: 'cs_mock_paid_seed', served_at: ago(20), legal_hold: true }, 120);
     addEvent(e.id, 'created', 'Request received', 'Expedited Service · estimate $140.00', true, ago(120));
     addEvent(e.id, 'attestation', 'Client legal attestation & Terms sealed', 'Terms & Best-Efforts Service scope accepted', true, ago(119));
     addEvent(e.id, 'payment', 'Payment received: $140.00', null, true, ago(100));
