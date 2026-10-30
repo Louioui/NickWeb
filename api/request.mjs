@@ -87,15 +87,14 @@ async function finish(request, body) {
     const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
     if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} document${uploaded.length === 1 ? '' : 's'} uploaded`);
 
-    // Send each email once, even if the browser calls finish twice.
+    // A completed finish is idempotent; failed delivery must remain retryable.
     const { data: already } = await db().from('order_events').select('id').eq('order_id', order.id).eq('title', 'Confirmation emailed').limit(1);
     if (already?.length) return json({ ok: true });
-    await addEvent(order.id, 'note', 'Confirmation emailed', null, false);
 
     const origin = siteOrigin(request);
     const trackUrl = `${origin}/track.html#t=${order.track_token}`;
     const addonNames = (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean);
-    await Promise.all([
+    const sent = await Promise.all([
         sendEmail({
             to: order.client_email,
             subject: `We received your request ${order.code}`,
@@ -124,5 +123,7 @@ async function finish(request, body) {
             button: { label: 'Open in your dashboard', url: `${origin}/admin.html#${order.id}` },
         })),
     ]);
+    if (sent.some(ok => !ok)) throw new HttpError(503, 'We saved your request, but could not send its confirmation yet. Please try again.');
+    await addEvent(order.id, 'note', 'Confirmation emailed', null, false);
     return json({ ok: true });
 }

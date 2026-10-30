@@ -487,8 +487,10 @@ const handlers = {
             const o = orderByToken(body.t);
             const up = confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} document${up.length === 1 ? '' : 's'} uploaded`);
+            if (events.some(e => e.order_id === o.id && e.title === 'Confirmation emailed')) return json({ ok: true });
             email(o.client_email, `We received your request ${o.code}`, `/track.html#t=${o.track_token}`);
             email(ADMIN_EMAIL, `New request ${o.code}: ${o.recipient_name}`, `/admin.html#${o.id}`);
+            addEvent(o.id, 'note', 'Confirmation emailed', null, false);
             return json({ ok: true });
         }
         if (body.website) return json({ ok: true, code: 'NP-000000', trackUrl: '/' });

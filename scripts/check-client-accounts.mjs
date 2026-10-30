@@ -92,5 +92,12 @@ check('Proof of Service exposes matching SHA-256 fingerprint on client tracking 
     const clientProof = trackData.files.find(f => f.kind === 'proof');
     assert.equal(clientProof?.sha256, proofFile.sha256);
 });
+const finishBody = { step: 'finish', t: detailData.order.track_token, fileIds: [] };
+assert.equal((await call(finishBody, '', 'request')).status, 200);
+assert.equal((await call(finishBody, '', 'request')).status, 200);
+const afterFinish = await (await call({ action: 'get', id: servedOrder.id }, nickCookie, 'admin')).json();
+check('mock request finish records one confirmation when retried', () => {
+    assert.equal(afterFinish.events.filter(e => e.title === 'Confirmation emailed').length, 1);
+});
 
 console.log(`${passed} client account checks passed`);

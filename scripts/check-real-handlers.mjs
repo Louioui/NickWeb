@@ -407,6 +407,17 @@ await check('F-04 the new-request email says when uploads are still being checke
     const toNick = emails.find(e => e.to.includes(ADMIN) && /New request/.test(e.subject));
     expect(res.status === 200 && toNick && /1 document\(s\) attached\. 1 more could not be checked yet/.test(toNick.text), `email: ${toNick?.text}`);
 });
+await check('request confirmation can retry after Resend rejects delivery', async () => {
+    reset(); const o = seedOrder();
+    const { POST: requestPOST } = await import('../api/request.mjs');
+    resendUp = false;
+    const first = await requestPOST(post('/api/request', { step: 'finish', t: o.track_token, fileIds: [] }));
+    expect(!events(o.id).some(e => e.title === 'Confirmation emailed'), 'failed send was marked delivered');
+    resendUp = true;
+    const second = await requestPOST(post('/api/request', { step: 'finish', t: o.track_token, fileIds: [] }));
+    expect(second.status === 200 && emails.some(e => e.to.includes(CLIENT)), `retry did not send client email (${first.status}, ${second.status})`);
+    expect(events(o.id).filter(e => e.title === 'Confirmation emailed').length === 1, 'confirmation marker missing or duplicated');
+});
 await check('F-10 a PDF with a script action deep inside (past 4 KB) is refused', async () => {
     const pdf = new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n<< /S /JavaScript /JS (app.alert(1)) >>\n%%EOF`);
     expect(core.verifyFileMagic(pdf, 'a.pdf') === false, 'deep /JavaScript action accepted');
