@@ -6,6 +6,7 @@ const PILL = {
     accepted: 'status-live', attempting: 'status-live', served: 'status-done', closed: 'status-muted', cancelled: 'status-muted',
 };
 const FILTERS = {
+    priority: { label: 'Due today & 48h', test: o => isPriority(o) },
     active: { label: 'Active', test: o => !['served', 'closed', 'cancelled'].includes(o.status) },
     review: { label: 'New', test: o => o.status === 'received' },
     waiting: { label: 'Waiting on client', test: o => ['action_required', 'awaiting_payment'].includes(o.status) },
@@ -16,8 +17,10 @@ const FILTERS = {
 };
 // Some timeline entries are written for the client ("You sent..."); on Nick's screen they read from his side.
 const NICK_WORDING = { 'You sent the requested information': 'Client sent the requested information' };
-const ATTEMPT_OUTCOMES = ['No answer', 'Subject not home', 'Spoke with resident, subject not there', 'Refused / evading', 'Gated, no access',
-    'Wrong address / moved', 'Business closed', 'Other'];
+const ATTEMPT_OUTCOMES = ['No answer', 'Served', 'Wrong address / moved', 'Refused / evading', 'Left with co-resident (Substituted Service)',
+    'Subject not home', 'Spoke with resident, subject not there', 'Gated, no access', 'Business closed', 'Other'];
+const ATTEMPT_PRESETS = [['No answer', 'No answer'], ['Served', 'Served'], ['Wrong address', 'Wrong address / moved'],
+    ['Refused', 'Refused / evading'], ['Left with co-resident', 'Left with co-resident (Substituted Service)']];
 
 let orders = [];
 let statuses = {};
@@ -148,6 +151,7 @@ const daysUntil = d => {
     return Math.round((Date.UTC(year, month - 1, day) - Date.UTC(today.getFullYear(), today.getMonth(), today.getDate())) / 864e5);
 };
 const isOpen = o => !['served', 'closed', 'cancelled'].includes(o.status);
+const isPriority = o => isOpen(o) && o.deadline && new Date(`${o.deadline}T23:59:59`).getTime() <= Date.now() + 48 * 3600e3;
 
 function renderStats() {
     const soon = orders.filter(o => isOpen(o) && o.deadline && daysUntil(o.deadline) <= 7).length;
@@ -175,6 +179,10 @@ function renderList() {
     const q = $('search').value.trim().toLowerCase();
     const shown = orders.filter(FILTERS[filter].test).filter(o => !q ||
         [o.code, o.client_name, o.client_firm, o.client_email, o.recipient_name, o.city, o.zip].some(v => (v || '').toLowerCase().includes(q)));
+    shown.sort((a, b) => Number(isPriority(b)) - Number(isPriority(a)) ||
+        (isPriority(a) && isPriority(b)
+            ? a.deadline.localeCompare(b.deadline) || Number(b.tier === 'sameday') - Number(a.tier === 'sameday')
+            : 0));
     $('list-count').textContent = `${shown.length} ${shown.length === 1 ? 'request' : 'requests'}`;
     $('job-list').innerHTML = shown.length ? shown.map(o => {
         const days = daysUntil(o.deadline);
@@ -405,6 +413,7 @@ function actionForm(o) {
         </div>`;
     }
     if (actionTab === 'attempt') return `
+        <div><p class="field-label">Quick outcome</p><div class="flex flex-wrap gap-2">${ATTEMPT_PRESETS.map(([label, value]) => `<button type="button" class="btn btn-outline btn-sm" data-attempt-preset="${esc(value)}">${esc(label)}</button>`).join('')}</div></div>
         <div class="grid sm:grid-cols-2 gap-4">
             <div><label for="f-outcome" class="field-label">Outcome</label><select id="f-outcome" class="field">${ATTEMPT_OUTCOMES.map(x => `<option>${x}</option>`).join('')}</select></div>
             <div><label for="f-when" class="field-label">When (leave blank for now)</label><input id="f-when" type="datetime-local" class="field"></div>
@@ -897,6 +906,14 @@ const CLICK_ACTIONS = {
     downloadFile: (arg, el) => downloadFile(arg, el),
 };
 document.addEventListener('click', (e) => {
+    const preset = e.target.closest('[data-attempt-preset]');
+    if (preset) {
+        $('f-outcome').value = preset.dataset.attemptPreset;
+        $('f-when').value = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+        formDirty = true;
+        $('draft-status').classList.remove('hidden');
+        return;
+    }
     const el = e.target.closest('[data-click]');
     if (el && Object.hasOwn(CLICK_ACTIONS, el.dataset.click)) CLICK_ACTIONS[el.dataset.click](el.dataset.arg, el);
 });
