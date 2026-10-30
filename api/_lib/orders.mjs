@@ -15,6 +15,15 @@ export const ADDONS = {
     stakeout: { name: 'Standard Stakeout (Up to 1 Hour)', cents: 10000 },
     coordinated: { name: 'Coordinated Service', cents: 5000 },
 };
+export function attemptDetail(when, note) {
+    if (!when) return note || null;
+    if (typeof when !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(when) ||
+        !Number.isFinite(Date.parse(when)) || new Date(when).toISOString() !== when ||
+        Date.parse(when) > Date.now() + 5 * 60e3) {
+        throw new HttpError(400, 'Enter a valid attempt time that is not in the future.');
+    }
+    return `Attempted at: ${when}${note ? ` · ${note}` : ''}`;
+}
 
 // What each status means to the client. Order here is the normal path of a job.
 export const STATUSES = {

@@ -81,7 +81,7 @@ function render(o) {
         <li>
             <span class="timeline-dot ${DOT[ev.kind] ?? ''}"></span>
             <p class="text-sm font-semibold text-ink">${esc(ev.title)}</p>
-            ${ev.detail ? `<p class="text-sm text-muted mt-0.5 whitespace-pre-line">${esc(ev.detail)}</p>` : ''}
+            ${ev.detail ? `<p class="text-sm text-muted mt-0.5 whitespace-pre-line">${esc(ev.kind === 'attempt' ? NPS.fmtAttemptDetail(ev.detail) : ev.detail)}</p>` : ''}
             <p class="text-[11px] text-muted mt-1">${esc(NPS.fmtDate(ev.created_at))}</p>
         </li>`).join('');
 }

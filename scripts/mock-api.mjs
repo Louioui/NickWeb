@@ -2,7 +2,7 @@
 // form, tracking page and dashboard can be clicked through before any keys exist. Orders live in memory and reset on restart.
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
 import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
-import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken } from '../api/_lib/orders.mjs';
+import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken, attemptDetail } from '../api/_lib/orders.mjs';
 import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
 import { stripPhotoBytes } from '../api/_lib/photo-metadata.mjs';
 
@@ -860,7 +860,7 @@ const handlers = {
                 const outcome = cleanText(body.outcome, 120, true, 'Outcome');
                 const when = cleanText(body.when, 40, false, 'When');
                 if (['received', 'paid', 'accepted'].includes(o.status)) updateOrder(o, { status: 'attempting' });
-                addEvent(o.id, 'attempt', `Attempt: ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
+                addEvent(o.id, 'attempt', `Attempt: ${outcome}`, attemptDetail(when, note), body.clientVisible !== false);
             } else if (body.kind === 'note') {
                 if (!note) fail(400, 'Write a note first.');
                 addEvent(o.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);

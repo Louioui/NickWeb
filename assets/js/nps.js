@@ -258,6 +258,14 @@ const NPS = (() => {
             ? { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }
             : { month: 'short', day: 'numeric', year: 'numeric' });
     };
+    const fmtAttemptDetail = (detail) => {
+        const match = /^Attempted at: (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z)(.*)$/.exec(detail || '');
+        if (!match) return detail || '';
+        const time = new Date(match[1]);
+        if (!Number.isFinite(time.getTime())) return detail;
+        const shown = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }).format(time);
+        return `Attempted ${shown}${match[2]}`;
+    };
     const fmtSize = (bytes) => bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB';
 
     // Printable service record for Nick (court files, disputes). It states what the system really does, nothing more:
@@ -303,6 +311,6 @@ const NPS = (() => {
     return {
         esc, post, get, onChange, fileMeta, checkFiles, uploadAll, stripPhotoBytes,
         verifyFileSha256, printChainOfCustody,
-        money, fmtDate, fmtSize,
+        money, fmtDate, fmtSize, fmtAttemptDetail,
     };
 })();

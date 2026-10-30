@@ -3,7 +3,7 @@ import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
          sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
-import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal } from './_lib/orders.mjs';
+import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal, attemptDetail } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 
@@ -519,9 +519,9 @@ async function update(request, body, admin) {
         });
     } else if (kind === 'attempt') {
         const outcome = text(body.outcome, { max: 120, required: true, label: 'Outcome' });
-        const when = text(body.when, { max: 40 });   // blank means "now", which the entry's own timestamp already shows
+        const when = text(body.when, { max: 40 });   // blank means now; the event timestamp is authoritative
         if (['received', 'paid', 'accepted'].includes(order.status)) await db().from('orders').update({ status: 'attempting' }).eq('id', order.id);
-        await addEvent(order.id, 'attempt', `Attempt: ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
+        await addEvent(order.id, 'attempt', `Attempt: ${outcome}`, attemptDetail(when, note), body.clientVisible !== false);
     } else if (kind === 'note') {
         if (!note) throw new HttpError(400, 'Write a note first.');
         await addEvent(order.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);

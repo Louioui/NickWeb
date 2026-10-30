@@ -275,9 +275,17 @@ function backToList() {
 }
 
 const row = (k, v) => v ? `<dt>${k}</dt><dd>${v}</dd>` : '';
+function attemptWindow(event) {
+    const stamped = /^Attempted at: (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z)/.exec(event.detail || '');
+    const when = new Date(stamped?.[1] || event.created_at);
+    if (!Number.isFinite(when.getTime())) return null;
+    const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', hourCycle: 'h23' }).format(when));
+    return hour < 12 ? 'Morning' : hour < 19 ? 'Afternoon / evening' : 'Night';
+}
 
 function renderDetail() {
     const { order: o, events, files } = current;
+    const attemptedWindows = new Set(events.filter(e => e.kind === 'attempt').map(attemptWindow).filter(Boolean));
     const fullAddress = `${o.address}${o.unit ? ', ' + o.unit : ''}, ${o.city} ${o.zip}`;
     const mapUrl = 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(fullAddress);
     const fileChip = f => `<button type="button" class="file-chip" data-click="downloadFile" data-arg="${esc(f.id)}" ${f.sha256 ? `title="Verified SHA-256 fingerprint: ${esc(f.sha256)}"` : ''}><i class="fa-solid ${f.kind === 'proof' ? 'fa-file-signature' : 'fa-file-lines'} text-bronze"></i><span>${esc(f.filename)}</span><span class="text-muted font-normal">${NPS.fmtSize(f.size_bytes)}</span>${f.sha256 ? `<span class="text-[11px] font-mono text-primary bg-primaryLight/60 px-1.5 py-0.5 rounded-sm"><i class="fa-solid fa-shield-halved mr-0.5" aria-hidden="true"></i>SHA-256 ${esc(f.sha256.slice(0, 8))}…</span>` : ''}</button>`;
@@ -298,6 +306,7 @@ function renderDetail() {
                 <span class="status-pill ${PILL[o.status]}">${esc(statuses[o.status]?.label || o.status)}</span>
             </div>
             ${o.action_note ? `<div class="result-box result-warn mt-5 text-sm"><strong>You asked the client:</strong> ${esc(o.action_note)}</div>` : ''}
+            ${['standard', 'expedited'].includes(o.tier) ? `<div class="mt-5"><p class="field-label">Attempt windows</p><div class="flex flex-wrap gap-2">${['Morning', 'Afternoon / evening', 'Night'].map(name => `<span class="status-pill ${attemptedWindows.has(name) ? 'status-done' : 'status-muted'}">${attemptedWindows.has(name) ? '✓' : 'Needed:'} ${name}</span>`).join('')}</div><p class="text-xs text-muted mt-2">Older attempts without a recorded attempt time use the time they were logged.</p></div>` : ''}
             <div class="grid sm:grid-cols-2 gap-x-8 gap-y-6 mt-6">
                 <dl class="review-recap content-start">
                     ${row('Address', `<a href="${mapUrl}" target="_blank" rel="noopener noreferrer" class="text-primary font-semibold underline underline-offset-2">${esc(fullAddress)}</a>`)}
@@ -337,7 +346,7 @@ function renderDetail() {
                 <li>
                     <span class="timeline-dot ${ev.kind === 'action' ? 'is-alert' : ev.kind === 'payment' ? 'is-gold' : ev.kind === 'proof' ? 'is-done' : ''}"></span>
                     <p class="text-sm font-semibold text-ink">${esc(NICK_WORDING[ev.title] || ev.title.replace(/ added by you$/, ' added by the client'))} ${ev.client_visible ? '' : '<span class="status-pill status-muted ml-1">Only you</span>'}</p>
-                    ${ev.detail ? `<p class="text-sm text-muted mt-0.5 whitespace-pre-line">${esc(ev.detail)}</p>` : ''}
+                    ${ev.detail ? `<p class="text-sm text-muted mt-0.5 whitespace-pre-line">${esc(ev.kind === 'attempt' ? NPS.fmtAttemptDetail(ev.detail) : ev.detail)}</p>` : ''}
                     <p class="text-[11px] text-muted mt-1">${esc(NPS.fmtDate(ev.created_at))}</p>
                 </li>`).join('')}
             </ol>
@@ -475,7 +484,7 @@ async function submitAction(e) {
     errBox.classList.add('hidden');
     try {
         if (actionTab === 'attempt') {
-            const when = v('f-when') ? new Date(v('f-when')).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+            const when = v('f-when') ? new Date(v('f-when')).toISOString() : '';
             current = await api('update', { id, kind: 'attempt', outcome: v('f-outcome'), when, note: v('f-note'), clientVisible: on('f-visible') });
         } else if (actionTab === 'status') {
             current = await api('update', { id, kind: 'status', status: v('f-status'), note: v('f-note'), clientVisible: on('f-visible'), notify: on('f-notify') });

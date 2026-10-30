@@ -418,6 +418,15 @@ await check('request confirmation can retry after Resend rejects delivery', asyn
     expect(second.status === 200 && emails.some(e => e.to.includes(CLIENT)), `retry did not send client email (${first.status}, ${second.status})`);
     expect(events(o.id).filter(e => e.title === 'Confirmation emailed').length === 1, 'confirmation marker missing or duplicated');
 });
+await check('attempt time is sealed as ISO and invalid times are refused', async () => {
+    reset(); const o = seedOrder();
+    const cookie = adminCookie();
+    const when = new Date(Date.now() - 3600e3).toISOString();
+    const good = await adminPOST(post('/api/admin', { action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', when, note: 'Three knocks' }, { cookie }));
+    expect(good.status === 200 && events(o.id).some(e => e.kind === 'attempt' && e.detail?.startsWith(`Attempted at: ${when}`)), 'ISO attempt time was not sealed');
+    const bad = await adminPOST(post('/api/admin', { action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', when: 'yesterday', note: '' }, { cookie }));
+    expect(bad.status === 400 && events(o.id).filter(e => e.kind === 'attempt').length === 1, 'ambiguous time was accepted');
+});
 await check('F-10 a PDF with a script action deep inside (past 4 KB) is refused', async () => {
     const pdf = new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n<< /S /JavaScript /JS (app.alert(1)) >>\n%%EOF`);
     expect(core.verifyFileMagic(pdf, 'a.pdf') === false, 'deep /JavaScript action accepted');

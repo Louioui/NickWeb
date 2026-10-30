@@ -99,5 +99,15 @@ const afterFinish = await (await call({ action: 'get', id: servedOrder.id }, nic
 check('mock request finish records one confirmation when retried', () => {
     assert.equal(afterFinish.events.filter(e => e.title === 'Confirmation emailed').length, 1);
 });
+const fieldJob = listData.orders.find(o => o.code === 'NP-517309');
+const attemptWhen = new Date(Date.now() - 3600e3).toISOString();
+const recorded = await call({ action: 'update', id: fieldJob.id, kind: 'attempt', outcome: 'No answer', when: attemptWhen }, nickCookie, 'admin');
+const rejected = await call({ action: 'update', id: fieldJob.id, kind: 'attempt', outcome: 'No answer', when: 'yesterday' }, nickCookie, 'admin');
+const attemptDetail = await (await call({ action: 'get', id: fieldJob.id }, nickCookie, 'admin')).json();
+check('mock attempt stores ISO time and rejects ambiguous time', () => {
+    assert.equal(recorded.status, 200);
+    assert.equal(rejected.status, 400);
+    assert.ok(attemptDetail.events.some(e => e.kind === 'attempt' && e.detail?.startsWith(`Attempted at: ${attemptWhen}`)));
+});
 
 console.log(`${passed} client account checks passed`);
