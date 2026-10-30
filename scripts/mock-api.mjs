@@ -507,6 +507,21 @@ const handlers = {
             addEvent(o.id, 'note', 'Client requested confidential document purge / retention seal', `Requested by verified account ${verifiedEmail}`, true);
             return json({ ok: true, code: o.code });
         }
+        if (action === 'receipt') {   // same rules as api/client.mjs
+            const code = String(body.code || '').trim().toUpperCase();
+            const o = [...orders.values()].find(ord => ord.client_email.toLowerCase() === verifiedEmail && ord.code === code);
+            if (!o) fail(404, 'Order not found.');
+            if (!o.paid_at) fail(409, 'This request has not been paid yet.');
+            return json({ receipt: clientView(o, { unlocked: true }).receipt });
+        }
+        if (action === 'proof-links') {
+            const mine = [...orders.values()].filter(o => o.client_email.toLowerCase() === verifiedEmail);
+            const out = [];
+            for (const o of mine) for (const f of files.values()) {
+                if (f.order_id === o.id && f.kind === 'proof' && f.uploaded) out.push({ code: o.code, name: f.filename, sha256: f.sha256 || null, url: `/__mock-file/${f.id}` });
+            }
+            return json({ files: out.slice(0, 50) });
+        }
         if (action === 'list') {
             const list = [...orders.values()].filter(o => o.client_email.toLowerCase() === verifiedEmail).sort((a,b) => b.created_at.localeCompare(a.created_at)).slice(0,100);
             return json({ profile, orders: list.map(o => ({ code: o.code, status: o.status, label: STATUSES[o.status].label, recipient: o.recipient_name, document: o.doc_type,
