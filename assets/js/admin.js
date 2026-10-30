@@ -222,8 +222,8 @@ function renderList() {
         const quiet = isOpen(o) ? NPSField.daysSince(o.last_activity_at || o.updated_at || o.created_at) : null;
         const badges = `${urg ? `<span class="status-pill status-alert"><i class="fa-solid fa-triangle-exclamation mr-1" aria-hidden="true"></i>${URGENCY_BADGE[urg]}</span>` : ''}${quiet != null && quiet >= 1 ? `<span class="text-[11px] text-muted">${quiet} day${quiet === 1 ? '' : 's'} since last update</span>` : ''}`;
         return `
-        ${badges ? `<div class="flex flex-wrap items-center gap-2 px-4 pt-3" aria-hidden="true">${badges}</div>` : ''}
-        <button type="button" aria-pressed="${current?.order.id === o.id}" aria-label="${esc(o.recipient_name)}, ${esc(o.code)}${urg ? ', ' + URGENCY_BADGE[urg] : ''}${quiet >= 1 ? `, ${quiet} days since last update` : ''}" class="job-row ${current?.order.id === o.id ? 'is-active' : ''}" data-click="openJob" data-arg="${esc(o.id)}">
+        ${badges ? `<div class="flex flex-wrap items-center gap-2 px-4 pt-3">${badges}</div>` : ''}
+        <button type="button" aria-pressed="${current?.order.id === o.id}" class="job-row ${current?.order.id === o.id ? 'is-active' : ''}" data-click="openJob" data-arg="${esc(o.id)}">
             <span class="font-semibold text-sm text-ink truncate">${esc(o.recipient_name)}</span>
             ${o.client_replied
                 ? '<span class="status-pill status-alert"><i class="fa-solid fa-reply mr-1"></i>Client replied</span>'
