@@ -101,7 +101,15 @@ export function createFakeSupabase() {
         verify_order_chain: ({ p_order }) => [{ ok: true, head: 'f'.repeat(64), entries: rows('order_events').filter(e => e.order_id === p_order).length }],
         admin_codes_last_hour: () => 0,
         use_admin_code: ({ p_email, p_hash }) => {
-            const r = rows('admin_codes').filter(c => c.email === p_email && !c.used && c.expires_at > new Date().toISOString())
+            const r = rows('admin_codes').filter(c => c.email === p_email && (c.purpose || 'login') === 'login' && !c.used && c.expires_at > new Date().toISOString())
+                .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+            if (!r || (r.attempts || 0) >= 5) return false;
+            r.attempts = (r.attempts || 0) + 1;
+            r.used = r.code_hash === p_hash;
+            return r.used;
+        },
+        use_admin_stepup_code: ({ p_email, p_hash }) => {
+            const r = rows('admin_codes').filter(c => c.email === p_email && c.purpose === 'stepup' && !c.used && c.expires_at > new Date().toISOString())
                 .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
             if (!r || (r.attempts || 0) >= 5) return false;
             r.attempts = (r.attempts || 0) + 1;

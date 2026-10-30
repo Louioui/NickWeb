@@ -48,7 +48,9 @@ check('devteam@partnershipwithmedia-dev.com can log into admin dashboard', () =>
 const devAdminCookie1 = devAdminLogin1.headers.get('set-cookie').split(';')[0];
 const devAdminCookie2 = devAdminLogin2.headers.get('set-cookie').split(';')[0];
 
-const genRes = await (await call({ action: 'generate-recovery-codes' }, devAdminCookie1, 'admin')).json();
+assert.equal((await call({ action: 'generate-recovery-codes' }, devAdminCookie1, 'admin')).status, 403);
+assert.equal((await call({ action: 'send-step-up-code' }, devAdminCookie1, 'admin')).status, 200);
+const genRes = await (await call({ action: 'generate-recovery-codes', totp: '12345678' }, devAdminCookie1, 'admin')).json();
 check('admin can generate 8 single-use backup recovery codes', () => {
     assert.equal(genRes.codes.length, 8);
     assert.equal(genRes.remaining, 8);

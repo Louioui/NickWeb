@@ -362,9 +362,10 @@ const submitBtn = label => `<p id="action-error" class="result-box result-err hi
 function actionForm(o) {
     if (actionTab === 'privacy') {
         const seal = o.integrity_seal || {};
-        const stepUp = totpEnabled ? `
-            <div><label for="f-stepup" class="field-label">Code from your authenticator app</label>
-            <input id="f-stepup" inputmode="text" maxlength="9" spellcheck="false" autocomplete="one-time-code" class="field font-mono tracking-widest max-w-[12rem] uppercase" placeholder="000000"><p class="text-xs text-muted mt-1">Or one of your recovery codes (XXXX-XXXX).</p></div>` : '';
+        const stepUp = `
+            <div><label for="f-stepup" class="field-label">${totpEnabled ? 'Code from your authenticator app' : 'Emailed security code'}</label>
+            <input id="f-stepup" inputmode="text" maxlength="9" spellcheck="false" autocomplete="one-time-code" class="field font-mono tracking-widest max-w-[12rem] uppercase" placeholder="${totpEnabled ? '000000' : '00000000'}">
+            ${totpEnabled ? '<p class="text-xs text-muted mt-1">Or one of your recovery codes (XXXX-XXXX).</p>' : '<button type="button" class="btn btn-outline btn-sm mt-2" data-click="sendStepUpCode">Email me a 5-minute security code</button>'}</div>`;
         return `
         <div class="space-y-3 pb-5 rule-b">
             <p class="text-sm font-semibold text-primary"><i class="fa-solid fa-shield-halved text-bronze mr-1"></i> Protection</p>
@@ -383,7 +384,7 @@ function actionForm(o) {
                 <p class="text-xs font-semibold ${o.legal_hold ? 'text-primary' : 'text-muted'}"><i class="fa-solid fa-scale-balanced mr-1"></i> Legal hold: ${o.legal_hold ? 'ON (the service record, proofs and timeline are frozen)' : 'off'}</p>
                 ${o.legal_hold ? `
                     <p class="text-xs text-muted mt-1">Turned on automatically when the job was served. Unlock only if a real mistake must be fixed; it's logged and emailed to you.</p>
-                    ${stepUp || `<div class="mt-2"><label for="f-hold-confirm" class="field-label">Type ${esc(o.code)} to unlock</label><input id="f-hold-confirm" class="field uppercase max-w-[12rem]" autocomplete="off" spellcheck="false"></div>`}
+                    ${stepUp}
                     <button type="button" class="btn btn-sm mt-2 border-[#9c2a26] text-[#7a1f1c] hover:bg-[#fbeceb]" data-click="setLegalHold" data-arg="false">Unlock legal hold</button>`
                 : `<button type="button" class="btn btn-outline btn-sm mt-2" data-click="setLegalHold" data-arg="true">Put under legal hold now</button>`}
             </div>
@@ -734,6 +735,16 @@ async function generateRecoveryCodes() {
         btn.disabled = false;
     }
 }
+async function sendStepUpCode() {
+    try {
+        await api('send-step-up-code');
+        if ($('security-modal').classList.contains('hidden')) alert('A security code was emailed to you. It expires in 5 minutes.');
+        else securityMessage('A security code was emailed to you. It expires in 5 minutes.');
+    } catch (err) {
+        if ($('security-modal').classList.contains('hidden')) alert(err.message);
+        else securityMessage(err.message, 'err');
+    }
+}
 async function copyRecoveryCodes() {
     if (!lastGeneratedCodes.length) return;
     try {
@@ -760,7 +771,8 @@ function updateSecurityState(enabled) {
     $('totp-status-badge').className = `status-pill ${totpEnabled ? 'status-done' : 'status-muted'}`;
     $('totp-setup-label').textContent = totpEnabled ? 'Move to a New Phone' : 'Turn On Two-Step Sign-In';
     $('totp-disable-btn').classList.toggle('hidden', !totpEnabled);
-    $('totp-current-wrap').classList.toggle('hidden', !totpEnabled);
+    $('totp-current-wrap').classList.remove('hidden');
+    $('totp-current-wrap').querySelector('label').textContent = totpEnabled ? 'Current code from your authenticator app' : 'Emailed security code';
 }
 async function startTotpSetup() {
     $('security-modal-msg').classList.add('hidden');
@@ -845,7 +857,7 @@ start();
 // Policy can refuse inline scripts. Only the functions listed here can be triggered this way.
 const CLICK_ACTIONS = {
     backToList, closeSecurityModal, refreshJobs, exportJob, showEmailStep, rotateLink, toggleDocLockJob, printRecord,
-    discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes,
+    discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes, sendStepUpCode,
     confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
     setLegalHold: (arg) => setLegalHold(arg === 'true'),
     setActionTab: (arg) => setActionTab(arg),

@@ -26,6 +26,7 @@ const sessions = new Set();
 const sessionEmails = new Map();
 const adminRecoveryCodes = new Map();
 const adminTotpSecrets = new Map(); // email -> { secret, enabled }
+const adminStepUpCodes = new Map(); // email -> { code, expires }
 const adminBurnFails = new Map();   // email -> count
 const adminCodesBurned = new Set(); // email if active code was burned
 const adminAuditLogs = [];
@@ -342,7 +343,12 @@ function useMockTotp(adminEmail, secret, code) {
 }
 function requireMockStepUp(adminEmail, totpInput) {
     const row = adminTotpSecrets.get(adminEmail);
-    if (!row?.enabled) return false;
+    if (!row?.enabled) {
+        const issued = adminStepUpCodes.get(adminEmail);
+        adminStepUpCodes.delete(adminEmail);
+        if (!issued || issued.expires < Date.now() || String(totpInput || '').replace(/[\s-]/g, '') !== issued.code) fail(403, 'That security code is wrong or expired. Request a new one.');
+        return true;
+    }
     if (!useMockTotp(adminEmail, row.secret, totpInput)) fail(403, 'Enter the current 6-digit code from your authenticator app.');
     return true;
 }
@@ -692,6 +698,12 @@ const handlers = {
         const cookie = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_admin=([^;]+)/)?.[1];
         if (!cookie || !/^[A-Za-z0-9_-]{16,160}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
         const adminEmail = sessionEmails.get(cookie) || ADMIN_EMAIL;
+        if (a === 'send-step-up-code') {
+            adminStepUpCodes.set(adminEmail, { code: MOCK_ADMIN_CODE, expires: Date.now() + 5 * 60 * 1000 });
+            email(adminEmail, 'Your dashboard security code');
+            auditAdmin(adminEmail, 'stepup_code_sent');
+            return json({ ok: true });
+        }
         if (a === 'me') {
             const totpRow = adminTotpSecrets.get(adminEmail);
             const auditLogs = adminAuditLogs.filter(l => l.email === adminEmail).slice(0, 10).map(({ action, target_code, detail, created_at }) => ({ action, target_code, detail, created_at }));
@@ -729,7 +741,7 @@ const handlers = {
         if (a === 'totp-setup') {
             // While one is on, changing it needs the current code, and the new secret waits as pending until confirmed.
             const row = adminTotpSecrets.get(adminEmail);
-            if (row?.enabled) requireMockStepUp(adminEmail, body?.totp);
+            requireMockStepUp(adminEmail, body?.totp);
             const secret = generateTotpSecret(20);
             if (row?.enabled) row.pending = secret;
             else adminTotpSecrets.set(adminEmail, { secret, enabled: false, last_used_step: row?.last_used_step || 0 });

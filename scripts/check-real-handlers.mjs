@@ -289,6 +289,26 @@ const adminCookie = () => {
     (tables().admin_sessions ||= []).push({ token_hash: core.sha256(token), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString() });
     return `nps_admin=${token}`;
 };
+await check('F-09 sensitive admin action needs a fresh, single-use emailed code without TOTP', async () => {
+    reset(); const cookie = adminCookie();
+    const call = (action, extra = {}) => adminPOST(post('/api/admin', { action, ...extra }, { cookie }));
+    expect((await call('generate-recovery-codes')).status === 403, 'missing step-up code accepted');
+    expect((await call('totp-setup')).status === 403, 'authenticator enrollment started without step-up');
+    expect((await call('send-step-up-code')).status === 200, 'could not request step-up code');
+    const row = (tables().admin_codes || []).find(c => c.purpose === 'stepup');
+    expect(row && row.expires_at > new Date().toISOString(), 'short-lived code was not stored');
+    row.code_hash = core.sha256(`${ADMIN}:87654321`);
+    expect((await call('generate-recovery-codes', { totp: '12345678' })).status === 403, 'login code accepted for step-up');
+    expect((await call('generate-recovery-codes', { totp: '87654321' })).status === 200, 'fresh step-up code refused');
+    const held = seedOrder({ legal_hold: true });
+    expect((await call('unlock-legal-hold', { id: held.id, hold: false, totp: '87654321' })).status === 403, 'step-up code replay accepted');
+    expect((tables().orders || []).find(o => o.id === held.id)?.legal_hold === true, 'legal hold changed on replay');
+    expect((await call('send-step-up-code')).status === 200, 'could not request a second code');
+    const expired = (tables().admin_codes || []).filter(c => c.purpose === 'stepup').at(-1);
+    expired.code_hash = core.sha256(`${ADMIN}:11223344`);
+    expired.expires_at = new Date(Date.now() - 1000).toISOString();
+    expect((await call('unlock-legal-hold', { id: held.id, hold: false, totp: '11223344' })).status === 403, 'expired code accepted');
+});
 await check('F-04 a proof upload with an unchecked file does not mark the order served or email the client', async () => {
     reset(); const o = seedOrder({ status: 'attempting' });
     const good = seedFile(o, { kind: 'proof' }); const slow = seedFile(o, { kind: 'proof' });

@@ -20,6 +20,7 @@ export const POST = handle(async (request) => {
 
     const admin = await requireAdmin(request);
     if (a === 'me') return me(admin);
+    if (a === 'send-step-up-code') return sendStepUpCode(request, admin);
     if (a === 'logout') return logout(request, admin);
     if (a === 'logout-all') return logoutAll(request, admin);
     if (a === 'sessions') return sessions(request, admin);
@@ -114,7 +115,15 @@ async function checkTotp(addr, secretEnc, code, bucket) {
 // A fresh authenticator code, or (phone lost) one single-use recovery code, confirms a sensitive action.
 async function requireStepUp(admin, code) {
     const row = await getAdminTotp(admin);
-    if (!row?.enabled) return false;
+    if (!row?.enabled) {
+        await rateLimit(`admin-stepup:${sha256(admin)}`, 10, 900);
+        const typed = String(code || '').replace(/[\s-]/g, '');
+        if (!/^\d{8}$/.test(typed)) throw new HttpError(403, 'Enter the 8-digit security code emailed to you.');
+        const { data, error } = await db().rpc('use_admin_stepup_code', { p_email: admin, p_hash: sha256(`${admin}:${typed}`) });
+        if (error) throw error;
+        if (!data) throw new HttpError(403, 'That security code is wrong or expired. Request a new one.');
+        return true;
+    }
     const typed = String(code || '').trim().toUpperCase();
     const recovery = typed.replace(/[^A-Z0-9]/g, '');
     if (!/^\d{6}$/.test(typed.replace(/\s+/g, '')) && recovery.length === 8) {
@@ -128,6 +137,18 @@ async function requireStepUp(admin, code) {
         throw new HttpError(403, 'Enter the current 6-digit code from your authenticator app, or one of your recovery codes.');
     }
     return true;
+}
+
+async function sendStepUpCode(request, admin) {
+    await rateLimit(`admin-stepup-send:${sha256(admin)}`, 5, 900);
+    await rateLimit(`admin-stepup-send-ip:${clientIp(request)}`, 5, 900);
+    const code = String(randomInt(0, 100000000)).padStart(8, '0');
+    const { error } = await db().from('admin_codes').insert({ email: admin, code_hash: sha256(`${admin}:${code}`), purpose: 'stepup', expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+    if (error) throw error;
+    await sendEmail({ to: admin, subject: 'Your dashboard security code', heading: `Your security code is ${code}`,
+        lines: ['Enter this code to confirm the sensitive dashboard action. It expires in 5 minutes.', "If you didn't request it, sign out all devices and contact your developer."] });
+    await auditAdmin(request, admin, 'stepup_code_sent');
+    return json({ ok: true });
 }
 
 const recoveryHash = (addr, code) => keyedHash('admin-recovery-v1', `${addr}:${code}`);
@@ -374,7 +395,7 @@ async function generateRecoveryCodes(request, body, admin) {
 async function totpSetup(request, body, admin) {
     await rateLimit(`admin-totp:${sha256(admin)}`, 6, 900);
     const row = await getAdminTotp(admin);
-    if (row?.enabled) await requireStepUp(admin, body?.totp);
+    await requireStepUp(admin, body?.totp);
     const secret = generateTotpSecret(20);
     const enc = encryptSecret(secret);
     const { error } = row
