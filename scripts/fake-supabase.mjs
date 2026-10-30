@@ -3,7 +3,7 @@
 // Like supabase-js, every call resolves to { data, error } and never throws.
 import { randomUUID } from 'node:crypto';
 
-const PRIMARY_KEY = { client_security_settings: 'email', track_unlock_codes: 'order_id', admin_totp: 'email', admin_sessions: 'token_hash' };
+const PRIMARY_KEY = { client_security_settings: 'email', track_unlock_codes: 'order_id', admin_totp: 'email', admin_sessions: 'token_hash', client_trusted_devices: 'token_hash', webauthn_credentials: 'credential_id' };
 
 export function createFakeSupabase() {
     const state = {
@@ -14,6 +14,7 @@ export function createFakeSupabase() {
         noBucket: new Set(),         // paths whose info() fails with "Bucket not found"
         rateHits: new Map(),
         otp: new Map(),              // email -> code accepted by auth.verifyOtp
+        linkHashes: new Map(),       // token hash from admin.generateLink -> email (single use)
         users: new Map(),            // email -> user
         sessions: new Map(),         // access token -> email
         pairs: new Map(),            // access token -> its refresh token (one Supabase session)
@@ -47,6 +48,11 @@ export function createFakeSupabase() {
             const match = all.filter(r => this.filters.every(f => f(r)));
             let out;
             if (this.op === 'insert' || this.op === 'upsert') {
+                // Like Postgres, a plain insert of an existing primary key fails with 23505 and writes nothing.
+                const key = PRIMARY_KEY[this.table];
+                if (this.op === 'insert' && key && this.payload.some(p => all.some(r => r[key] === p[key]))) {
+                    return { data: null, error: { code: '23505', message: 'duplicate key value violates unique constraint' } };
+                }
                 out = this.payload.map(p => {
                     const key = PRIMARY_KEY[this.table] || 'id';
                     const existing = this.op === 'upsert' && all.find(r => r[key] === p[key]);
@@ -140,8 +146,12 @@ export function createFakeSupabase() {
         storage: { from: () => bucket },
         auth: {
             signInWithOtp: async () => ({ data: {}, error: null }),
-            verifyOtp: async ({ email, token }) => {
-                if (state.otp.get(email) !== token) return { data: {}, error: authError('Token has expired or is invalid', 'otp_expired') };
+            verifyOtp: async ({ email, token, token_hash, type }) => {
+                if (token_hash !== undefined) {
+                    email = type === 'magiclink' ? state.linkHashes.get(token_hash) : undefined;
+                    state.linkHashes.delete(token_hash);
+                    if (!email) return { data: {}, error: authError('Token has expired or is invalid', 'otp_expired') };
+                } else if (state.otp.get(email) !== token) return { data: {}, error: authError('Token has expired or is invalid', 'otp_expired') };
                 const user = state.users.get(email);
                 const access = `access-${randomUUID()}`, refresh = `refresh-${randomUUID()}`;
                 state.sessions.set(access, email);
@@ -163,7 +173,17 @@ export function createFakeSupabase() {
             },
             // Like Supabase: signing a session out also revokes its refresh token; scope 'global' signs out every session
             // of that user.
-            admin: { signOut: async (access, scope = 'global') => {
+            // Like Supabase, a magic link for an unknown email quietly creates that user.
+            admin: { getUserById: async (id) => {
+                const user = [...state.users.values()].find(u => u.id === id);
+                return user ? { data: { user }, error: null } : { data: { user: null }, error: { message: 'User not found', code: 'user_not_found', status: 404 } };
+            }, generateLink: async ({ type, email }) => {
+                if (type !== 'magiclink') return { data: {}, error: { message: 'bad type', status: 400 } };
+                if (!state.users.has(email)) client.__addUser(email);
+                const hashed = randomUUID().replace(/-/g, '');
+                state.linkHashes.set(hashed, email);
+                return { data: { user: state.users.get(email), properties: { hashed_token: hashed } }, error: null };
+            }, signOut: async (access, scope = 'global') => {
                 const email = state.sessions.get(access);
                 const targets = scope === 'global' && email ? [...state.sessions].filter(([, e]) => e === email).map(([a]) => a) : [access];
                 for (const a of targets) {
@@ -179,7 +199,7 @@ export function createFakeSupabase() {
     client.__state = state;
     client.__reset = () => {
         state.tables = {};
-        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'rateHits', 'otp', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
+        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
         state.revoked = [];
     };
     client.__addUser = (email) => {

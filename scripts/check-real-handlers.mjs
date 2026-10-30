@@ -143,6 +143,64 @@ await check('F-01 "sign out everywhere" ends every session of that client', asyn
     expect(res.status === 401 && db.__state.refreshTokens.size === 0, `other session still works (${res.status})`);
 });
 
+
+// --- Trusted devices (30 days) and login alerts ---
+const cookieValue = (res, name) => (res.headers.get('set-cookie') || '').match(new RegExp(`${name}=([^;,]+)`))?.[1];
+const codeLogin = (extra = {}, headers = {}) => { db.__state.otp.set(CLIENT, '111111'); return clientPOST(post('/api/client', { action: 'verify-code', email: CLIENT, code: '111111', ...extra }, headers)); };
+await check('Trusted devices: a remembered device skips the PIN next time, but still needs the email code', async () => {
+    reset(); db.__addUser(CLIENT); setPin(CLIENT);
+    const first = await codeLogin({ pin: PIN });
+    const device = cookieValue(first, 'nps_device');
+    expect(first.status === 200 && device, 'device was not remembered');
+    const again = await codeLogin({}, { cookie: `nps_device=${device}` });
+    expect(again.status === 200 && cookieValue(again, 'nps_client'), `trusted device was still asked for the PIN (${again.status})`);
+    db.__state.otp.clear();
+    const noCode = await clientPOST(post('/api/client', { action: 'verify-code', email: CLIENT, code: '999999' }, { cookie: `nps_device=${device}` }));
+    expect(noCode.status === 401, `trusted device signed in without an email code (${noCode.status})`);
+});
+await check('Trusted devices: an untrusted device is still asked for the PIN', async () => {
+    reset(); db.__addUser(CLIENT); setPin(CLIENT);
+    const res = await codeLogin({});
+    expect(res.status === 200 && (await res.json()).requiresPin === true, 'PIN not requested on a new device');
+});
+await check('Trusted devices: a device remembered for one client does not work for another', async () => {
+    reset(); db.__addUser(CLIENT); db.__addUser('other@example.com'); setPin(CLIENT); setPin('other@example.com');
+    const first = await codeLogin({ pin: PIN });
+    const device = cookieValue(first, 'nps_device');
+    db.__state.otp.set('other@example.com', '111111');
+    const res = await clientPOST(post('/api/client', { action: 'verify-code', email: 'other@example.com', code: '111111' }, { cookie: `nps_device=${device}` }));
+    expect(res.status === 200 && (await res.json()).requiresPin === true, 'another client was let in by this device');
+});
+await check('Trusted devices: remember is optional and off when the client says no', async () => {
+    reset(); db.__addUser(CLIENT); setPin(CLIENT);
+    const res = await codeLogin({ pin: PIN, remember: false });
+    expect(!cookieValue(res, 'nps_device') && (tables().client_trusted_devices || []).length === 0, 'device remembered without consent');
+});
+await check('Login alerts: a sign-in from a new device emails the client', async () => {
+    reset(); db.__addUser(CLIENT);
+    const res = await codeLogin({ remember: false }, { 'user-agent': 'Mozilla/5.0 (iPhone) Safari' });
+    expect(res.status === 200, `sign-in failed (${res.status})`);
+    expect(emails.some(e => e.to.includes(CLIENT) && /New sign-in to your account/.test(e.subject)), 'no login alert was sent');
+});
+await check('Login alerts: no alert for a trusted device', async () => {
+    reset(); db.__addUser(CLIENT);
+    const first = await codeLogin({});
+    emails.length = 0;
+    await codeLogin({}, { cookie: `nps_device=${cookieValue(first, 'nps_device')}` });
+    expect(!emails.some(e => /New sign-in/.test(e.subject)), 'alert sent for a device the client already trusts');
+});
+await check('Trusted devices: "sign out all devices" forgets every remembered device', async () => {
+    reset(); db.__addUser(CLIENT); setPin(CLIENT);
+    const first = await codeLogin({ pin: PIN });
+    const device = cookieValue(first, 'nps_device');
+    const client = cookieValue(first, 'nps_client');
+    await clientPOST(post('/api/client', { action: 'logout-all' }, { cookie: `nps_client=${client}` }));
+    expect((tables().client_trusted_devices || []).length === 0, 'trusted devices survived sign out all');
+    db.__state.otp.set(CLIENT, '111111');
+    const after = await clientPOST(post('/api/client', { action: 'verify-code', email: CLIENT, code: '111111' }, { cookie: `nps_device=${device}` }));
+    expect((await after.json()).requiresPin === true, 'old device still skipped the PIN');
+});
+
 // --- F-02: email code first, then PIN; no lockout or PIN oracle without the email code ---
 await check('F-02 a wrong email code gives the same answer whether the PIN is right or wrong', async () => {
     reset(); db.__addUser(CLIENT); setPin(CLIENT); db.__state.otp.set(CLIENT, '111111');

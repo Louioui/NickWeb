@@ -55,6 +55,10 @@
                 <button type="submit" class="btn btn-pine w-full">Log In</button>
                 <button type="button" data-click="showEmailStep" class="text-xs text-primary underline underline-offset-2">Use a different email or send a new code</button>
             </form>
+            <div id="passkey-login-wrap" class="hidden pt-4 mt-4 rule-t text-center">
+                <button type="button" data-click="passkeyLogin" class="btn btn-outline w-full"><i class="fa-solid fa-fingerprint" aria-hidden="true"></i> Log in with a passkey</button>
+                <p class="text-xs text-muted mt-2">Face ID, fingerprint or device PIN. Replaces both the email code and the authenticator code.</p>
+            </div>
             <p id="login-error" class="result-box result-err hidden mt-4" role="alert"></p>
         </div>
     </main>
@@ -157,6 +161,18 @@
                 </div>
             </section>
 
+            <!-- Passkeys -->
+            <section id="admin-passkey-section" class="hidden pb-5 rule-b space-y-3">
+                <h3 class="font-serif text-lg text-primary"><i class="fa-solid fa-fingerprint text-bronze mr-1.5" aria-hidden="true"></i> Passkeys</h3>
+                <p class="text-xs text-muted leading-relaxed">Log in with Face ID, your fingerprint or your device PIN. A passkey only works on this website, so a fake login page can't steal it. Adding or removing one needs two-step sign-in to be on and a current authenticator code.</p>
+                <ul id="admin-passkey-list" class="space-y-2 text-xs" aria-label="Your passkeys"></ul>
+                <div class="flex flex-wrap items-end gap-2">
+                    <div><label for="admin-passkey-label" class="field-label">Device name <span class="font-normal text-muted">(optional)</span></label><input id="admin-passkey-label" class="field max-w-[12rem]" maxlength="80" placeholder="My iPhone" autocomplete="off"></div>
+                    <div><label for="admin-passkey-totp" class="field-label">Authenticator code</label><input id="admin-passkey-totp" class="field font-mono tracking-widest max-w-[8rem]" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="123456"></div>
+                    <button type="button" data-click="addAdminPasskey" class="btn btn-pine btn-sm">Add a passkey</button>
+                </div>
+            </section>
+
             <!-- 3. Active Sessions -->
             <section class="space-y-3">
                 <h3 class="font-serif text-lg text-primary"><i class="fa-solid fa-user-lock text-bronze mr-1.5" aria-hidden="true"></i> Active Sessions</h3>
@@ -171,6 +187,7 @@
 
 <script src="assets/js/nps.js"></script>
 <script src="assets/vendor/qrcode-generator-1.4.4/qrcode.js"></script>
+<script src="assets/vendor/simplewebauthn-browser-14.0.0/index.umd.min.js"></script>
 <script src="assets/js/admin.js"></script>
 </body>
 </html>

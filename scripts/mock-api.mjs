@@ -349,6 +349,7 @@ function requireMockStepUp(adminEmail, totpInput) {
 const handlers = {
     async client(req, body) {
         const action = body.action;
+        if (String(action).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
         if (action === 'send-code') {
             const addr = cleanEmail(body.email);
             const signup = body.intent === 'signup';
@@ -626,6 +627,7 @@ const handlers = {
 
     async admin(req, body) {
         const a = body.action;
+        if (String(a).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
         if (a === 'send-code') {
             const addr = cleanEmail(body.email);
             if (MOCK_ADMIN_EMAILS.includes(addr)) {

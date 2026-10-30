@@ -50,12 +50,12 @@ function restoreDraft() {
     $('draft-status').classList.remove('hidden');
 }
 
-const READ_ONLY = new Set(['me', 'list', 'get', 'file-url', 'export', 'send-code', 'verify-code', 'sessions']);
+const READ_ONLY = new Set(['me', 'list', 'get', 'file-url', 'export', 'send-code', 'verify-code', 'sessions', 'passkeys', 'passkey-login-options']);
 async function api(action, data = {}) {
     try {
         return await NPS.post('/api/admin', { action, ...data }, { notify: !READ_ONLY.has(action) });
     } catch (err) {
-        if (err.status === 401 && action !== 'verify-code' && action !== 'send-code') showLogin();
+        if (err.status === 401 && !['verify-code', 'send-code', 'passkey-login-verify'].includes(action)) showLogin();
         throw err;
     }
 }
@@ -641,8 +641,58 @@ $('session-list').addEventListener('click', async (e) => {
     catch (err) { const msg = $('security-modal-msg'); msg.textContent = err.message; msg.className = 'result-box result-err text-xs'; btn.disabled = false; }
 });
 
+// --- Passkeys (Face ID / fingerprint / device PIN). Shown only where the browser supports them. ---
+const PK = window.SimpleWebAuthnBrowser;
+const passkeysSupported = !!PK?.browserSupportsWebAuthn?.();
+$('passkey-login-wrap').classList.toggle('hidden', !passkeysSupported);
+const passkeyError = (err) => (err?.name === 'NotAllowedError' || err?.name === 'AbortError')
+    ? 'The passkey request was cancelled or timed out.'
+    : err?.name === 'InvalidStateError' ? 'This device already has a passkey for your dashboard.' : (err?.message || 'The passkey did not work. Please try again.');
+async function passkeyLogin() {
+    $('login-error').classList.add('hidden');
+    try {
+        const { options } = await api('passkey-login-options');
+        const response = await PK.startAuthentication({ optionsJSON: options });
+        await api('passkey-login-verify', { response });
+        start();
+    } catch (err) { loginError(passkeyError(err)); }
+}
+function renderAdminPasskeys(list) {
+    $('admin-passkey-list').innerHTML = list.map(k => `
+        <li class="flex flex-wrap items-center justify-between gap-2 p-3 border border-[color:var(--hair-ink)] rounded-sm">
+            <div><p class="font-semibold text-ink">${esc(k.label)}</p><p class="text-muted">Added ${esc(NPS.fmtDate(k.createdAt, false))}${k.lastUsedAt ? ` · last used ${esc(NPS.fmtDate(k.lastUsedAt))}` : ''}</p></div>
+            <button type="button" class="btn btn-outline btn-sm" data-passkey-remove="${esc(k.id)}">Remove</button>
+        </li>`).join('') || '<li class="text-muted">No passkeys yet.</li>';
+}
+async function loadAdminPasskeys() {
+    if (!passkeysSupported) return;
+    try { renderAdminPasskeys((await api('passkeys')).passkeys); $('admin-passkey-section').classList.remove('hidden'); }
+    catch { $('admin-passkey-section').classList.add('hidden'); }   // not set up yet: hide it
+}
+async function addAdminPasskey() {
+    try {
+        const { options } = await api('passkey-register-options', { totp: $('admin-passkey-totp').value.trim() });
+        const response = await PK.startRegistration({ optionsJSON: options });
+        renderAdminPasskeys((await api('passkey-register-verify', { response, label: $('admin-passkey-label').value.trim() })).passkeys);
+        $('admin-passkey-label').value = '';
+        securityMessage('Passkey added. Next time, choose "Log in with a passkey".');
+    } catch (err) { securityMessage(passkeyError(err), 'err'); }
+    finally { $('admin-passkey-totp').value = ''; }
+}
+$('admin-passkey-list').addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-passkey-remove]');
+    if (!btn) return;
+    btn.disabled = true;
+    try {
+        renderAdminPasskeys((await api('passkey-remove', { id: btn.dataset.passkeyRemove, totp: $('admin-passkey-totp').value.trim() })).passkeys);
+        securityMessage('Passkey removed.');
+    } catch (err) { securityMessage(err.message, 'err'); btn.disabled = false; }
+    finally { $('admin-passkey-totp').value = ''; }
+});
+
 function openSecurityModal() {
     loadSessions();
+    loadAdminPasskeys();
     $('security-modal-msg').classList.add('hidden');
     $('recovery-codes-box').classList.add('hidden');
     $('copy-recovery-btn').classList.add('hidden');
@@ -796,7 +846,7 @@ start();
 const CLICK_ACTIONS = {
     backToList, closeSecurityModal, refreshJobs, exportJob, showEmailStep, rotateLink, toggleDocLockJob, printRecord,
     discardDraft, logout, openSecurityModal, logoutAllDevices, copyRecoveryCodes, generateRecoveryCodes,
-    confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp,
+    confirmTotpEnable, disableTotp, startTotpSetup, installPwaApp, passkeyLogin, addAdminPasskey,
     setLegalHold: (arg) => setLegalHold(arg === 'true'),
     setActionTab: (arg) => setActionTab(arg),
     setFilter: (arg) => setFilter(arg),

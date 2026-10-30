@@ -6,7 +6,7 @@
     // Set while the server is waiting for the Security PIN: after a code ({ kind: 'code' }) or a sign-in link, whose
     // tokens stay in memory only until the PIN is sent ({ kind: 'link', access, refresh }).
     let pinFor = null;
-    const post = (action, data = {}) => NPS.post('/api/client', { action, ...data }, { notify: ['verify-code', 'session', 'logout', 'logout-all'].includes(action) });
+    const post = (action, data = {}) => NPS.post('/api/client', { action, ...data }, { notify: ['verify-code', 'session', 'passkey-login-verify', 'logout', 'logout-all'].includes(action) });
     function showError(message) { $('account-error').textContent = message || ''; $('account-error').classList.toggle('hidden', !message); }
     function setMode(next) {
         mode = next;
@@ -60,7 +60,7 @@
         $('pin-save').disabled = true;
         try {
             await post('set-pin', { pin: next, currentPin: $('pin-current').value.trim() });
-            clearPinFields(); showSecurity(true); securityFeedback('Your Security PIN is saved. You’ll be asked for it at your next sign-in.', true);
+            clearPinFields(); showSecurity(true); hasPinNow = true; loadPasskeys(); securityFeedback('Your Security PIN is saved. You’ll be asked for it at your next sign-in.', true);
         } catch (err) { securityFeedback(err.message); $('pin-current').value = ''; }
         finally { $('pin-save').disabled = false; }
     };
@@ -69,9 +69,71 @@
         const current = $('pin-current').value.trim();
         if (!/^\d{6}$/.test(current)) return securityFeedback('Enter your current PIN above to turn it off.');
         $('pin-remove').disabled = true;
-        try { await post('disable-pin', { pin: current }); clearPinFields(); showSecurity(false); securityFeedback('Your Security PIN is off.', true); }
+        try { await post('disable-pin', { pin: current }); clearPinFields(); showSecurity(false); hasPinNow = false; loadPasskeys(); securityFeedback('Your Security PIN is off.', true); }
         catch (err) { securityFeedback(err.message); $('pin-current').value = ''; }
         finally { $('pin-remove').disabled = false; }
+    };
+    // --- Passkeys: sign in with Face ID / fingerprint / device PIN. Shown only where the browser supports them. ---
+    const PK = window.SimpleWebAuthnBrowser;
+    const passkeysSupported = !!PK?.browserSupportsWebAuthn?.();
+    let hasPinNow = false;
+    const passkeyError = (err) => (err?.name === 'NotAllowedError' || err?.name === 'AbortError')
+        ? 'The passkey request was cancelled or timed out.'
+        : err?.name === 'InvalidStateError' ? 'This device already has a passkey for your account.' : (err?.message || 'The passkey did not work. Please try again.');
+    function renderPasskeys(list) {
+        $('passkey-list').replaceChildren(...(list.length ? list : [null]).map(k => {
+            const li = document.createElement('li');
+            if (!k) { li.className = 'text-muted'; li.textContent = 'No passkeys yet.'; return li; }
+            li.className = 'flex flex-wrap items-center justify-between gap-3 rule-b pb-2';
+            const info = document.createElement('span');
+            info.textContent = `${k.label} · added ${NPS.fmtDate(k.createdAt, false)}${k.lastUsedAt ? ` · last used ${NPS.fmtDate(k.lastUsedAt, false)}` : ''}`;
+            const btn = document.createElement('button');
+            btn.type = 'button'; btn.className = 'text-sm text-primary underline underline-offset-2'; btn.textContent = 'Remove';
+            btn.dataset.passkeyRemove = k.id;
+            li.append(info, btn);
+            return li;
+        }));
+    }
+    async function loadPasskeys() {
+        if (!passkeysSupported) return;
+        $('passkey-section').classList.remove('hidden');
+        $('passkey-pin-wrap').classList.toggle('hidden', !hasPinNow);
+        $('passkey-pin-help').textContent = hasPinNow ? 'Adding or removing a passkey needs your Security PIN.' : 'Adding or removing a passkey works within 15 minutes of signing in. If it has been longer, sign out and back in first.';
+        try { renderPasskeys((await post('passkeys')).passkeys); }
+        catch { $('passkey-section').classList.add('hidden'); }   // not set up yet (or the demo): hide it
+    }
+    $('passkey-add').onclick = async () => {
+        securityFeedback(''); $('passkey-add').disabled = true;
+        try {
+            const pin = $('passkey-pin').value.trim();
+            const { options } = await post('passkey-register-options', hasPinNow ? { pin } : {});
+            const response = await PK.startRegistration({ optionsJSON: options });
+            renderPasskeys((await post('passkey-register-verify', { response, label: $('passkey-label').value.trim() })).passkeys);
+            $('passkey-label').value = '';
+            securityFeedback('Passkey added. Next time, choose "Sign in with a passkey".', true);
+        } catch (err) { securityFeedback(passkeyError(err)); }
+        finally { $('passkey-add').disabled = false; $('passkey-pin').value = ''; }
+    };
+    $('passkey-list').addEventListener('click', async (e) => {
+        const id = e.target.closest('[data-passkey-remove]')?.dataset.passkeyRemove;
+        if (!id) return;
+        securityFeedback('');
+        const pin = $('passkey-pin').value.trim();
+        if (hasPinNow && !/^\d{6}$/.test(pin)) return securityFeedback('Enter your Security PIN above to remove a passkey.');
+        try { renderPasskeys((await post('passkey-remove', { id, ...(hasPinNow ? { pin } : {}) })).passkeys); securityFeedback('Passkey removed.', true); }
+        catch (err) { securityFeedback(err.message); }
+        finally { $('passkey-pin').value = ''; }
+    });
+    $('passkey-signin-wrap').classList.toggle('hidden', !passkeysSupported);
+    $('passkey-signin').onclick = async () => {
+        if (sending) return; sending = true; showError(''); $('passkey-signin').disabled = true;
+        try {
+            const { options } = await post('passkey-login-options');
+            const response = await PK.startAuthentication({ optionsJSON: options });
+            await post('passkey-login-verify', { response, remember: true });
+            await load();
+        } catch (err) { showError(passkeyError(err)); }
+        finally { sending = false; $('passkey-signin').disabled = false; }
     };
     $('client-logout-all').onclick = async () => {
         $('client-logout-all').disabled = true;
@@ -113,9 +175,10 @@
         const btn = e.target.querySelector('button[type="submit"]'); btn.disabled = true; btn.textContent = 'Verifying…';
         try {
             const pin = pinFor ? $('account-pin').value.trim() : '';
+            const remember = $('account-remember').checked;
             const result = pinFor?.kind === 'link'
-                ? await post('session', { access: pinFor.access, refresh: pinFor.refresh, pin })
-                : await post('verify-code', { email: pendingEmail, code: $('account-code').value.trim(), ...(pin ? { pin } : {}) });
+                ? await post('session', { access: pinFor.access, refresh: pinFor.refresh, pin, remember })
+                : await post('verify-code', { email: pendingEmail, code: $('account-code').value.trim(), ...(pin ? { pin } : {}), remember });
             if (result.requiresPin) { showPinStep(pinFor || { kind: 'code' }); return; }
             pinFor = null; $('account-code').value = ''; $('account-pin').value = ''; await load();
         }
@@ -137,9 +200,11 @@
         $('client-refresh').disabled = true;
         try {
             const result = await post('list');
+            const signedInBefore = signedIn;
             orders = result.orders; signedIn = true;
             $('client-identity').textContent = [result.profile.name, result.profile.email].filter(Boolean).join(' · ');
             showSecurity(!!result.profile.hasPin);
+            if (!signedInBefore || hasPinNow !== !!result.profile.hasPin) { hasPinNow = !!result.profile.hasPin; loadPasskeys(); }
             $('account-loading').classList.add('hidden'); $('account-auth').classList.add('hidden'); $('client-workspace').classList.remove('hidden');
             $('client-feedback').classList.add('hidden'); renderOrders();
             $('client-sync').textContent = `Updated ${new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;

@@ -5,6 +5,7 @@ import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
 import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal } from './_lib/orders.mjs';
 import { createCheckout, stripeClient } from './_lib/stripe.mjs';
+import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 
 const COOKIE = 'nps_admin';
 const SESSION_DAYS = 14;
@@ -14,6 +15,8 @@ export const POST = handle(async (request) => {
     const a = body.action;
     if (a === 'send-code') return sendCode(request, body);
     if (a === 'verify-code') return verifyCode(request, body);
+    if (a === 'passkey-login-options') return passkeyLoginOptions(request);
+    if (a === 'passkey-login-verify') return passkeyLoginVerify(request, body);
 
     const admin = await requireAdmin(request);
     if (a === 'me') return me(admin);
@@ -21,6 +24,10 @@ export const POST = handle(async (request) => {
     if (a === 'logout-all') return logoutAll(request, admin);
     if (a === 'sessions') return sessions(request, admin);
     if (a === 'revoke-session') return revokeSession(request, body, admin);
+    if (a === 'passkeys') return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
+    if (a === 'passkey-register-options') return passkeyRegisterOptions(request, body, admin);
+    if (a === 'passkey-register-verify') return passkeyRegisterVerify(request, body, admin);
+    if (a === 'passkey-remove') return passkeyRemove(request, body, admin);
     if (a === 'generate-recovery-codes') return generateRecoveryCodes(request, body, admin);
     if (a === 'totp-setup') return totpSetup(request, body, admin);
     if (a === 'totp-enable') return totpEnable(request, body, admin);
@@ -174,6 +181,11 @@ async function verifyCode(request, body) {
         throw new HttpError(401, 'That code is wrong or expired. Request a new one.');
     }
 
+    return issueAdminSession(request, addr, method, !!totpRow?.enabled);
+}
+
+// Last step of every dashboard sign-in: at most 5 sessions, a new session cookie, an audit entry and a login alert.
+async function issueAdminSession(request, addr, method, totpEnabled) {
     const nowIso = new Date().toISOString();
     await db().from('admin_sessions').delete().eq('email', addr).lt('expires_at', nowIso);
     const { data: activeSessions } = await db().from('admin_sessions').select('token_hash, created_at')
@@ -191,11 +203,60 @@ async function verifyCode(request, body) {
     if (agent) await db().from('admin_sessions').update({ user_agent: agent }).eq('token_hash', sha256(token)).then(() => {}, () => {});
     await auditAdmin(request, addr, method.includes('recovery') ? 'login_recovery_code' : 'login_success', null, `Signed in with ${method}`);
     await sendSecurityAlert(addr, method.includes('recovery') ? 'Recovery code used to sign in' : 'New sign-in to your dashboard', [
-        `Your dashboard was just signed into (${method === 'email' ? 'email code' : method.replace('+', ' + ').replace('email', 'email code')}).`,
+        `Your dashboard was just signed into (${method === 'email' ? 'email code' : method === 'passkey' ? 'passkey' : method.replace('+', ' + ').replace('email', 'email code')}).`,
         `Browser: ${String(request.headers.get('user-agent') || 'unknown').slice(0, 120)}`,
+        ...(method === 'passkey' ? ['If this wasn\'t you, remove any passkey you don\'t recognise under Security & Field App, then use Log Out All Devices.'] : []),
     ]);
     const secure = new URL(request.url).hostname === 'localhost' ? '' : ' Secure;';   // HTTPS-only everywhere but local testing
-    return json({ ok: true, totpEnabled: !!totpRow?.enabled }, 200, { 'set-cookie': `${COOKIE}=${token}; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}` });
+    return json({ ok: true, totpEnabled }, 200, { 'set-cookie': `${COOKIE}=${token}; Path=/api/admin; HttpOnly;${secure} SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}` });
+}
+
+// --- Passkeys. A passkey asks for Face ID, a fingerprint or the device PIN and only works on this site, so it stands in
+// for both the email code and the authenticator code. Adding one needs the authenticator app to be on, plus a fresh
+// authenticator code, so a stolen session cookie can't plant a passkey of its own.
+async function passkeyLoginOptions(request) {
+    const { options, cookie } = await loginOptions(request, 'admin');
+    return json({ ok: true, options }, 200, { 'set-cookie': cookie });
+}
+
+async function passkeyLoginVerify(request, body) {
+    await rateLimit(`admin-verify:${clientIp(request)}`, 10, 900);
+    const { ownerEmail } = await loginVerify(request, 'admin', body.response);
+    // Checked again at every sign-in, so removing an address from ADMIN_EMAILS also shuts out its passkeys.
+    if (!ADMIN_EMAILS.includes(ownerEmail)) throw new HttpError(401, 'That passkey could not be used to sign in. Please try again or use your email code.');
+    const res = await issueAdminSession(request, ownerEmail, 'passkey', !!(await getAdminTotp(ownerEmail))?.enabled);
+    res.headers.append('set-cookie', clearChallengeCookie(request, 'admin'));
+    return res;
+}
+
+async function passkeyRegisterOptions(request, body, admin) {
+    await rateLimit(`admin-passkey:${sha256(admin)}`, 10, 900);
+    if (!(await getAdminTotp(admin))?.enabled) throw new HttpError(400, 'Turn on the authenticator app first, then add a passkey.');
+    await requireStepUp(admin, body?.totp);
+    // A stable id that isn't the email address (the passkey shows the email as its name).
+    const { options, cookie } = await registrationOptions(request, 'admin', admin, keyedHash('admin-passkey-user-v1', admin).slice(0, 32), "Nick's dashboard");
+    return json({ ok: true, options }, 200, { 'set-cookie': cookie });
+}
+
+async function passkeyRegisterVerify(request, body, admin) {
+    await rateLimit(`admin-passkey:${sha256(admin)}`, 10, 900);
+    const label = text(String(body.label || '').slice(0, 80), { max: 80 });
+    await registrationVerify(request, 'admin', admin, body.response, label);
+    await auditAdmin(request, admin, 'passkey_added', null, label ? `Passkey "${label}"` : 'Passkey');
+    await sendSecurityAlert(admin, 'A passkey was added to your dashboard', [
+        `A passkey${label ? ` ("${label}")` : ''} can now be used to sign in to your dashboard.`,
+        `Browser: ${String(request.headers.get('user-agent') || 'unknown').slice(0, 120)}`,
+    ]);
+    return json({ ok: true, passkeys: await listPasskeys('admin', admin) }, 200, { 'set-cookie': clearChallengeCookie(request, 'admin') });
+}
+
+async function passkeyRemove(request, body, admin) {
+    await rateLimit(`admin-passkey:${sha256(admin)}`, 10, 900);
+    await requireStepUp(admin, body?.totp);
+    await removePasskey('admin', admin, body.id);
+    await auditAdmin(request, admin, 'passkey_removed');
+    await sendSecurityAlert(admin, 'A passkey was removed from your dashboard', ['That passkey can no longer be used to sign in.']);
+    return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
 }
 
 async function requireAdmin(request) {
