@@ -13,12 +13,19 @@ class FakeStripe {
         this.checkout = { sessions: {
             retrieve: async (id) => stripeSessions.get(id) || { id, payment_status: 'unpaid', metadata: {} },
             expire: async (id) => { const ses = stripeSessions.get(id); if (ses) ses.status = 'expired'; return ses || {}; },
-            create: async () => { const id = `cs_test_${randomUUID().replace(/-/g, '')}`; const ses = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid' }; stripeSessions.set(id, ses); return ses; },
+            create: async (params, options) => {
+                // Like Stripe: with stripeIdempotency on, a repeated idempotency key returns the session it created first.
+                if (stripeIdempotency && options?.idempotencyKey && idempotent.has(options.idempotencyKey)) return idempotent.get(options.idempotencyKey);
+                const id = `cs_test_${randomUUID().replace(/-/g, '')}`; const ses = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid' };
+                stripeSessions.set(id, ses); if (options?.idempotencyKey) idempotent.set(options.idempotencyKey, ses); return ses;
+            },
         } };
         this.paymentIntents = { retrieve: async (id) => paymentIntents.get(id) || { id, metadata: {} } };
     }
 }
 const paymentIntents = new Map();
+const idempotent = new Map();
+let stripeIdempotency = false;   // set to true to make a repeated idempotency key return the first session
 mock.module('@supabase/supabase-js', { namedExports: { createClient: () => db } });
 mock.module('stripe', { defaultExport: FakeStripe });
 
@@ -67,7 +74,7 @@ const post = (path, body, headers = {}) => new Request(`https://site.test${path}
     method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
 });
 const tables = () => db.__state.tables;
-const reset = () => { db.__reset(); stripeSessions.clear(); emails.length = 0; resendUp = true; };
+const reset = () => { db.__reset(); stripeSessions.clear(); idempotent.clear(); stripeIdempotency = false; emails.length = 0; resendUp = true; };
 const ADMIN = 'nicksprocessservices@outlook.com';
 const CLIENT = 'client@example.com';
 const PIN = '246810';
@@ -958,6 +965,16 @@ await check('R-02 two renewals at once leave one live payment link and one timel
     expect(created === 1, `${created} "New payment link created" entries`);
     expect(live.length === 1 && live[0].id === tables().orders[0].stripe_session_id, `${live.length} open links; stored ${tables().orders[0].stripe_session_id}`);
 });
+await check('R-02b a double-click that Stripe answers with one session keeps that session open and on the order', async () => {
+    reset(); stripeIdempotency = true;
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_oldsession1', payment_url: 'https://checkout.stripe.com/c/pay/cs_test_oldsession1' });
+    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    await Promise.all([track(o, { action: 'renew-payment' }), track(o, { action: 'renew-payment' })]);
+    const stored = stripeSessions.get(tables().orders[0].stripe_session_id);
+    const created = events(o.id).filter(e => e.title === 'New payment link created').length;
+    expect(stored && stored.id !== 'cs_test_oldsession1' && stored.status === 'open', `the only live link was ${stored?.status}`);
+    expect(created === 1, `${created} "New payment link created" entries`);
+});
 const stripeEvent = (id, type, object) => webhookPOST(new Request('https://site.test/api/stripe-webhook', {
     method: 'POST', headers: { 'stripe-signature': 'fake' }, body: JSON.stringify({ id, type, data: { object } }),
 }));
@@ -1000,6 +1017,32 @@ await check('R-06 a paid Stripe session for another order is never applied to th
     stripeSessions.set('cs_test_mysession01', { id: 'cs_test_mysession01', status: 'complete', payment_status: 'paid', amount_total: 9000, metadata: { order_id: other.id } });
     await track(o, { action: 'confirm-payment', session: 'cs_test_mysession01' });
     expect(!tables().orders.find(x => x.id === o.id).paid_at, 'order marked paid from a session that names a different order');
+});
+
+await check('R-07 the admin API refuses sessions that expired, went idle, or belong to an address no longer on the admin list', async () => {
+    const session = (over) => { reset(); const token = 'B'.repeat(43);
+        (tables().admin_sessions ||= []).push({ token_hash: core.sha256(token), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString(), ...over });
+        return adminAct({ action: 'list' }, `nps_admin=${token}`); };
+    expect((await session({})).status === 200, 'a valid session was refused');
+    expect((await session({ expires_at: new Date(Date.now() - 1000).toISOString() })).status === 401, 'an expired session was accepted');
+    expect((await session({ last_seen_at: new Date(Date.now() - 13 * 3600e3).toISOString() })).status === 401, 'a session idle for 13 hours was accepted');
+    expect((await session({ email: 'former-dev@example.com' })).status === 401, 'a session for an address not on ADMIN_EMAILS was accepted');
+});
+await check('R-08 a firm member who is not a firm admin cannot add or list members', async () => {
+    reset();
+    const firmId = await firms.createFirm('Vance & Ortiz LLP', 'boss@firm.example');
+    await firms.addMember(firmId, 'boss@firm.example', CLIENT, 'paralegal');
+    await expectReject(() => firms.addMember(firmId, CLIENT, 'intruder@example.com', 'admin'), 'a paralegal added a firm admin');
+    await expectReject(() => firms.listMembers(firmId, CLIENT), 'a paralegal listed the firm\'s members');
+});
+await check('R-09 a signed-in client\'s request list holds only their own requests', async () => {
+    reset(); db.__addUser(CLIENT);
+    seedOrder();
+    seedOrder({ id: randomUUID(), code: 'NP-654321', client_email: 'other@example.com', track_token: 'U'.repeat(32) });
+    const login = await codeLogin({ remember: false });
+    const list = await (await clientPOST(post('/api/client', { action: 'list' }, { cookie: `nps_client=${cookieValue(login, 'nps_client')}` }))).json();
+    const codes = (list.orders || []).map(o => o.code);
+    expect(codes.length === 1 && codes[0] === 'NP-123456', `list returned ${JSON.stringify(codes)}`);
 });
 
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);
