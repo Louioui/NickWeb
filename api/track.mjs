@@ -246,9 +246,16 @@ export const POST = handle(async (request) => {
         }
         if (old.status !== 'expired') throw new HttpError(409, 'Your payment link still works. Use the Pay button.');
         const session = await createCheckout(order, order.amount_due_cents, TIERS[order.tier]?.name || null, siteOrigin(request));
-        const { error } = await db().from('orders').update({ payment_url: session.url, stripe_session_id: session.id })
-            .eq('id', order.id).eq('stripe_session_id', old.id).is('paid_at', null);
+        const { data: won, error } = await db().from('orders').update({ payment_url: session.url, stripe_session_id: session.id })
+            .eq('id', order.id).eq('stripe_session_id', old.id).is('paid_at', null).select('id');
         if (error) throw error;
+        if (!won?.length) {
+            // Another renewal (or a payment) got there first. Close this link so only one can be paid, unless Stripe's
+            // idempotency handed both calls the same session, which is then the one now on the order.
+            const current = await orderByToken(body.t);
+            if (current.stripe_session_id !== session.id) await stripeClient().checkout.sessions.expire(session.id).catch(err => console.error('Could not expire a losing payment link:', err?.message));
+            return json(await clientView(current, { unlocked }));
+        }
         await addEvent(order.id, 'payment', 'New payment link created', 'The previous link had expired.', true);
         await logClientAction(request, order.id, 'renew_payment', session.id);
         return json(await clientView(await orderByToken(body.t), { unlocked }));

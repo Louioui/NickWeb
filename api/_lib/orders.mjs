@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS, clientIp, sha256 } from './core.mjs';
+import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS, clientIp, sha256, hitRateLimit } from './core.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -268,6 +268,32 @@ ${button ? `<p style="margin:24px 0 8px"><a href="${escHtml(button.url)}" style=
 </table></td></tr></table></body></html>`;
 }
 
+// A refund or a card dispute on an order's payment. The money moved inside Stripe, so the order is never changed
+// automatically: Nick gets a private timeline entry and an email, once per Stripe event, and decides what to do. Like
+// flagUnappliedPayment, the entry is written only after an email was accepted; otherwise this throws and Stripe retries.
+export async function flagPaymentReversal(orderId, { eventId, kind, amountCents, reason }) {
+    uuid(orderId, 'Order');
+    if (typeof eventId !== 'string' || !/^evt_[A-Za-z0-9_]{8,128}$/.test(eventId)) return false;
+    const { data: order, error } = await db().from('orders').select('id, code').eq('id', orderId).maybeSingle();
+    if (error) throw error;
+    if (!order) return false;
+    const { data: earlier, error: eErr } = await db().from('order_events').select('detail').eq('order_id', orderId).eq('kind', 'payment').eq('client_visible', false);
+    if (eErr) throw eErr;
+    if ((earlier || []).some(e => String(e.detail || '').includes(eventId))) return false;   // already flagged
+    const amount = money(Number(amountCents) || 0);
+    const what = kind === 'dispute' ? `disputed (${String(reason || 'no reason given').slice(0, 60)})` : 'refunded';
+    const title = kind === 'dispute' ? 'Payment disputed' : 'Payment refunded';
+    const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
+        to, subject: `${order.code}: a payment was ${kind === 'dispute' ? 'disputed' : 'refunded'}`,
+        heading: title,
+        lines: [`${amount} of the card payment on ${order.code} was ${what}.`,
+            kind === 'dispute' ? 'Open Stripe to respond before its deadline. The order export has your evidence.' : 'The order still shows as paid. Check Stripe and update the order if needed.'],
+    }).catch(() => false)));
+    if (!sent.some(Boolean)) throw new Error(`${title} alert for ${order.code} could not be emailed`);
+    await addEvent(orderId, 'payment', title, `Stripe event ${eventId}: ${amount} ${what}. Nothing was changed on the order automatically.`, false);
+    return true;
+}
+
 // Records what a client did on their tracking page, for Nick's dispute evidence. Never blocks the client: if the table
 // doesn't exist yet or the write fails, the action still goes ahead.
 const CLIENT_ACTIONS = new Set(['view', 'unlock', 'download', 'reply', 'payment', 'renew_payment']);
@@ -295,6 +321,9 @@ export async function prefersDigest(emailAddr) {
 
 // The daily summary: for each client who chose it, one email listing what changed on their requests in the last day.
 export async function sendDailyDigests(origin) {
+    // Once per UTC day, whoever calls: Vercel can retry the cleanup job, and until CRON_SECRET is set anyone can run it.
+    // The counter is an atomic database increment, so two runs at once can't both send.
+    if (await hitRateLimit('daily-digest-run', 86400) > 1) return 0;
     const { data: prefs, error } = await db().from('client_preferences').select('email').eq('notify_mode', 'daily').limit(500);
     if (error || !prefs?.length) return 0;
     const since = new Date(Date.now() - 864e5).toISOString();

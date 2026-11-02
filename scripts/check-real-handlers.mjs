@@ -12,11 +12,13 @@ class FakeStripe {
         this.webhooks = { constructEventAsync: async (raw) => JSON.parse(raw) };
         this.checkout = { sessions: {
             retrieve: async (id) => stripeSessions.get(id) || { id, payment_status: 'unpaid', metadata: {} },
-            expire: async () => ({}),
+            expire: async (id) => { const ses = stripeSessions.get(id); if (ses) ses.status = 'expired'; return ses || {}; },
             create: async () => { const id = `cs_test_${randomUUID().replace(/-/g, '')}`; const ses = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid' }; stripeSessions.set(id, ses); return ses; },
         } };
+        this.paymentIntents = { retrieve: async (id) => paymentIntents.get(id) || { id, metadata: {} } };
     }
 }
+const paymentIntents = new Map();
 mock.module('@supabase/supabase-js', { namedExports: { createClient: () => db } });
 mock.module('stripe', { defaultExport: FakeStripe });
 
@@ -934,6 +936,70 @@ await check('PORT-4 portal receipt and proof links stay inside the client\'s own
     const r = await clientPOST(post('/api/client', { action: 'receipt', code: 'NP-123456' }, { cookie }));
     expect(r.status === 200 && (await r.json()).receipt?.code === 'NP-123456', `own receipt ${r.status}`);
     expect((await clientPOST(post('/api/client', { action: 'receipt', code: 'NP-654321' }, { cookie }))).status === 404, 'another client\'s receipt was returned');
+});
+
+// --- Second-pass review (2026-11-02): digest once a day, renewal race, refunds and disputes ---
+await check('R-01 the daily digest goes out once a day, however often the cleanup job is called', async () => {
+    reset(); const o = seedOrder();
+    (tables().client_preferences ||= []).push({ email: CLIENT, notify_mode: 'daily' });
+    await core.addEvent(o.id, 'note', 'Attempt logged', null, true);
+    emails.length = 0;
+    const cronReq = () => keepaliveGET(new Request('https://site.test/api/keepalive', { headers: { authorization: 'Bearer test-cron' } }));
+    for (let i = 0; i < 4; i++) await cronReq();
+    const digests = emails.filter(e => e.to.includes(CLIENT) && /daily update/i.test(e.subject)).length;
+    expect(digests === 1, `client got ${digests} digests from 4 cleanup runs`);
+});
+await check('R-02 two renewals at once leave one live payment link and one timeline entry', async () => {
+    reset(); const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_oldsession1', payment_url: 'https://checkout.stripe.com/c/pay/cs_test_oldsession1' });
+    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    await Promise.all([track(o, { action: 'renew-payment' }), track(o, { action: 'renew-payment' })]);
+    const created = events(o.id).filter(e => e.title === 'New payment link created').length;
+    const live = [...stripeSessions.values()].filter(s => s.id !== 'cs_test_oldsession1' && s.status === 'open');
+    expect(created === 1, `${created} "New payment link created" entries`);
+    expect(live.length === 1 && live[0].id === tables().orders[0].stripe_session_id, `${live.length} open links; stored ${tables().orders[0].stripe_session_id}`);
+});
+const stripeEvent = (id, type, object) => webhookPOST(new Request('https://site.test/api/stripe-webhook', {
+    method: 'POST', headers: { 'stripe-signature': 'fake' }, body: JSON.stringify({ id, type, data: { object } }),
+}));
+await check('R-03 a refund or dispute on a paid order is flagged once for Nick, and never unpays the order', async () => {
+    reset(); const paidAt = new Date().toISOString();
+    const o = seedOrder({ status: 'paid', paid_at: paidAt, amount_due_cents: 9000, stripe_session_id: 'cs_test_paidsession1' });
+    paymentIntents.set('pi_test_123', { id: 'pi_test_123', metadata: { order_id: o.id } });
+    const refund = { id: 'ch_test_1', object: 'charge', payment_intent: 'pi_test_123', amount_refunded: 9000 };
+    await stripeEvent('evt_refund_1', 'charge.refunded', refund); await stripeEvent('evt_refund_1', 'charge.refunded', refund);
+    const dispute = { id: 'dp_test_1', object: 'dispute', payment_intent: 'pi_test_123', amount: 9000, reason: 'fraudulent' };
+    await stripeEvent('evt_dispute_1', 'charge.dispute.created', dispute);
+    const flagged = reviewEvents(o);
+    expect(flagged.filter(e => /refund/i.test(e.title)).length === 1 && flagged.filter(e => /disput/i.test(e.title)).length === 1, `entries: ${flagged.map(e => e.title).join(', ')}`);
+    expect(emails.filter(e => e.to.includes(ADMIN) && /refund|disput/i.test(e.subject)).length === 2, 'Nick was not emailed once per event');
+    expect(tables().orders[0].paid_at === paidAt && tables().orders[0].status === 'paid', 'order state was changed automatically');
+    paymentIntents.set('pi_other', { id: 'pi_other', metadata: {} });
+    const r = await stripeEvent('evt_refund_2', 'charge.refunded', { id: 'ch_test_2', payment_intent: 'pi_other', amount_refunded: 100 });
+    expect(r.status === 200, `a refund for an unknown order answered ${r.status}`);
+});
+
+await check('R-04 a tracking link cannot download a file that belongs to another order', async () => {
+    reset();
+    const mine = seedOrder(), theirs = seedOrder({ code: 'NP-654321', track_token: 'U'.repeat(32), client_email: 'other@example.com' });
+    const f = seedFile(theirs, { uploaded: true });
+    const r = await track(mine, { action: 'download', fileId: f.id });
+    const body = await r.json();
+    expect(r.status === 404 && !body.url, `cross-order download answered ${r.status} ${JSON.stringify(body).slice(0, 120)}`);
+    const own = seedFile(mine, { uploaded: true });
+    expect((await track(mine, { action: 'download', fileId: own.id })).status === 200, 'own file could not be downloaded');
+});
+await check('R-05 a locked tracking page cannot download documents until it is unlocked', async () => {
+    reset(); const o = seedOrder({ doc_lock: true }); const f = seedFile(o, { uploaded: true });
+    const r = await track(o, { action: 'download', fileId: f.id });
+    expect(r.status === 403 && !(await r.json()).url, `locked download answered ${r.status}`);
+});
+await check('R-06 a paid Stripe session for another order is never applied to this one', async () => {
+    reset();
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_mysession01' });
+    const other = seedOrder({ code: 'NP-654321', track_token: 'U'.repeat(32) });
+    stripeSessions.set('cs_test_mysession01', { id: 'cs_test_mysession01', status: 'complete', payment_status: 'paid', amount_total: 9000, metadata: { order_id: other.id } });
+    await track(o, { action: 'confirm-payment', session: 'cs_test_mysession01' });
+    expect(!tables().orders.find(x => x.id === o.id).paid_at, 'order marked paid from a session that names a different order');
 });
 
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);
