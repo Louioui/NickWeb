@@ -44,7 +44,16 @@ for (const tier of ['origin', 'nexus']) {
         expect(policy.includes('collects nothing from you online'), 'policy does not say the site collects nothing online');
     });
     check(`${tier}: no api/ folder or private pages in the package`, () => {
-        for (const f of ['api', 'admin.html', 'account.html', 'track.html', 'sw.js', 'vercel.json']) expect(!existsSync(join(ROOT, 'dist', tier, f)), `${f} shipped`);
+        for (const f of ['api', 'admin.html', 'account.html', 'track.html', 'sw.js']) expect(!existsSync(join(ROOT, 'dist', tier, f)), `${f} shipped`);
+    });
+    check(`${tier}: ships the site's security headers and nothing server-side`, () => {
+        const config = JSON.parse(readFileSync(join(ROOT, 'dist', tier, 'vercel.json'), 'utf8'));
+        expect(JSON.stringify(Object.keys(config)) === '["headers"]', `unexpected config keys: ${Object.keys(config)}`);
+        const site = config.headers.find(h => h.source === '/(.*)');
+        const keys = new Set((site?.headers || []).map(h => h.key));
+        for (const k of ['Content-Security-Policy', 'X-Frame-Options', 'X-Content-Type-Options', 'Strict-Transport-Security', 'Referrer-Policy', 'Permissions-Policy']) expect(keys.has(k), `missing ${k}`);
+        const csp = site.headers.find(h => h.key === 'Content-Security-Policy').value;
+        expect(/connect-src 'self';/.test(csp) && !/supabase/i.test(csp) && /frame-ancestors 'self'/.test(csp), `CSP: ${csp}`);
     });
     check(`${tier}: every inline handler calls a function the page defines`, () => {
         const called = new Set([...html.matchAll(/\bon(?:click|submit|change|input)="(?:event\.preventDefault\(\);\s*)?([A-Za-z_$][\w$]*)\(/g)].map(m => m[1]));

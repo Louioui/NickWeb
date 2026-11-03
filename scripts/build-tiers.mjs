@@ -120,10 +120,26 @@ const AURA_EXCLUDE = new Set(['.git', '.github', '.claude', 'node_modules', 'dis
     '.DS_Store', '.gitignore', 'package.json', 'package-lock.json', 'tailwind.config.js', 'demo.html']);
 
 rmSync(DIST, { recursive: true, force: true });
+// The live site's security headers live in vercel.json, which also carries Aura's crons, functions and path
+// redirects. Origin and Nexus are static, so they get only the site-wide headers and the font cache rule, with the
+// database server taken out of connect-src since nothing on these pages calls it.
+const siteConfig = JSON.parse(readFileSync(join(ROOT, 'vercel.json'), 'utf8'));
+const siteHeaders = siteConfig.headers.find(h => h.source === '/(.*)');
+const assetCache = siteConfig.headers.find(h => h.source === '/assets/(vendor|fonts)/(.*)');
+if (!siteHeaders || !assetCache) throw new Error('vercel.json: the site-wide or asset header rule is missing');
+const staticConfig = JSON.stringify({
+    headers: [
+        { source: '/(.*)', headers: siteHeaders.headers.map(h => h.key !== 'Content-Security-Policy' ? h
+            : { ...h, value: h.value.replace(/connect-src[^;]*/, "connect-src 'self'") }) },
+        assetCache,
+    ],
+}, null, 2) + '\n';
+
 for (const [tier, html] of [['origin', origin], ['nexus', nexus]]) {
     const out = join(DIST, tier);
     mkdirSync(out, { recursive: true });
     writeFileSync(join(out, 'index.html'), html);
+    writeFileSync(join(out, 'vercel.json'), staticConfig);
     for (const f of PUBLIC_FILES) {
         if (existsSync(join(ROOT, f))) { mkdirSync(dirname(join(out, f)), { recursive: true }); cpSync(join(ROOT, f), join(out, f), { recursive: true }); }
     }
