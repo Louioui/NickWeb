@@ -49,7 +49,7 @@ Each guard was removed in turn, all 8 suites were run separately, then the file 
 | client list own-orders filter | real-handlers (new R-09) |
 | client `checkPin` | real-handlers, passkeys |
 
-All 18 mutations are caught. Five were not caught before this review.
+All 18 mutations are caught. Eight of them were not caught by the suites before this review: three found in the first pass (T-01) and five in the second (T-02). The third pass (section 7) found three more.
 
 ## 4. Verified by reading (not changed)
 
@@ -84,7 +84,7 @@ I ran 13 more mutations against the public order form (`request.mjs`), pricing (
 | **`finish` only within an hour of creation** | **nothing before this pass**; now real-handlers (R-12) |
 | new atomic confirmation guard | real-handlers (R-12) |
 
-**L-03 (Low, fixed).** `/api/request` `finish` checked "already emailed?" and wrote the marker in two separate steps. Three `finish` calls at the same moment sent the client three confirmation emails (reproduced in R-12). An atomic `hit_rate_limit('request-confirm:<order>', 86400)` now lets only one call send. If that counter is removed, R-12 fails.
+**L-03 (Low, fixed).** `/api/request` `finish` checked "already emailed?" and wrote the marker in two separate steps. Three `finish` calls at the same moment sent the client three confirmation emails (reproduced in R-12). An atomic `hit_rate_limit('request-confirm:<order>', 86400)` now lets only one call send. If that counter is removed, R-12 fails. R-12b covers the failure path: if writing the "Confirmation emailed" marker fails, no email is sent, the slot is released, and a retry sends exactly one set of emails.
 
 ## 8. Recommendation
 

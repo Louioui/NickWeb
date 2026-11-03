@@ -286,12 +286,13 @@ export async function flagPaymentReversal(orderId, { eventId, kind, amountCents,
     const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
         to, subject: `${order.code}: a payment was ${kind === 'dispute' ? 'disputed' : 'refunded'}`,
         heading: title,
-        // charge.refunded carries the charge's running total (amount_refunded), not this one refund.
-        lines: [kind === 'dispute' ? `${amount} of the card payment on ${order.code} was ${what}.` : `The card payment on ${order.code} has now been refunded ${amount} in total.`,
+        // charge.refunded carries the charge's running total (amount_refunded) as of that event, not this one refund,
+        // and Stripe may deliver events out of order, so it is described as of the event rather than as current.
+        lines: [kind === 'dispute' ? `${amount} of the card payment on ${order.code} was ${what}.` : `When this refund happened, the card payment on ${order.code} had been refunded ${amount} in total. Stripe can deliver refund events out of order, so check Stripe for the current total.`,
             kind === 'dispute' ? 'Open Stripe to respond before its deadline. The order export has your evidence.' : 'The order still shows as paid. Check Stripe and update the order if needed.'],
     }).catch(() => false)));
     if (!sent.some(Boolean)) throw new Error(`${title} alert for ${order.code} could not be emailed`);
-    await addEvent(orderId, 'payment', title, `Stripe event ${eventId}: ${kind === 'dispute' ? `${amount} ${what}` : `${amount} refunded in total so far`}. Nothing was changed on the order automatically.`, false);
+    await addEvent(orderId, 'payment', title, `Stripe event ${eventId}: ${kind === 'dispute' ? `${amount} ${what}` : `${amount} refunded in total as of this event`}. Nothing was changed on the order automatically.`, false);
     return true;
 }
 
