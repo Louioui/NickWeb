@@ -1,0 +1,78 @@
+// Checks the three package builds from scripts/build-tiers.mjs (it runs the build first).
+// Aura must be the live page byte for byte; Origin and Nexus must hold no private platform code and no dead buttons;
+// Nexus keeps the motion layer and its reduced-motion branch; Origin has none of it.
+// Run with: node scripts/check-tiers.mjs
+import { execFileSync } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+execFileSync(process.execPath, [join(ROOT, 'scripts/build-tiers.mjs')], { stdio: 'ignore' });
+const read = (tier) => readFileSync(join(ROOT, 'dist', tier, 'index.html'), 'utf8');
+const source = readFileSync(join(ROOT, 'index.html'), 'utf8');
+const pages = { origin: read('origin'), nexus: read('nexus'), aura: read('aura') };
+
+let passed = 0;
+const failures = [];
+function check(name, fn) {
+    try { fn(); passed++; console.log(`PASS ${name}`); }
+    catch (err) { failures.push(name); console.log(`FAIL ${name}\n     ${err.message}`); }
+}
+function expect(cond, msg) { if (!cond) throw new Error(msg); }
+
+// Private platform markers: anything that would call the server, show order tracking or link to a private page.
+const PRIVATE = ['/api/', 'NPS.post', 'NPS.uploadAll', 'stripe', 'supabase', 'service-request-form', 'lookupOrder', 'openTrackModal',
+    'track-modal', 'confirm-modal', 'handleOrderSubmit', 'admin.html', 'account.html', 'track.html', 'href="#checkout"'];
+
+check('Aura is the live index.html, byte for byte', () => expect(pages.aura === source, 'dist/aura/index.html differs from index.html'));
+check('Aura still carries the platform and the motion layer', () => {
+    for (const s of ['/api/request', 'openTrackModal', 'initLuxuryVisuals', 'geometry-canvas']) expect(pages.aura.includes(s), `missing ${s}`);
+});
+for (const tier of ['origin', 'nexus']) {
+    const html = pages[tier];
+    check(`${tier}: no private platform code or links`, () => {
+        // Scanned without the shared compiled CSS (it has selectors for every page) and the privacy policy's "Service
+        // providers" sentence, which is Nick's legal copy and is flagged for his review rather than rewritten here.
+        const code = html.replace(/<style>[\s\S]*?<\/style>/, '').replace(/<p><strong>Service providers:<\/strong>[^\n]*/, '');
+        const found = PRIVATE.filter(s => code.toLowerCase().includes(s.toLowerCase()));
+        expect(!found.length, `found ${found.join(', ')}`);
+    });
+    check(`${tier}: no api/ folder or private pages in the package`, () => {
+        for (const f of ['api', 'admin.html', 'account.html', 'track.html', 'sw.js', 'vercel.json']) expect(!existsSync(join(ROOT, 'dist', tier, f)), `${f} shipped`);
+    });
+    check(`${tier}: every inline handler calls a function the page defines`, () => {
+        const called = new Set([...html.matchAll(/\bon(?:click|submit|change|input)="(?:event\.preventDefault\(\);\s*)?([A-Za-z_$][\w$]*)\(/g)].map(m => m[1]));
+        const missing = [...called].filter(fn => !new RegExp(`function ${fn}\\b`).test(html));
+        expect(!missing.length, `undefined: ${missing.join(', ')}`);
+    });
+    check(`${tier}: every in-page link points at an element that exists`, () => {
+        const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
+        const dead = [...new Set([...html.matchAll(/href="#([A-Za-z][\w-]*)"/g)].map(m => m[1]))].filter(id => !ids.has(id));
+        expect(!dead.length, `dead links: #${dead.join(', #')}`);
+    });
+    check(`${tier}: the contact section offers call, text and email`, () => {
+        for (const s of ['id="contact"', 'href="tel:+12099226817"', 'href="sms:+12099226817"', 'href="mailto:nicksprocessservices@outlook.com"']) expect(html.includes(s), `missing ${s}`);
+    });
+    check(`${tier}: the contact section only uses classes the page's CSS defines`, () => {
+        const section = html.slice(html.indexOf('<section id="contact"'), html.indexOf('</section>', html.indexOf('<section id="contact"')));
+        const css = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+        const classes = new Set([...section.matchAll(/class="([^"]+)"/g)].flatMap(m => m[1].split(/\s+/)).filter(c => !c.startsWith('fa-')));
+        const esc = (c) => c.replace(/[:\[\]./!]/g, m => '\\' + m);
+        const missing = [...classes].filter(c => !css.includes('.' + esc(c)));
+        expect(!missing.length, `no CSS for: ${missing.join(', ')}`);
+    });
+}
+check('Nexus keeps the motion layer and its reduced-motion branch', () => {
+    for (const s of ['initLuxuryVisuals', 'geometry-canvas', "matchMedia('(prefers-reduced-motion: reduce)')", '.logo-lockup']) expect(pages.nexus.includes(s), `missing ${s}`);
+});
+check('Origin is static: no motion layer, canvas or sprite animation', () => {
+    const code = pages.origin.replace(/<style>[\s\S]*?<\/style>/, '');
+    for (const s of ['initLuxuryVisuals', '<canvas', 'is-run-visible', "'reveal-item'"]) expect(!code.includes(s), `found ${s}`);
+    // CSS-only animations (hero rise, gold shimmer, tagline shine) need the static override too.
+    expect(pages.origin.includes('<style id="origin-static">*,:after,:before{animation:none!important}</style>'), 'CSS animations are not switched off');
+    expect(!pages.nexus.includes('origin-static'), 'Nexus lost its CSS animations');
+});
+
+console.log(`\n${passed} package checks passed, ${failures.length} failed`);
+if (failures.length) process.exit(1);

@@ -3,3 +3,6 @@ build/
 .claude/
 .env*
 .vercel
+
+# Package builds from scripts/build-tiers.mjs. Never committed, so Vercel never serves them.
+dist/
