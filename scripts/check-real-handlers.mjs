@@ -1045,5 +1045,36 @@ await check('R-09 a signed-in client\'s request list holds only their own reques
     expect(codes.length === 1 && codes[0] === 'NP-123456', `list returned ${JSON.stringify(codes)}`);
 });
 
+const requestForm = (over = {}) => ({ step: 'create', clientName: 'Pat Client', clientEmail: CLIENT, clientPhone: '209-555-0100', recipientName: 'Sam Recipient',
+    docType: 'Other Legal Document', address: '1 Test Rd', city: 'Stockton', zip: '95202', tier: 'standard', addons: [], acceptTerms: true, files: [], ...over });
+await check('R-10 a signed-in admin session alone cannot delete an order: the step-up code is required', async () => {
+    reset(); const o = seedOrder();
+    const r = await adminAct({ action: 'delete', id: o.id, confirm: o.code }, adminCookie());
+    expect(r.status === 403 && tables().orders.some(x => x.id === o.id), `deleted without a step-up (${r.status})`);
+});
+await check('R-11 the order form refuses a request whose Terms were not accepted, and stores nothing', async () => {
+    reset();
+    const { POST: requestPOST } = await import('../api/request.mjs');
+    for (const acceptTerms of [false, 'true', 1, undefined]) {
+        const r = await requestPOST(post('/api/request', requestForm({ acceptTerms })));
+        expect(r.status === 400, `acceptTerms=${JSON.stringify(acceptTerms)} answered ${r.status}`);
+    }
+    expect(!(tables().orders || []).length, 'an order was stored without accepted Terms');
+});
+await check('R-12 the confirmation emails go out once, even when the browser finishes twice at the same moment, and never for an old order', async () => {
+    reset();
+    const { POST: requestPOST } = await import('../api/request.mjs');
+    const created = await (await requestPOST(post('/api/request', requestForm()))).json();
+    emails.length = 0;
+    const finish = () => requestPOST(post('/api/request', { step: 'finish', t: created.token, fileIds: [] }));
+    await Promise.all([finish(), finish(), finish()]);
+    await finish();
+    const toClient = emails.filter(e => e.to.includes(CLIENT)).length;
+    expect(toClient === 1, `client got ${toClient} confirmation emails`);
+    reset(); const old = seedOrder({ created_at: new Date(Date.now() - 2 * 3600e3).toISOString() });
+    await requestPOST(post('/api/request', { step: 'finish', t: old.track_token, fileIds: [] }));
+    expect(!emails.length, 'a two-hour-old order sent confirmation emails again');
+});
+
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);
 if (failures.length) process.exit(1);
