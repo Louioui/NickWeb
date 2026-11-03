@@ -703,8 +703,9 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     const cp1 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow);
     const cp2 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 15000);
     const cpNextMin = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 65000);
-    assert.equal(cp1.params.expires_at, Math.floor(fixedNow / 1000) + 86340);
+    assert.equal(cp1.params.expires_at, Math.floor(fixedNow / 60000) * 60 + 86340, 'Expiry is rounded to the idempotency minute');
     assert.equal(cp1.options.idempotencyKey, cp2.options.idempotencyKey, 'Double-click within same minute must produce identical Stripe idempotencyKey');
+    assert.deepEqual(cp1.params, cp2.params, 'Same key must carry identical parameters, or Stripe refuses the retry');
     assert.notEqual(cp1.options.idempotencyKey, cpNextMin.options.idempotencyKey, 'Retry in next minute gets a fresh idempotencyKey');
 
     const unpaidOrder = { id: sampleOrd.id, status: 'awaiting_payment', paid_at: null, stripe_session_id: 'cs_live_active123456', amount_due_cents: 12500 };
@@ -714,7 +715,7 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     assert.equal(canMarkPaid(unpaidOrder, 0, 'cs_live_active123456'), false, 'Zero amount must be rejected');
     assert.equal(canMarkPaid(unpaidOrder, 12500, 'bad_session'), false, 'Malformed session ID must be rejected');
     assert.equal(canMarkPaid({ ...unpaidOrder, paid_at: '2026-10-29T00:00:00Z' }, 12500, 'cs_live_active123456'), false, 'Already-paid order must be rejected');
-    totalAssertions += 9;
+    totalAssertions += 10;
 
     // 11f. Tamper-evident admin audit log records failed login, successful login, recovery-code generation, export, and delete
     const activeAdminCookie = adminCookies[5];
