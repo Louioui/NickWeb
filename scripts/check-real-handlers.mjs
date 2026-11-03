@@ -1076,6 +1076,10 @@ await check('R-12 the confirmation emails go out once, even when the browser fin
     await finish();
     const toClient = emails.filter(e => e.to.includes(CLIENT)).length;
     expect(toClient === 1, `client got ${toClient} confirmation emails`);
+    for (const admin of core.ADMIN_EMAILS) {
+        const n = emails.filter(e => e.to.includes(admin)).length;
+        expect(n === 1, `${admin} got ${n} new-request emails`);
+    }
     reset(); const old = seedOrder({ created_at: new Date(Date.now() - 2 * 3600e3).toISOString() });
     await requestPOST(post('/api/request', { step: 'finish', t: old.track_token, fileIds: [] }));
     expect(!emails.length, 'a two-hour-old order sent confirmation emails again');
@@ -1113,6 +1117,7 @@ await check('R-12b if the confirmation marker cannot be written, a retry still s
     } finally { db.from = realFrom; }
     await requestPOST(post('/api/request', { step: 'finish', t: created.token, fileIds: [] }));
     expect(emails.filter(e => e.to.includes(CLIENT)).length === 1, 'the retry did not email the client');
+    for (const admin of core.ADMIN_EMAILS) expect(emails.filter(e => e.to.includes(admin)).length === 1, `the retry did not email ${admin} exactly once`);
 });
 
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);

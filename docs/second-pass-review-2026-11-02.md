@@ -67,7 +67,7 @@ All 18 mutations are caught. Five were not caught before this review.
 
 These were not run: load, stress, spike and soak tests against real infrastructure; chaos tests against real Supabase, Stripe or Resend; live Stripe or email; the production database or migrations; RLS tests against a real Postgres; full line-by-line reviews of `admin.mjs` (891 lines), `client.mjs`, `request.mjs` (the public, unauthenticated order and pricing endpoint), `_lib/passkeys.mjs`, `_lib/clients.mjs`, `_lib/photos.mjs`, `_lib/surveys.mjs`, `_lib/safewalk.mjs` and `_lib/firms.mjs`, beyond the guards mutated above; browser and accessibility testing. The existing suites' "stress" and "chaos" checks run in-process against fakes. They do not measure production capacity.
 
-## 8. Third pass: order form and admin step-ups
+## 7. Third pass: order form and admin step-ups
 
 I ran 13 more mutations against the public order form (`request.mjs`), pricing (`estimate`) and the admin step-up gates.
 
@@ -86,6 +86,6 @@ I ran 13 more mutations against the public order form (`request.mjs`), pricing (
 
 **L-03 (Low, fixed).** `/api/request` `finish` checked "already emailed?" and wrote the marker in two separate steps. Three `finish` calls at the same moment sent the client three confirmation emails (reproduced in R-12). An atomic `hit_rate_limit('request-confirm:<order>', 86400)` now lets only one call send. If that counter is removed, R-12 fails.
 
-## 7. Recommendation
+## 8. Recommendation
 
 **Ready for local review.** Production approval still needs: `CRON_SECRET` set; the webhook subscribed to `charge.refunded` and `charge.dispute.created`; a real-infrastructure load test; and an independent review of `admin.mjs`.
