@@ -15,9 +15,14 @@ class FakeStripe {
             expire: async (id) => { const ses = stripeSessions.get(id); if (ses) ses.status = 'expired'; return ses || {}; },
             create: async (params, options) => {
                 // Like Stripe: with stripeIdempotency on, a repeated idempotency key returns the session it created first.
-                if (stripeIdempotency && options?.idempotencyKey && idempotent.has(options.idempotencyKey)) return idempotent.get(options.idempotencyKey);
+                if (stripeIdempotency && options?.idempotencyKey && idempotent.has(options.idempotencyKey)) {
+                    // Stripe refuses a reused key whose parameters differ from the first request's.
+                    const first = idempotent.get(options.idempotencyKey);
+                    if (first.__params !== JSON.stringify(params)) throw Object.assign(new Error('Keys for idempotent requests can only be used with the same parameters they were first used with.'), { type: 'StripeIdempotencyError' });
+                    return first;
+                }
                 const id = `cs_test_${randomUUID().replace(/-/g, '')}`; const ses = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid' };
-                stripeSessions.set(id, ses); if (options?.idempotencyKey) idempotent.set(options.idempotencyKey, ses); return ses;
+                stripeSessions.set(id, ses); if (options?.idempotencyKey) idempotent.set(options.idempotencyKey, Object.assign(ses, { __params: JSON.stringify(params) })); return ses;
             },
         } };
         this.paymentIntents = { retrieve: async (id) => paymentIntents.get(id) || { id, metadata: {} } };
@@ -1074,6 +1079,40 @@ await check('R-12 the confirmation emails go out once, even when the browser fin
     reset(); const old = seedOrder({ created_at: new Date(Date.now() - 2 * 3600e3).toISOString() });
     await requestPOST(post('/api/request', { step: 'finish', t: old.track_token, fileIds: [] }));
     expect(!emails.length, 'a two-hour-old order sent confirmation emails again');
+});
+
+await check('R-02c two payment links asked for seconds apart in the same minute send Stripe identical requests', async () => {
+    const { checkoutParams } = await import('../api/_lib/stripe.mjs');
+    const order = { id: randomUUID(), code: 'NP-123456', client_email: CLIENT, track_token: 'T'.repeat(32) };
+    const minute = Math.floor(Date.now() / 60000) * 60000;
+    const a = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 2000);
+    const b = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 55000);
+    expect(a.options.idempotencyKey === b.options.idempotencyKey, 'keys differ within one minute');
+    expect(JSON.stringify(a.params) === JSON.stringify(b.params), `parameters differ (expires_at ${a.params.expires_at} vs ${b.params.expires_at}), so Stripe would refuse the second`);
+    const c = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 61000);
+    expect(c.options.idempotencyKey !== a.options.idempotencyKey, 'the next minute reused the key');
+});
+await check('R-12b if the confirmation marker cannot be written, a retry still sends the emails', async () => {
+    reset();
+    const { POST: requestPOST } = await import('../api/request.mjs');
+    const created = await (await requestPOST(post('/api/request', requestForm()))).json();
+    emails.length = 0;
+    const realFrom = db.from.bind(db);
+    let failOnce = true;
+    db.from = (table) => {
+        const q = realFrom(table);
+        if (table === 'order_events' && failOnce) {
+            const insert = q.insert.bind(q);
+            q.insert = (row) => (row?.title === 'Confirmation emailed' && failOnce) ? (failOnce = false, Promise.resolve({ data: null, error: { message: 'insert failed' } })) : insert(row);
+        }
+        return q;
+    };
+    try {
+        const first = await requestPOST(post('/api/request', { step: 'finish', t: created.token, fileIds: [] }));
+        expect(first.status >= 500 && !emails.length, `first finish answered ${first.status} with ${emails.length} emails`);
+    } finally { db.from = realFrom; }
+    await requestPOST(post('/api/request', { step: 'finish', t: created.token, fileIds: [] }));
+    expect(emails.filter(e => e.to.includes(CLIENT)).length === 1, 'the retry did not email the client');
 });
 
 console.log(`\n${passed} real-handler checks passed, ${failures.length} failed`);

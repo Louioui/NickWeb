@@ -91,8 +91,15 @@ async function finish(request, body) {
     const { data: already } = await db().from('order_events').select('id').eq('order_id', order.id).eq('title', 'Confirmation emailed').limit(1);
     if (already?.length) return json({ ok: true });
     // Two finishes at the same moment can both pass that read; the atomic counter lets only one send.
-    if (await hitRateLimit(`request-confirm:${order.id}`, 86400) > 1) return json({ ok: true });
-    await addEvent(order.id, 'note', 'Confirmation emailed', null, false);
+    const confirmBucket = `request-confirm:${order.id}`;
+    if (await hitRateLimit(confirmBucket, 86400) > 1) return json({ ok: true });
+    try {
+        await addEvent(order.id, 'note', 'Confirmation emailed', null, false);
+    } catch (err) {
+        // Nothing was sent: give the slot back so the browser's retry can still email the client and Nick.
+        await db().from('rate_limits').delete().eq('bucket', confirmBucket).then(() => {}, () => {});
+        throw err;
+    }
 
     const origin = siteOrigin(request);
     const trackUrl = `${origin}/track.html#t=${order.track_token}`;

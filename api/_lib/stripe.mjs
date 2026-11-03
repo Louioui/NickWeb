@@ -16,8 +16,10 @@ export function stripeClient() {
 }
 
 export function checkoutParams(order, amountCents, description, origin, nowMs = Date.now()) {
-    const expiresAt = Math.floor(nowMs / 1000) + 86340; // 23h 59m hard expiry matching email copy
+    // The expiry is rounded to the same minute as the idempotency key, so a retry within that minute sends identical
+    // parameters. Stripe rejects a reused key whose parameters differ, which made a double-click a few seconds apart fail.
     const minuteBucket = Math.floor(nowMs / 60000);
+    const expiresAt = minuteBucket * 60 + 86340; // 23h 58m to 23h 59m from now, matching the email copy
     const idempotencyKey = `nps-checkout-${sha256(`${order.id}:${amountCents}:${description || ''}:${minuteBucket}`)}`;
     return {
         params: {
