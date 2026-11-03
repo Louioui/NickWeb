@@ -32,11 +32,16 @@ check('Aura still carries the platform and the motion layer', () => {
 for (const tier of ['origin', 'nexus']) {
     const html = pages[tier];
     check(`${tier}: no private platform code or links`, () => {
-        // Scanned without the shared compiled CSS (it has selectors for every page) and the privacy policy's "Service
-        // providers" sentence, which is Nick's legal copy and is flagged for his review rather than rewritten here.
-        const code = html.replace(/<style>[\s\S]*?<\/style>/, '').replace(/<p><strong>Service providers:<\/strong>[^\n]*/, '');
+        // Scanned without the shared compiled CSS, which has selectors for every page. The privacy policy is included,
+        // so it can't name services (Stripe, Supabase) this package doesn't use.
+        const code = html.replace(/<style>[\s\S]*?<\/style>/, '');
         const found = PRIVATE.filter(s => code.toLowerCase().includes(s.toLowerCase()));
         expect(!found.length, `found ${found.join(', ')}`);
+    });
+    check(`${tier}: the privacy policy matches a site with no online forms or payments`, () => {
+        const policy = html.slice(html.indexOf("titleEl.textContent = 'Privacy Policy"), html.indexOf("titleEl.textContent = 'Terms of Service'"));
+        for (const s of ['Supabase', 'Resend', 'Stripe', 'uploaded documents', 'tracking page']) expect(!policy.includes(s), `policy still mentions ${s}`);
+        expect(policy.includes('collects nothing from you online'), 'policy does not say the site collects nothing online');
     });
     check(`${tier}: no api/ folder or private pages in the package`, () => {
         for (const f of ['api', 'admin.html', 'account.html', 'track.html', 'sw.js', 'vercel.json']) expect(!existsSync(join(ROOT, 'dist', tier, f)), `${f} shipped`);
