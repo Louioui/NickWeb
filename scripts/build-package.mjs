@@ -7,9 +7,12 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageName = String(process.argv[2] || '').toLowerCase();
-const out = path.resolve(process.argv[3] || '');
+const rawOut = process.argv[3] || '';
 if (!['origin', 'nexus'].includes(packageName)) throw new Error('Choose package "origin" or "nexus". Aura is released from the secured application project.');
-if (!out || !path.isAbsolute(out) || out === root) throw new Error('Choose a separate absolute output directory.');
+// Checked before resolving: path.resolve would turn a relative argument into a folder inside this repository.
+if (!path.isAbsolute(rawOut)) throw new Error('Choose a separate absolute output directory.');
+const out = path.resolve(rawOut);
+if (out === root || out.startsWith(root + path.sep)) throw new Error('Choose an output directory outside this repository.');
 await mkdir(out, { recursive: true });
 if ((await readdir(out)).length) throw new Error('Package output directory must be empty.');
 

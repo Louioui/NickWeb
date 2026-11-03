@@ -347,6 +347,41 @@ await check('a reply already emailed under the pre-message marker title is not e
     expect(res.status === 200, `respond-finish returned ${res.status}`);
     expect(emails.length === 0, `legacy-marked reply re-emailed ${emails.length} time(s)`);
 });
+await check('twelve concurrent respond-finish calls for one message email Nick exactly once', async () => {
+    reset();
+    const o = seedOrder({ status: 'served', doc_lock: false });
+    expect((await trackPOST(post('/api/track', { t: o.track_token, action: 'respond', reply: 'Hello Nick' }))).status === 200, 'message failed');
+    await Promise.all(Array.from({ length: 12 }, () => trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }))));
+    expect(emails.length === core.ADMIN_EMAILS.length, `one message sent ${emails.length} email(s)`);
+});
+await check('a failed notification is not recorded as sent, and a later call after the claim expires delivers it', async () => {
+    reset();
+    const o = seedOrder({ status: 'served', doc_lock: false });
+    await trackPOST(post('/api/track', { t: o.track_token, action: 'respond', reply: 'Hello Nick' }));
+    resendUp = false;
+    const failed = await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }));
+    expect(failed.status === 200, `respond-finish returned ${failed.status} although the message is saved`);
+    expect(!events(o.id).some(e => e.title === 'Client reply emailed'), 'a rejected email was recorded as delivered');
+    resendUp = true;
+    tables().rate_limits = (tables().rate_limits || []).filter(r => !r.bucket.startsWith('reply-email:'));   // the claim window passing
+    await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }));
+    expect(emails.length === core.ADMIN_EMAILS.length && events(o.id).some(e => e.title === 'Client reply emailed'), `retry sent ${emails.length} email(s)`);
+});
+await check('a new message sharing a timestamp with the previous email marker is still emailed', async () => {
+    reset();
+    const o = seedOrder({ status: 'served', doc_lock: false });
+    const at = new Date(Date.now() - 1000).toISOString();
+    const first = randomUUID();
+    (tables().order_events ||= []).push(
+        { id: first, order_id: o.id, kind: 'client_message', title: 'You sent Nick a message', created_at: at },
+        { id: randomUUID(), order_id: o.id, kind: 'note', title: 'Client reply emailed', detail: `Emailed Nick about reply ${first}`, created_at: at },
+        { id: randomUUID(), order_id: o.id, kind: 'client_message', title: 'You sent Nick a message', created_at: at },
+    );
+    // Same-millisecond rows: make the newest message sort first, as Postgres may return it.
+    tables().order_events.reverse();
+    await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }));
+    expect(emails.length === core.ADMIN_EMAILS.length, `second message on a timestamp tie sent ${emails.length} email(s)`);
+});
 await check('a locked Aura request still requires document unlock before any client message', async () => {
     reset(); setPin(CLIENT);
     const locked = seedOrder({ status: 'served', doc_lock: true });
@@ -715,6 +750,20 @@ const webhook = (session) => webhookPOST(new Request('https://site.test/api/stri
     body: JSON.stringify({ type: 'checkout.session.completed', data: { object: session } }),
 }));
 const reviewEvents = (o) => events(o.id).filter(e => e.kind === 'payment' && !e.client_visible);
+await check('a PWM-Dev sale on the shared Stripe account is acknowledged without touching any order or emailing Nick', async () => {
+    reset();
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 10000 });
+    const before = JSON.stringify(tables());
+    for (const type of ['checkout.session.completed', 'checkout.session.async_payment_succeeded']) {
+        const res = await webhookPOST(new Request('https://site.test/api/stripe-webhook', {
+            method: 'POST', headers: { 'stripe-signature': 'fake' },
+            body: JSON.stringify({ type, data: { object: { id: 'cs_test_pwmorigin1', payment_status: 'paid', amount_total: 55000, metadata: { offer: 'origin', client_site: 'example.com' } } } }),
+        }));
+        expect(res.status === 200, `${type} from another site returned ${res.status}, so Stripe would keep retrying`);
+    }
+    expect(JSON.stringify(tables()) === before && !o.paid_at, 'a foreign session changed NickWeb data');
+    expect(emails.length === 0, `a foreign session emailed ${emails.length} time(s)`);
+});
 await check('F-05 a paid, replaced payment link is flagged once for Nick (and emailed)', async () => {
     reset();
     const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 10000, stripe_session_id: 'cs_test_newlink123' });

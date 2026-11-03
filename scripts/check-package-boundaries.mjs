@@ -28,4 +28,11 @@ try {
     if (name === 'nexus') assert(/nexus-rise/.test(html) && /prefers-reduced-motion/.test(html), 'Nexus interaction or reduced-motion support missing');
     console.log(`PASS ${name}: static package excludes Aura code and has its expected visual scope`);
   }
+  // A relative or in-repo output path would write the deliverable among the Aura source, so both must be refused.
+  for (const bad of ['relative-out', path.join(root, 'package-out')]) {
+    const refused = await run(process.execPath, ['scripts/build-package.mjs', 'origin', bad], { cwd: root }).then(() => false, () => true);
+    assert(refused, `build-package accepted unsafe output directory ${bad}`);
+    await rm(path.resolve(root, bad), { recursive: true, force: true });
+  }
+  console.log('PASS build-package refuses relative and in-repository output directories');
 } finally { await rm(tmp, { recursive: true, force: true }); }

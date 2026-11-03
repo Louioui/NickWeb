@@ -675,10 +675,12 @@ const handlers = {
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
             const orderEvents = events.filter(e => e.order_id === o.id);
             const lastResponse = [...orderEvents].reverse().find(e => e.kind === 'action_response' || e.kind === 'client_message');
-            const lastEmailed = [...orderEvents].reverse().find(e => e.title === 'Client reply emailed' || e.title === 'Reply emailed');
-            if (lastResponse && (!lastEmailed || lastEmailed.created_at < lastResponse.created_at)) {
+            const markerDetail = lastResponse && `Emailed Nick about reply ${lastResponse.id}`;
+            const emailed = lastResponse && orderEvents.some(e => e.title === 'Client reply emailed' && e.detail === markerDetail
+                || ((e.title === 'Reply emailed' || e.title === 'Client reply emailed') && !e.detail && e.created_at >= lastResponse.created_at));
+            if (lastResponse && !emailed) {
                 email(ADMIN_EMAIL, lastResponse.kind === 'action_response' ? `${o.code}: client sent the information you asked for` : `${o.code}: client sent a message`, `/admin.html#${o.id}`);
-                addEvent(o.id, 'note', 'Client reply emailed', null, false);
+                addEvent(o.id, 'note', 'Client reply emailed', markerDetail, false);
             }
             return json(clientView(o, { unlocked }));
         }

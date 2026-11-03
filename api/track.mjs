@@ -225,16 +225,20 @@ export const POST = handle(async (request) => {
         // Told to the client too, so the page doesn't say "sent" for a file that isn't on the request yet.
         const fileStatus = { filesStillChecking: stillChecking, filesMissing: missing };
         if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} file${uploaded.length === 1 ? '' : 's'} added by you`);
-        const { data: recentEvents } = await db().from('order_events').select('kind, title, created_at')
-            .eq('order_id', order.id).order('created_at', { ascending: false }).limit(20);
+        const { data: recentEvents } = await db().from('order_events').select('id, kind, title, detail, created_at')
+            .eq('order_id', order.id).order('created_at', { ascending: false }).order('seq', { ascending: false }).limit(20);
         const lastResponse = (recentEvents || []).find(e => e.kind === 'action_response' || e.kind === 'client_message');
-        // 'Reply emailed' is the marker title written before client messages existed; both mean Nick was already told.
-        const lastEmailed = (recentEvents || []).find(e => e.title === 'Client reply emailed' || e.title === 'Reply emailed');
-        if (!lastResponse || (lastEmailed && lastEmailed.created_at >= lastResponse.created_at)) {
+        // A marker names the reply it covers, so a new reply with the same timestamp is never mistaken for an emailed one.
+        // Markers without a reply id ('Reply emailed', written before client messages existed) fall back to timestamps.
+        const markerDetail = lastResponse && `Emailed Nick about reply ${lastResponse.id}`;
+        const emailed = lastResponse && (recentEvents || []).some(e => e.title === 'Client reply emailed' && e.detail === markerDetail
+            || ((e.title === 'Reply emailed' || e.title === 'Client reply emailed') && !e.detail && e.created_at >= lastResponse.created_at));
+        // One sender per reply: hit_rate_limit is an atomic upsert, so of several concurrent calls only the first sees 1.
+        if (!lastResponse || emailed || await hitRateLimit(`reply-email:${lastResponse.id}`, 120) > 1) {
             return json({ ...await clientView(await orderByToken(body.t), { unlocked }), ...fileStatus });
         }
         const origin = siteOrigin(request);
-        await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
+        const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
             to,
             subject: lastResponse?.kind === 'action_response' ? `${order.code}: client sent the information you asked for` : `${order.code}: client sent a message`,
             heading: lastResponse?.kind === 'action_response' ? `${order.client_name} responded` : `${order.client_name} sent a message`,
@@ -243,9 +247,10 @@ export const POST = handle(async (request) => {
                 ...(missing ? [`${missing} file(s) did not reach storage.`] : [])],
             button: { label: 'Open in your dashboard', url: `${origin}/admin.html#${order.id}` },
         })));
-        // Persist this marker only after every intended recipient accepted the message. A failed delivery remains eligible
-        // for a safe client retry instead of being recorded as delivered before the notification was actually accepted.
-        await addEvent(order.id, 'note', 'Client reply emailed', null, false);
+        // Notification is best effort: the reply itself is already saved and flags the job on Nick's dashboard. The marker
+        // records only a delivery every recipient accepted; after a failure a later call can send once the claim expires.
+        if (sent.every(Boolean)) await addEvent(order.id, 'note', 'Client reply emailed', markerDetail, false);
+        else console.error(`Client reply notification for ${order.code} was not accepted by every recipient`);
         return json({ ...await clientView(await orderByToken(body.t), { unlocked }), ...fileStatus });
     }
 
