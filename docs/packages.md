@@ -54,7 +54,7 @@ Disabling a single cut in the build (the tracking dialogs) makes 4 checks fail.
 
 ## Open questions for Nick and the owner
 
-1. **Privacy policy and Terms.** In Origin and Nexus, the privacy policy still says requests are stored with Supabase and card payments go through Stripe. Those packages no longer collect anything online. This is Nick's legal copy, so it needs his rewrite; it was not edited here.
+1. **Privacy policy (done 2026-11-03).** The Origin and Nexus builds now get their own privacy policy: no online collection, what Nick receives by phone, text or email, Vercel hosting and OpenStreetMap map images. Aura keeps the full policy. `check-tiers` fails if the Origin or Nexus policy mentions Supabase, Stripe, Resend, uploads or the tracking page. Nick should still read it over, since it's his legal text.
 2. **The coverage map (decided: keep it).** It stays in Origin as coverage information, alongside the ZIP checker. Only the motion layer goes.
 3. **A contact form for Origin.** Origin has call, text and email links but no form. A form needs a server endpoint and spam protection. Decide whether Origin should include one.
 4. **Selling the packages.** The Origin, Nexus and Aura pricing section described in the UI brief is for selling these packages to clients. It is not part of Nick's own page and was not added.

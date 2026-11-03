@@ -85,8 +85,17 @@ function withoutPlatform(html) {
     html = replace(html, "const MODAL_IDS = ['track-modal', 'confirm-modal', 'legal-modal'];", "const MODAL_IDS = ['legal-modal'];", 'modal list');
     html = cut(html, '        // --- Track Existing Serve', '        // --- Legal Modals ---', 'tracking, account check and request wizard');
     html = replace(html, '                closeTrackModal();\n                closeConfirmModal();\n', '', 'Escape handler');
+    // Privacy policy: without the platform the site collects nothing online, so the parts about online requests,
+    // uploads, the database, emails and card payments are replaced with what is true for these packages.
+    html = cut(html, '<p><strong>What we collect:</strong>', '<p><strong>Cookies and tracking:</strong>', 'privacy policy', PUBLIC_PRIVACY);
     return html;
 }
+
+const PUBLIC_PRIVACY = `<p><strong>What we collect:</strong> This website has no forms and collects nothing from you online. When you call, text, or email Nick, we receive what you choose to share: your name, firm, email and phone; your case details; the name, address and description of the person to be served; and any documents you send.</p>
+                    <p><strong>How it's used:</strong> Only to carry out and keep a record of the service you request. We never sell it or share it for advertising.</p>
+                    <p><strong>Storage:</strong> Information you send by phone, text or email is kept in Nick's own business records and email account, and documents are opened only by Nick.</p>
+                    <p><strong>Service providers:</strong> The site is hosted by Vercel, which receives your IP address when you visit, like any website host. The coverage map shows map images from OpenStreetMap, which also receives your IP address when those images load. Links to Nick's Google reviews open Google's own site. Payment is arranged directly with Nick after he confirms your request, for example by Zelle.</p>
+                    `;
 
 // Origin: also take out the motion layer, so the page is static (content was never hidden without it: the reveal
 // script is what adds the hidden state).
@@ -111,10 +120,26 @@ const AURA_EXCLUDE = new Set(['.git', '.github', '.claude', 'node_modules', 'dis
     '.DS_Store', '.gitignore', 'package.json', 'package-lock.json', 'tailwind.config.js', 'demo.html']);
 
 rmSync(DIST, { recursive: true, force: true });
+// The live site's security headers live in vercel.json, which also carries Aura's crons, functions and path
+// redirects. Origin and Nexus are static, so they get only the site-wide headers and the font cache rule, with the
+// database server taken out of connect-src since nothing on these pages calls it.
+const siteConfig = JSON.parse(readFileSync(join(ROOT, 'vercel.json'), 'utf8'));
+const siteHeaders = siteConfig.headers.find(h => h.source === '/(.*)');
+const assetCache = siteConfig.headers.find(h => h.source === '/assets/(vendor|fonts)/(.*)');
+if (!siteHeaders || !assetCache) throw new Error('vercel.json: the site-wide or asset header rule is missing');
+const staticConfig = JSON.stringify({
+    headers: [
+        { source: '/(.*)', headers: siteHeaders.headers.map(h => h.key !== 'Content-Security-Policy' ? h
+            : { ...h, value: h.value.replace(/connect-src[^;]*/, "connect-src 'self'") }) },
+        assetCache,
+    ],
+}, null, 2) + '\n';
+
 for (const [tier, html] of [['origin', origin], ['nexus', nexus]]) {
     const out = join(DIST, tier);
     mkdirSync(out, { recursive: true });
     writeFileSync(join(out, 'index.html'), html);
+    writeFileSync(join(out, 'vercel.json'), staticConfig);
     for (const f of PUBLIC_FILES) {
         if (existsSync(join(ROOT, f))) { mkdirSync(dirname(join(out, f)), { recursive: true }); cpSync(join(ROOT, f), join(out, f), { recursive: true }); }
     }
