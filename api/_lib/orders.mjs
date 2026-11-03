@@ -323,9 +323,10 @@ export async function prefersDigest(emailAddr) {
 export async function sendDailyDigests(origin) {
     // Once per UTC day, whoever calls: Vercel can retry the cleanup job, and until CRON_SECRET is set anyone can run it.
     // The counter is an atomic database increment, so two runs at once can't both send.
-    if (await hitRateLimit('daily-digest-run', 86400) > 1) return 0;
+    // Taken only after the preferences read succeeds, so a database hiccup doesn't use up the day's run.
     const { data: prefs, error } = await db().from('client_preferences').select('email').eq('notify_mode', 'daily').limit(500);
     if (error || !prefs?.length) return 0;
+    if (await hitRateLimit('daily-digest-run', 86400) > 1) return 0;
     const since = new Date(Date.now() - 864e5).toISOString();
     let sent = 0;
     for (const { email: to } of prefs) {
