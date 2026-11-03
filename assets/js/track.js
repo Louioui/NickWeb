@@ -73,8 +73,13 @@ function render(o) {
             : 'If your earlier link has expired, check it here for a fresh one.';
     }
 
-    $('action-panel').classList.toggle('hidden', !o.actionNote);
-    if (o.actionNote) $('action-note').textContent = o.actionNote;
+    const needsAction = !!o.actionNote;
+    $('action-panel').classList.remove('hidden');
+    $('action-required-copy').classList.toggle('hidden', !needsAction);
+    $('message-copy').classList.toggle('hidden', needsAction);
+    $('address-update').classList.toggle('hidden', !needsAction);
+    $('access-update').classList.toggle('hidden', !needsAction);
+    if (needsAction) $('action-note').textContent = o.actionNote;
 
     const proof = o.files.filter(f => f.kind === 'proof');
     const docs = o.files.filter(f => f.kind !== 'proof');
@@ -240,7 +245,7 @@ $('action-form').addEventListener('submit', async (e) => {
             ? `Your reply was sent, but ${done.filesMissing} file(s) didn't arrive. Please send them again or call Nick at (209) 922-6817.`
             : done.filesStillChecking
             ? `Your reply was sent. ${done.filesStillChecking} file(s) are still being checked and will appear on your request once they are; Nick has been told.`
-            : 'Your reply was sent to Nick. Your request is ready for his review; there’s nothing else you need to do right now.';
+            : 'Your message was sent to Nick. You can continue following your request here.';
         window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
         errBox.textContent = err.message;

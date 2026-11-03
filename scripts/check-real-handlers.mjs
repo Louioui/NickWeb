@@ -317,6 +317,43 @@ await check('client audit log records tracking, unlock, download, reply and paym
     expect(['tracking_view', 'document_unlock', 'file_download', 'action_reply', 'payment_confirmation'].every(action => logs.some(x => x.action === action)), `missing audit action: ${logs.map(x => x.action)}`);
     expect(logs.every(x => /^[0-9a-f]{64}$/.test(x.ip_hash) && !JSON.stringify(x).includes('203.0.113.17')), 'raw IP stored in audit log');
 });
+await check('Aura client messages are always available without reopening an order or allowing unsolicited address changes', async () => {
+    reset();
+    const served = seedOrder({ status: 'served', served_at: new Date().toISOString(), doc_lock: false });
+    const message = await trackPOST(post('/api/track', { t: served.track_token, action: 'respond', reply: 'Thank you. Please send me a copy of the proof when it is ready.' }));
+    const messageBody = await message.json();
+    expect(message.status === 200 && messageBody.responseType === 'client_message', `message failed (${message.status} ${JSON.stringify(messageBody)})`);
+    const stored = tables().orders.find(x => x.id === served.id);
+    expect(stored.status === 'served' && stored.served_at === served.served_at, `message changed terminal workflow state: ${JSON.stringify(stored)}`);
+    expect(events(served.id).some(e => e.kind === 'client_message' && e.title === 'You sent Nick a message'), 'message event was not recorded');
+    expect((tables().client_audit_logs || []).some(e => e.order_id === served.id && e.action === 'client_message'), 'message audit action missing');
+    const adminToken = 'M'.repeat(43);
+    (tables().admin_sessions ||= []).push({ token_hash: core.sha256(adminToken), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString() });
+    const dashboard = await (await adminPOST(post('/api/admin', { action: 'list' }, { cookie: `nps_admin=${adminToken}` }))).json();
+    expect(dashboard.orders.find(x => x.id === served.id)?.client_replied === true, 'dashboard did not flag a message on a completed order');
+    const addressChange = await trackPOST(post('/api/track', { t: served.track_token, action: 'respond', address: '999 Attacker Ave', reply: 'Please update this.' }));
+    expect(addressChange.status === 409, `unsolicited address change returned ${addressChange.status}`);
+    expect(tables().orders.find(x => x.id === served.id).address === '12 Main St', 'unsolicited address change was saved');
+});
+await check('a reply already emailed under the pre-message marker title is not emailed to Nick again', async () => {
+    reset();
+    const o = seedOrder({ status: 'received', doc_lock: false });
+    const at = (ms) => new Date(Date.now() - ms).toISOString();
+    (tables().order_events ||= []).push(
+        { id: randomUUID(), order_id: o.id, kind: 'action_response', title: 'You sent the requested information', created_at: at(2000) },
+        { id: randomUUID(), order_id: o.id, kind: 'note', title: 'Reply emailed', created_at: at(1000) },
+    );
+    const res = await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }));
+    expect(res.status === 200, `respond-finish returned ${res.status}`);
+    expect(emails.length === 0, `legacy-marked reply re-emailed ${emails.length} time(s)`);
+});
+await check('a locked Aura request still requires document unlock before any client message', async () => {
+    reset(); setPin(CLIENT);
+    const locked = seedOrder({ status: 'served', doc_lock: true });
+    const denied = await trackPOST(post('/api/track', { t: locked.track_token, action: 'respond', reply: 'Can you call me?' }));
+    expect(denied.status === 403, `locked message returned ${denied.status}`);
+    expect(!events(locked.id).some(e => e.kind === 'client_message'), 'locked message was recorded');
+});
 await check('admin dispute pack contains paginated evidence, excludes tokens, and needs admin auth', async () => {
     reset();
     const o = seedOrder({ recipient_name: '<script>Unsafe</script>', stripe_session_id: 'cs_test_evidence123', paid_at: new Date().toISOString(), amount_due_cents: 7500 });
@@ -459,6 +496,32 @@ await check('dashboard last-contact date follows the latest client exchange', as
     const res = await adminPOST(post('/api/admin', { action: 'list' }, { cookie: adminCookie() }));
     const body = await res.json();
     expect(res.status === 200 && body.orders.find(x => x.id === o.id)?.last_contact_at === reply, 'latest reply was not used');
+});
+await check('a client message advances last contact; an order with no exchange still counts from its submission', async () => {
+    reset();
+    const created = new Date(Date.now() - 5 * 864e5).toISOString();
+    const message = new Date(Date.now() - 3600e3).toISOString();
+    const talked = seedOrder({ created_at: created, status: 'attempting' });
+    const quiet = seedOrder({ created_at: created, status: 'attempting' });
+    (tables().order_events ||= []).push({ id: randomUUID(), order_id: talked.id, kind: 'client_message', created_at: message });
+    const body = await (await adminPOST(post('/api/admin', { action: 'list' }, { cookie: adminCookie() }))).json();
+    const byId = new Map(body.orders.map(x => [x.id, x]));
+    expect(byId.get(talked.id)?.last_contact_at === message, `client message not counted: ${byId.get(talked.id)?.last_contact_at}`);
+    expect(byId.get(talked.id)?.client_replied === true, 'client message not flagged as awaiting Nick');
+    expect(byId.get(quiet.id)?.last_contact_at === created, `order without exchange lost its submission date: ${byId.get(quiet.id)?.last_contact_at}`);
+});
+await check('a full 500-order dashboard loads and flags replies without an oversized id filter', async () => {
+    reset();
+    const base = Date.now() - 864e5;
+    const seeded = Array.from({ length: 500 }, (_, i) => seedOrder({ created_at: new Date(base + i * 1000).toISOString(), status: 'attempting' }));
+    const oldest = seeded[0];
+    (tables().order_events ||= []).push({ id: randomUUID(), order_id: oldest.id, kind: 'client_message', created_at: new Date(base + 1).toISOString() });
+    // Thousands of newer Nick events on other orders must not push the oldest order's reply out of view.
+    for (const o of seeded.slice(1)) for (let k = 0; k < 12; k++) tables().order_events.push({ id: randomUUID(), order_id: o.id, kind: 'attempt', created_at: new Date(base + 6e5 + k).toISOString() });
+    const res = await adminPOST(post('/api/admin', { action: 'list' }, { cookie: adminCookie() }));
+    const body = await res.json();
+    expect(res.status === 200, `500-order dashboard failed (${res.status} ${JSON.stringify(body).slice(0, 200)})`);
+    expect(body.orders.find(x => x.id === oldest.id)?.client_replied === true, 'reply on the oldest listed order was truncated away');
 });
 await check('F-09 sensitive admin action needs a fresh, single-use emailed code without TOTP', async () => {
     reset(); const cookie = adminCookie();

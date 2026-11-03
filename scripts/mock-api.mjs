@@ -631,27 +631,32 @@ const handlers = {
             return json(clientView(o, { unlocked }));
         }
         if (body.action === 'respond') {
-            if (o.status !== 'action_required') fail(409, 'Nothing is needed from you right now.');
             if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
+            const answeringAction = o.status === 'action_required';
             const changes = {};
             const address = cleanText(body.address, 200, false, 'Street address');
+            if (address && !answeringAction) fail(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
             if (address) changes.address = address;
             const unit = cleanText(body.unit, 40, false, 'Unit');
+            if (unit && !answeringAction) fail(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
             if (unit) changes.unit = unit;
             const city = cleanText(body.city, 80, false, 'City');
+            if (city && !answeringAction) fail(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
             if (city) changes.city = city;
             const zip = cleanText(body.zip, 10, false, 'ZIP code');
             if (zip) {
                 if (!/^\d{5}(-\d{4})?$/.test(zip)) fail(400, 'Please enter a valid 5-digit ZIP code.');
+                if (!answeringAction) fail(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
                 changes.zip = zip;
             }
             const access = cleanLongText(body.accessNotes, 500, 'Access notes');
+            if (access && !answeringAction) fail(409, 'Access instructions can only be changed when Nick has requested additional information. Please contact Nick for this change.');
             if (access) changes.access_notes = access;
             const reply = cleanLongText(body.reply, 2000, 'Your reply');
             const fileList = Array.isArray(body.files) ? body.files : [];
             if (!Object.keys(changes).length && !reply && !fileList.length) fail(400, 'Please add the missing information, a reply, or a file.');
             const uploads = prepareUploads(o.id, 'action_upload', fileList);
-            updateOrder(o, { ...changes, status: 'received', action_note: null, updated_at: now() });
+            if (answeringAction) updateOrder(o, { ...changes, status: 'received', action_note: null, updated_at: now() });
             const attemptCount = events.filter(e => e.order_id === o.id && e.kind === 'attempt').length;
             const amendDigest = sha256Hex(`${o.code}|${changes.address || ''}|${changes.unit || ''}|${changes.city || ''}|${changes.zip || ''}|${changes.access_notes || ''}|${reply || ''}`).slice(0, 16);
             const summary = [
@@ -660,21 +665,20 @@ const handlers = {
                 reply,
                 `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
             ].filter(Boolean).join(' · ');
-            addEvent(o.id, 'action_response', 'You sent the requested information', summary || null);
-            auditClient(req, o.id, 'action_reply');
-            return json({ ok: true, uploads });
+            addEvent(o.id, answeringAction ? 'action_response' : 'client_message', answeringAction ? 'You sent the requested information' : 'You sent Nick a message', summary || null);
+            auditClient(req, o.id, answeringAction ? 'action_reply' : 'client_message');
+            return json({ ok: true, uploads, responseType: answeringAction ? 'action_response' : 'client_message' });
         }
         if (body.action === 'respond-finish') {
             if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Unlock it first.');
-            if (o.status !== 'received') return json(clientView(o, { unlocked }));
             const up = await confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
             const orderEvents = events.filter(e => e.order_id === o.id);
-            const lastResponse = [...orderEvents].reverse().find(e => e.kind === 'action_response');
-            const lastEmailed = [...orderEvents].reverse().find(e => e.title === 'Reply emailed');
+            const lastResponse = [...orderEvents].reverse().find(e => e.kind === 'action_response' || e.kind === 'client_message');
+            const lastEmailed = [...orderEvents].reverse().find(e => e.title === 'Client reply emailed' || e.title === 'Reply emailed');
             if (lastResponse && (!lastEmailed || lastEmailed.created_at < lastResponse.created_at)) {
-                addEvent(o.id, 'note', 'Reply emailed', null, false);
-                email(ADMIN_EMAIL, `${o.code}: client sent the information you asked for`, `/admin.html#${o.id}`);
+                email(ADMIN_EMAIL, lastResponse.kind === 'action_response' ? `${o.code}: client sent the information you asked for` : `${o.code}: client sent a message`, `/admin.html#${o.id}`);
+                addEvent(o.id, 'note', 'Client reply emailed', null, false);
             }
             return json(clientView(o, { unlocked }));
         }
@@ -838,12 +842,12 @@ const handlers = {
             return json({ codes: out, remaining: out.length });
         }
         if (a === 'list') {
-            const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response'];
+            const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response', 'client_message'];
             const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(o => {
                 const last = events.filter(e => e.order_id === o.id && kinds.includes(e.kind)).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                const contact = events.filter(e => e.order_id === o.id && ['action', 'action_response'].includes(e.kind))
+                const contact = events.filter(e => e.order_id === o.id && ['action', 'action_response', 'client_message'].includes(e.kind))
                     .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                return { ...o, client_replied: last?.kind === 'action_response', last_contact_at: contact?.created_at || o.created_at };
+                return { ...o, client_replied: ['action_response', 'client_message'].includes(last?.kind), last_contact_at: contact?.created_at || o.created_at };
             });
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
         }

@@ -37,7 +37,8 @@ export function createFakeSupabase() {
         lt(c, v) { this.filters.push(r => r[c] < v); return this; }
         gt(c, v) { this.filters.push(r => r[c] > v); return this; }
         gte(c, v) { this.filters.push(r => r[c] >= v); return this; }
-        in(c, list) { this.filters.push(r => list.includes(r[c])); return this; }
+        // PostgREST puts .in() lists in the URL; gateways reject URLs past roughly 8KB, so model that limit here.
+        in(c, list) { if (list.join(',').length > 8000) this.uriTooLong = true; this.filters.push(r => list.includes(r[c])); return this; }
         is(c, v) { this.filters.push(r => (r[c] ?? null) === v); return this; }
         order(c, { ascending = true } = {}) { (this.orderBy ||= []).push({ c, ascending }); return this; }
         limit(n) { this.limitN = n; return this; }
@@ -46,6 +47,7 @@ export function createFakeSupabase() {
         maybeSingle() { this.one = 'maybe'; return this; }
         then(resolve, reject) { return Promise.resolve().then(() => this.run()).then(resolve, reject); }
         run() {
+            if (this.uriTooLong) return { data: null, error: { code: '414', message: 'URI Too Long' } };
             const all = rows(this.table);
             const match = all.filter(r => this.filters.every(f => f(r)));
             let out;
@@ -108,9 +110,15 @@ export function createFakeSupabase() {
         list_order_contact_dates: ({ p_order_ids }) => p_order_ids.map(id => {
             const order = rows('orders').find(o => o.id === id);
             if (!order) return null;
-            const latest = rows('order_events').filter(e => e.order_id === id && ['action', 'action_response'].includes(e.kind))
+            const latest = rows('order_events').filter(e => e.order_id === id && ['action', 'action_response', 'client_message'].includes(e.kind))
                 .map(e => e.created_at).sort().at(-1);
             return { order_id: id, last_contact_at: latest || order.created_at };
+        }).filter(Boolean),
+        list_order_client_replied: ({ p_order_ids }) => p_order_ids.map(id => {
+            const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response', 'client_message'];
+            const latest = rows('order_events').filter(e => e.order_id === id && kinds.includes(e.kind))
+                .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+            return latest && { order_id: id, client_replied: ['action_response', 'client_message'].includes(latest.kind) };
         }).filter(Boolean),
         admin_codes_last_hour: () => 0,
         use_admin_code: ({ p_email, p_hash }) => {

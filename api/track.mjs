@@ -3,7 +3,8 @@
 //   POST { t, action: 'view' }                     -> order status, timeline, files
 //   POST { t, action: 'download', fileId }         -> short-lived download link
 //   POST { t, action: 'confirm-payment', session } -> checks Stripe after the client returns from paying
-//   POST { t, action: 'respond', ...fields, files }-> answers "Action required"; returns upload links
+//   POST { t, action: 'respond', ...fields, files }-> sends an auditable client reply; address changes are accepted only
+//                                                      while Nick has explicitly requested an action
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, hitRateLimit, peekRateLimit, text, longText, cleanFileList,
@@ -167,31 +168,38 @@ export const POST = handle(async (request) => {
 
     if (body.action === 'respond') {
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
-        if (order.status !== 'action_required') throw new HttpError(409, 'Nothing is needed from you right now.');
         // A locked page can't be used to change the service address: unlock with the emailed code or PIN first.
         if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
+        const answeringAction = order.status === 'action_required';
         const changes = {};
         const address = text(body.address, { max: 200 });
+        if (address && !answeringAction) throw new HttpError(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
         if (address) changes.address = address;
         const unit = text(body.unit, { max: 40 });
+        if (unit && !answeringAction) throw new HttpError(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
         if (unit) changes.unit = unit;
         const city = text(body.city, { max: 80 });
+        if (city && !answeringAction) throw new HttpError(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
         if (city) changes.city = city;
         const zip = text(body.zip, { max: 10 });
         if (zip) {
             if (!/^\d{5}(-\d{4})?$/.test(zip)) throw new HttpError(400, 'Please enter a valid 5-digit ZIP code.');
+            if (!answeringAction) throw new HttpError(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
             changes.zip = zip;
         }
         const access = longText(body.accessNotes, { max: 500 });
+        if (access && !answeringAction) throw new HttpError(409, 'Access instructions can only be changed when Nick has requested additional information. Please contact Nick for this change.');
         if (access) changes.access_notes = access;
         const reply = longText(body.reply, { max: 2000, label: 'Your reply' });
         const files = cleanFileList(body.files);
         if (!Object.keys(changes).length && !reply && !files.length) throw new HttpError(400, 'Please add the missing information, a reply, or a file.');
 
-        changes.status = 'received';
-        changes.action_note = null;
-        const { error } = await db().from('orders').update(changes).eq('id', order.id);
-        if (error) throw error;
+        if (answeringAction) {
+            changes.status = 'received';
+            changes.action_note = null;
+            const { error } = await db().from('orders').update(changes).eq('id', order.id);
+            if (error) throw error;
+        }
         let attemptCount = 0;
         try {
             const { count } = await db().from('order_events').select('id', { count: 'exact', head: true }).eq('order_id', order.id).eq('kind', 'attempt');
@@ -204,38 +212,40 @@ export const POST = handle(async (request) => {
             reply,
             `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
         ].filter(Boolean).join(' · ');
-        await addEvent(order.id, 'action_response', 'You sent the requested information', summary || null);
+        await addEvent(order.id, answeringAction ? 'action_response' : 'client_message', answeringAction ? 'You sent the requested information' : 'You sent Nick a message', summary || null);
         const uploads = await prepareUploads(order.id, 'action_upload', files);
-        await auditClientAction(request, order.id, 'action_reply');
-        return json({ ok: true, uploads });
+        await auditClientAction(request, order.id, answeringAction ? 'action_reply' : 'client_message');
+        return json({ ok: true, uploads, responseType: answeringAction ? 'action_response' : 'client_message' });
     }
 
     if (body.action === 'respond-finish') {
         if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Unlock it first.');
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
-        if (order.status !== 'received') return json(await clientView(order, { unlocked }));
         const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
         // Told to the client too, so the page doesn't say "sent" for a file that isn't on the request yet.
         const fileStatus = { filesStillChecking: stillChecking, filesMissing: missing };
         if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} file${uploaded.length === 1 ? '' : 's'} added by you`);
         const { data: recentEvents } = await db().from('order_events').select('kind, title, created_at')
             .eq('order_id', order.id).order('created_at', { ascending: false }).limit(20);
-        const lastResponse = (recentEvents || []).find(e => e.kind === 'action_response');
-        const lastEmailed = (recentEvents || []).find(e => e.title === 'Reply emailed');
+        const lastResponse = (recentEvents || []).find(e => e.kind === 'action_response' || e.kind === 'client_message');
+        // 'Reply emailed' is the marker title written before client messages existed; both mean Nick was already told.
+        const lastEmailed = (recentEvents || []).find(e => e.title === 'Client reply emailed' || e.title === 'Reply emailed');
         if (!lastResponse || (lastEmailed && lastEmailed.created_at >= lastResponse.created_at)) {
             return json({ ...await clientView(await orderByToken(body.t), { unlocked }), ...fileStatus });
         }
-        await addEvent(order.id, 'note', 'Reply emailed', null, false);
         const origin = siteOrigin(request);
         await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
             to,
-            subject: `${order.code}: client sent the information you asked for`,
-            heading: `${order.client_name} responded`,
+            subject: lastResponse?.kind === 'action_response' ? `${order.code}: client sent the information you asked for` : `${order.code}: client sent a message`,
+            heading: lastResponse?.kind === 'action_response' ? `${order.client_name} responded` : `${order.client_name} sent a message`,
             lines: [`Request ${order.code} (${order.recipient_name}) is back in your queue.`, uploaded.length ? `${uploaded.length} new file(s) attached.` : 'No new files.',
                 ...(stillChecking ? [`${stillChecking} more file(s) could not be checked yet; they will appear on the order once checked.`] : []),
                 ...(missing ? [`${missing} file(s) did not reach storage.`] : [])],
             button: { label: 'Open in your dashboard', url: `${origin}/admin.html#${order.id}` },
         })));
+        // Persist this marker only after every intended recipient accepted the message. A failed delivery remains eligible
+        // for a safe client retry instead of being recorded as delivered before the notification was actually accepted.
+        await addEvent(order.id, 'note', 'Client reply emailed', null, false);
         return json({ ...await clientView(await orderByToken(body.t), { unlocked }), ...fileStatus });
     }
 

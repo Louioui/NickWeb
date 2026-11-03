@@ -455,19 +455,15 @@ async function list() {
     return json({ orders, statuses: STATUSES, tiers: TIERS });
 }
 
-// A job "has a client reply" when the client's answer is newer than anything Nick has done on it since.
-// Only "received" jobs can be in that state (answering sets it), which keeps the id list short enough for one query.
-const NICK_KINDS = ['action', 'status', 'attempt', 'payment', 'proof'];
+// A job "has a client reply" when the client's answer or message is newer than anything Nick has done on it since.
+// Aura messages do not change the operational order state, so every listed job is checked, in the database (one row per
+// order, ids in the request body) so a full 500-job list neither overflows the URL nor loses older jobs to a row limit.
 async function withClientReplied(list) {
-    const ids = list.filter(o => o.status === 'received').map(o => o.id).slice(0, 150);
-    if (!ids.length) return list.map(o => ({ ...o, client_replied: false }));
-    const { data: evs, error } = await db().from('order_events').select('order_id, kind')
-        .in('order_id', ids).in('kind', [...NICK_KINDS, 'action_response'])
-        .order('created_at', { ascending: false }).limit(5000);
+    if (!list.length) return list;
+    const { data, error } = await db().rpc('list_order_client_replied', { p_order_ids: list.map(o => o.id) });
     if (error) throw error;
-    const latest = new Map();
-    for (const e of evs) if (!latest.has(e.order_id)) latest.set(e.order_id, e.kind);
-    return list.map(o => ({ ...o, client_replied: latest.get(o.id) === 'action_response' }));
+    const replied = new Set((data || []).filter(r => r.client_replied).map(r => r.order_id));
+    return list.map(o => ({ ...o, client_replied: replied.has(o.id) }));
 }
 
 async function getOrder(id) {
