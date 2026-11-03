@@ -33,6 +33,25 @@ Disabling a single cut in the build (the tracking dialogs) makes 4 checks fail.
 - **The ZIP checker** works.
 - **The contact buttons** are 236 by 48 pixels on a phone.
 
+## How a customer buys and upgrades
+
+**Buying.** The customer pays on the owner's site, partnershipwithmedia-dev.com, through the owner's Stripe account. The link to send is `https://partnershipwithmedia-dev.com/buy/<origin|nexus|aura>?site=<their domain>`. It shows the package and price for their site. Stripe only opens when they press Buy. The owner gets an email naming the package, the buyer and the website. The website comes from the link, so check the buyer's email matches the client.
+
+**Delivery and upgrades are done by the owner, by hand.** Payment does not change the client's site by itself. Each package is a different deployed site, and Aura also needs its own database, keys and Stripe setup.
+
+| Step | Origin or Nexus | Aura |
+|---|---|---|
+| Build | `npm run build:tiers` | same |
+| Deploy | Upload `dist/<tier>/` to the client's Vercel project with `vercel deploy --prod` from that folder, or the dashboard | Deploy the repo, then set up Supabase (apply `supabase/migrations/`), the Vercel environment variables, the client's own Stripe keys and webhook, Resend and `CRON_SECRET` (see `docs/HANDOFF.md`) |
+| Domain | Point the client's domain at that project | same |
+| Time | Minutes | About an hour, plus verifying the email domain |
+
+**Upgrading** (for example Origin to Nexus or Aura): the client pays the new package, or the difference if you offer upgrade credit. You then deploy the bigger package to their project, or move their domain to it. Their old deployment stays in Vercel, so going back is just moving the domain back.
+
+**Why it isn't automatic.** A payment could trigger a Vercel deploy hook. That's only practical for Origin and Nexus, and the website on the buy link is unverified, so an automatic deploy could change a site its buyer doesn't own. Aura can't be automated at all: it needs a database and the client's own payment keys. Delivering by hand also gives a check that the payment is real and matches the client.
+
+**Nick (2026-11-03):** bought Origin. `nicksprocessservices.dev` now serves `dist/origin/` from Vercel project `nickweb-origin`. The full site is still in project `nickweb`, without a domain. The Stripe webhook for his old payments was removed from the owner's account.
+
 ## Open questions for Nick and the owner
 
 1. **Privacy policy and Terms.** In Origin and Nexus, the privacy policy still says requests are stored with Supabase and card payments go through Stripe. Those packages no longer collect anything online. This is Nick's legal copy, so it needs his rewrite; it was not edited here.
