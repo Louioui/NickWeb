@@ -265,6 +265,43 @@ export async function flagUnappliedPayment(orderId, amountCents, sessionId) {
     return true;
 }
 
+// A Stripe dispute or early fraud warning on one of Nick's payments. The Stripe account is shared with another site,
+// so only payments carrying one of these orders' ids get here. Nick is emailed once per dispute or warning (Stripe
+// redelivers events), with a private timeline entry; if no email goes out, it throws so Stripe retries.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export async function flagDispute(orderId, eventType, obj) {
+    if (!UUID_RE.test(String(orderId)) || typeof obj?.id !== 'string') return false;
+    const { data: order, error } = await db().from('orders').select('id, code').eq('id', orderId).maybeSingle();
+    if (error) throw error;
+    if (!order) return false;
+    const { data: earlier, error: eErr } = await db().from('order_events').select('detail').eq('order_id', orderId).eq('kind', 'payment').eq('client_visible', false);
+    if (eErr) throw eErr;
+    if ((earlier || []).some(e => String(e.detail || '').includes(obj.id))) return false;   // already flagged
+    const fraud = eventType === 'radar.early_fraud_warning.created';
+    // Early fraud warnings carry no amount, only the charge.
+    const amount = Number.isFinite(obj.amount) ? money(obj.amount) : null;
+    const payment = amount ? `the ${amount} payment` : 'a payment';
+    const dueBy = obj.evidence_details?.due_by
+        ? new Date(obj.evidence_details.due_by * 1000).toLocaleDateString('en-US', { dateStyle: 'long', timeZone: 'America/Los_Angeles' }) : null;
+    const reason = String(obj.reason || obj.fraud_type || 'not given').replaceAll('_', ' ');
+    const lines = fraud
+        ? [`Stripe flagged ${payment} on ${order.code} as possibly fraudulent (${reason}).`,
+            'No money has been taken back yet. Consider refunding it in Stripe before it becomes a dispute.']
+        : [`${payment[0].toUpperCase()}${payment.slice(1)} on ${order.code} was disputed by the cardholder (${reason}).`,
+            dueBy ? `Respond in Stripe before ${dueBy}, or the dispute is lost by default.` : 'Respond to it in Stripe as soon as possible.',
+            'Download the evidence pack for this order from your dashboard and upload it to the dispute in Stripe.'];
+    console.error(`Stripe ${fraud ? 'fraud warning' : 'dispute'} on ${order.code}: ${obj.id}${amount ? ` (${amount})` : ''}`);
+    const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
+        to, subject: `${order.code}: ${fraud ? 'a payment was flagged as possible fraud' : 'a payment was disputed'}`,
+        heading: fraud ? 'A payment was flagged as possible fraud' : 'A payment was disputed',
+        lines,
+    }).catch(() => false)));
+    if (!sent.some(Boolean)) throw new Error(`${fraud ? 'Fraud warning' : 'Dispute'} alert for ${order.code} could not be emailed`);
+    await addEvent(orderId, 'payment', fraud ? 'Fraud warning on payment' : 'Payment disputed',
+        `Stripe ${fraud ? 'early fraud warning' : 'dispute'} ${obj.id} on ${payment}: ${reason}.${dueBy ? ` Evidence due by ${dueBy}.` : ''}`, false);
+    return true;
+}
+
 // --- Email (Resend). Without RESEND_API_KEY the email is printed to the server log instead (local testing). ---
 const FROM = process.env.EMAIL_FROM || "Nick's Process Services <updates@nicksprocessservices.dev>";
 const REPLY_TO = 'nicksprocessservices@outlook.com';

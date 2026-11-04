@@ -10,9 +10,11 @@ import { countPdfPages, printingSummary } from '../api/_lib/pdf-pages.mjs';
 const db = createFakeSupabase();
 const stripeSessions = new Map();
 const stripeIdempotency = new Map();
+const stripeIntents = new Map();
 class FakeStripe {
     constructor() {
         this.webhooks = { constructEventAsync: async (raw) => JSON.parse(raw) };
+        this.paymentIntents = { retrieve: async (id) => { const row = stripeIntents.get(id); if (row instanceof Error) throw row; return row || { id, metadata: {} }; } };
         this.checkout = { sessions: { retrieve: async (id) => { const row = stripeSessions.get(id); if (row instanceof Error) throw row; return row || { id, payment_status: 'unpaid', metadata: {} }; },
             expire: async (id) => { const row = stripeSessions.get(id); if (row?.expireError) throw new Error('Stripe expiry failed'); if (row) row.status = 'expired'; return row || {}; },
             create: async (params, options) => { if (stripeIdempotency.has(options?.idempotencyKey)) return stripeIdempotency.get(options.idempotencyKey);
@@ -69,7 +71,7 @@ const post = (path, body, headers = {}) => new Request(`https://site.test${path}
     method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
 });
 const tables = () => db.__state.tables;
-const reset = () => { db.__reset(); stripeSessions.clear(); stripeIdempotency.clear(); emails.length = 0; resendUp = true; };
+const reset = () => { db.__reset(); stripeSessions.clear(); stripeIdempotency.clear(); stripeIntents.clear(); emails.length = 0; resendUp = true; };
 const ADMIN = 'nicksprocessservices@outlook.com';
 const CLIENT = 'client@example.com';
 const PIN = '246810';
@@ -763,6 +765,58 @@ await check('a PWM-Dev sale on the shared Stripe account is acknowledged without
     }
     expect(JSON.stringify(tables()) === before && !o.paid_at, 'a foreign session changed NickWeb data');
     expect(emails.length === 0, `a foreign session emailed ${emails.length} time(s)`);
+});
+const stripeEventPOST = (type, object) => webhookPOST(new Request('https://site.test/api/stripe-webhook', {
+    method: 'POST', headers: { 'stripe-signature': 'fake' }, body: JSON.stringify({ type, data: { object } }),
+}));
+const disputeEvents = (o) => events(o.id).filter(e => e.kind === 'payment' && !e.client_visible && /disputed|Fraud warning/.test(e.title));
+await check('a dispute on one of Nick\'s payments emails him once, with the respond-by date, and is recorded privately', async () => {
+    reset();
+    const o = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 12500 });
+    stripeIntents.set('pi_test_nick1', { id: 'pi_test_nick1', metadata: { order_id: o.id, order_code: o.code } });
+    const dispute = { id: 'dp_test_1', object: 'dispute', payment_intent: 'pi_test_nick1', amount: 12500, reason: 'product_not_received', evidence_details: { due_by: 1796000000 } };
+    expect((await stripeEventPOST('charge.dispute.created', dispute)).status === 200, 'dispute webhook failed');
+    expect((await stripeEventPOST('charge.dispute.created', dispute)).status === 200, 'redelivered dispute failed');
+    const alerts = emails.filter(e => /a payment was disputed/.test(e.subject));
+    expect(alerts.length === core.ADMIN_EMAILS.length, `dispute emailed ${alerts.length} time(s)`);
+    expect(/Respond in Stripe before/.test(alerts[0].text) && /product not received/.test(alerts[0].text), 'alert lacks the deadline or reason');
+    expect(disputeEvents(o).length === 1 && !events(o.id).some(e => e.client_visible && /disput/i.test(e.title)), 'dispute not recorded once, privately');
+});
+await check('an early fraud warning on Nick\'s payment is flagged to him', async () => {
+    reset();
+    const o = seedOrder({ paid_at: new Date().toISOString() });
+    stripeIntents.set('pi_test_nick2', { id: 'pi_test_nick2', metadata: { order_id: o.id } });
+    await stripeEventPOST('radar.early_fraud_warning.created', { id: 'issfr_test_1', payment_intent: 'pi_test_nick2', fraud_type: 'made_with_stolen_card' });
+    const alert = emails.find(e => /flagged as possible fraud/.test(e.subject));
+    expect(alert && disputeEvents(o).length === 1, 'fraud warning not flagged');
+    expect(!/\$0\.00/.test(alert.text) && /flagged a payment on/.test(alert.text), 'fraud warning invents an amount');
+});
+await check('a dispute on another site\'s payment (shared Stripe account) is ignored without error', async () => {
+    reset();
+    const o = seedOrder();
+    stripeIntents.set('pi_test_pwm', { id: 'pi_test_pwm', metadata: { offer: 'origin' } });
+    const before = JSON.stringify(tables());
+    for (const type of ['charge.dispute.created', 'radar.early_fraud_warning.created']) {
+        expect((await stripeEventPOST(type, { id: `x_${type}`, payment_intent: 'pi_test_pwm', amount: 55000 })).status === 200, `${type} from another site failed`);
+    }
+    expect((await stripeEventPOST('charge.dispute.created', { id: 'dp_test_none', amount: 100 })).status === 200, 'a dispute with no payment intent failed');
+    expect(JSON.stringify(tables()) === before && emails.length === 0 && disputeEvents(o).length === 0, 'another site\'s dispute touched NickWeb');
+});
+await check('if the dispute alert cannot be emailed, nothing is recorded and Stripe is asked to retry', async () => {
+    reset(); resendUp = false;
+    const o = seedOrder({ paid_at: new Date().toISOString() });
+    stripeIntents.set('pi_test_nick3', { id: 'pi_test_nick3', metadata: { order_id: o.id } });
+    const dispute = { id: 'dp_test_3', payment_intent: 'pi_test_nick3', amount: 7500, reason: 'fraudulent' };
+    const first = await stripeEventPOST('charge.dispute.created', dispute);
+    expect(first.status >= 500 && disputeEvents(o).length === 0, `status ${first.status}, entries ${disputeEvents(o).length}`);
+    resendUp = true;
+    expect((await stripeEventPOST('charge.dispute.created', dispute)).status === 200 && disputeEvents(o).length === 1, 'retry did not alert Nick');
+});
+await check('a Stripe outage while looking up a disputed payment makes Stripe retry', async () => {
+    reset();
+    stripeIntents.set('pi_test_down', new Error('Stripe unavailable'));
+    const res = await stripeEventPOST('charge.dispute.created', { id: 'dp_test_4', payment_intent: 'pi_test_down', amount: 100 });
+    expect(res.status >= 500, `status ${res.status}`);
 });
 await check('F-05 a paid, replaced payment link is flagged once for Nick (and emailed)', async () => {
     reset();

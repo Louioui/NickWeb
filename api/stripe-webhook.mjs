@@ -1,6 +1,7 @@
-// POST /api/stripe-webhook — Stripe tells us a checkout was paid. The signature check needs the raw body.
+// POST /api/stripe-webhook — Stripe tells us a checkout was paid, or a payment was disputed. The signature check needs
+// the raw body.
 import { handle, json, HttpError } from './_lib/core.mjs';
-import { markPaid, flagUnappliedPayment } from './_lib/orders.mjs';
+import { markPaid, flagUnappliedPayment, flagDispute } from './_lib/orders.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
 
 export const POST = handle(async (request) => {
@@ -19,6 +20,14 @@ export const POST = handle(async (request) => {
         // A paid session that can't be applied (replaced link, short amount) is flagged for Nick rather than dropped.
         if (s.payment_status === 'paid' && s.metadata?.order_id && !(await markPaid(s.metadata.order_id, s.amount_total, s.id))) {
             await flagUnappliedPayment(s.metadata.order_id, s.amount_total, s.id);
+        }
+    } else if (event.type === 'charge.dispute.created' || event.type === 'radar.early_fraud_warning.created') {
+        // The order id lives on the payment intent (stripe.mjs sets it); payments without one belong to another site.
+        const obj = event.data.object;
+        const intentId = typeof obj.payment_intent === 'string' ? obj.payment_intent : obj.payment_intent?.id;
+        if (intentId) {
+            const intent = await stripeClient().paymentIntents.retrieve(intentId);
+            if (intent?.metadata?.order_id) await flagDispute(intent.metadata.order_id, event.type, obj);
         }
     }
     return json({ received: true });
