@@ -1421,6 +1421,21 @@ await check('R-03 a refund or dispute on a paid order is flagged once for Nick, 
     const r = await stripeEvent('evt_refund_2', 'charge.refunded', { id: 'ch_test_2', payment_intent: 'pi_other', amount_refunded: 100 });
     expect(r.status === 200, `a refund for an unknown order answered ${r.status}`);
 });
+await check('R-03b two partial refunds on one charge each reach Nick; a redelivered dispute event for the same dispute does not', async () => {
+    reset();
+    const o = seedOrder({ status: 'paid', paid_at: new Date().toISOString(), amount_due_cents: 9000, stripe_session_id: 'cs_test_paidsession1' });
+    paymentIntents.set('pi_test_123', { id: 'pi_test_123', metadata: { order_id: o.id } });
+    // Same charge, two refund events (Stripe sends charge.refunded for each partial refund, with the running total).
+    await stripeEvent('evt_refund_part1', 'charge.refunded', { id: 'ch_test_1', object: 'charge', payment_intent: 'pi_test_123', amount_refunded: 3000 });
+    await stripeEvent('evt_refund_part2', 'charge.refunded', { id: 'ch_test_1', object: 'charge', payment_intent: 'pi_test_123', amount_refunded: 9000 });
+    const refunds = reviewEvents(o).filter(e => /refund/i.test(e.title));
+    expect(refunds.length === 2, `${refunds.length} refund entries for two partial refunds`);
+    // One dispute delivered under two event ids (dispute created, then Stripe's own redelivery) is one alert.
+    const dispute = { id: 'dp_test_9', object: 'dispute', payment_intent: 'pi_test_123', amount: 9000, reason: 'fraudulent' };
+    await stripeEvent('evt_dispute_a', 'charge.dispute.created', dispute);
+    await stripeEvent('evt_dispute_b', 'charge.dispute.created', dispute);
+    expect(reviewEvents(o).filter(e => /disput/i.test(e.title)).length === 1, 'one dispute alerted twice');
+});
 
 await check('R-04 a tracking link cannot download a file that belongs to another order', async () => {
     reset();

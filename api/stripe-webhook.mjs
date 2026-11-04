@@ -32,7 +32,9 @@ export const POST = handle(async (request) => {
             const orderId = intent?.metadata?.order_id;
             if (typeof orderId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(orderId)) {
                 const kind = event.type === 'charge.refunded' ? 'refund' : event.type === 'charge.dispute.created' ? 'dispute' : 'fraud_warning';
-                await flagPaymentReversal(orderId, { eventId: event.id, objectId: obj.id, kind,
+                // Disputes and warnings dedupe on their own id too (one alert per dispute); a refund only on its event id,
+                // since one charge can be refunded several times (partial refunds) and each should reach Nick.
+                await flagPaymentReversal(orderId, { eventId: event.id, objectId: kind === 'refund' ? null : obj.id, kind,
                     amountCents: kind === 'refund' ? obj.amount_refunded : kind === 'dispute' ? obj.amount : null,
                     reason: obj.reason || obj.fraud_type || null, dueBy: obj.evidence_details?.due_by ?? null });
             }

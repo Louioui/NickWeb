@@ -6,12 +6,21 @@ import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 //   unsafe: true   JavaScript actions (document or page level, including inside object streams) or attached files
 //   pages: n       the page tree's real page count
 //   pages: null    pdf.js could not read the file (unsafe is then false: not being able to parse it is not proof of harm)
+// A strict read first; if that fails, a lenient one (pdf.js repairs what it can), so the JavaScript and attachment check
+// still runs on slightly malformed files. Only the strict read's page count is trusted for billing.
 export async function inspectPdf(bytes) {
+    const strict = await readPdf(bytes, true);
+    if (strict.unsafe || strict.pages) return strict;
+    const lenient = await readPdf(bytes, false);
+    return { pages: null, unsafe: lenient.unsafe };
+}
+
+async function readPdf(bytes, stopAtErrors) {
     if (!(bytes instanceof Uint8Array) || bytes.length < 16 || bytes.length > 25 * 1024 * 1024) return { pages: null, unsafe: false };
     let task;
     try {
         task = getDocument({ data: new Uint8Array(bytes), useSystemFonts: false, isEvalSupported: false,
-            stopAtErrors: true, disableFontFace: true });
+            stopAtErrors, disableFontFace: true });
         const pdf = await task.promise;
         const count = pdf.numPages;
         if (!Number.isSafeInteger(count) || count < 1 || count > 100000) return { pages: null, unsafe: false };
