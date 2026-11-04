@@ -17,8 +17,10 @@ export function stripeClient() {
 
 export function checkoutParams(order, amountCents, description, origin, nowMs = Date.now(), requestToken = randomToken(12)) {
     const expiresAt = Math.floor(nowMs / 1000) + 86340; // 23h 59m hard expiry matching email copy
-    // One key per create attempt. Sharing a key across concurrent requests can return the same session to both;
-    // the losing compare-and-swap request would then expire the winner's payable link.
+    // One key per create attempt. A shared (per-minute) key hands concurrent or quick repeat requests the same session:
+    // a link Nick replaces within the same minute would come back already expired, and a request that loses the
+    // compare-and-swap on the order would expire the winner's payable link. Every caller saves the new session with a
+    // compare-and-swap and closes its own session if it loses, so a double-click still leaves one live link.
     const idempotencyKey = `nps-checkout-${sha256(`${order.id}:${amountCents}:${description || ''}:${requestToken}`)}`;
     return {
         params: {

@@ -15,13 +15,14 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;
 const table = (headers, rows) => `<table><thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(v => `<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
 
 export function evidenceHtml(pack) {
-    const { order, payment, attestation, attempts, downloads, files, chain } = pack;
+    const { order, payment, attestation, attempts, downloads, files, chain, client_activity: activity = [] } = pack;
     return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${esc(order.code)} Dispute Evidence</title>
 <style>body{font:14px/1.5 system-ui,sans-serif;max-width:950px;margin:35px auto;padding:0 20px;color:#15261c}h1,h2{color:#0d422e}h2{margin-top:30px;border-bottom:1px solid #bbb;padding-bottom:5px}table{border-collapse:collapse;width:100%;margin:10px 0 20px}th,td{border:1px solid #bbb;padding:7px;text-align:left;vertical-align:top;overflow-wrap:anywhere}th{background:#edf3ef}p{overflow-wrap:anywhere}.mono{font-family:ui-monospace,monospace;font-size:12px}@media print{body{margin:0;max-width:none}h2{break-after:avoid}tr{break-inside:avoid}}</style></head><body>
 <h1>Dispute evidence pack · ${esc(order.code)}</h1><p>Generated ${esc(pack.exported_at)}. Review this record and the source JSON before submitting it anywhere.</p>
 <h2>Request and payment</h2>${table(['Field','Value'], [['Reference',order.code],['Client',order.client_name],['Recipient',order.recipient_name],['Case number',order.case_number],['Court',order.court],['Service tier',order.tier],['Stripe session',payment.stripe_session_id],['Amount due (cents)',payment.amount_due_cents],['Paid at',payment.paid_at],['Legal attestation at',attestation?.created_at || 'Not recorded']])}
 <h2>Attempt log</h2>${table(['Logged at','Outcome','Detail'],attempts.map(a => [a.created_at,a.title,a.detail]))}
 <h2>Client downloads</h2>${table(['Downloaded at','File'],downloads.map(d => [d.created_at,d.filename || d.file_id || 'Unknown file']))}
+<h2>Client activity on the tracking page</h2>${table(['When','Action','Detail','Network (hashed)'],activity.map(a => [a.created_at,a.action,a.detail || '',a.network || '']))}
 <h2>File fingerprints</h2>${table(['File','Kind','SHA-256'],files.map(f => [f.filename,f.kind,f.sha256 || 'Pending']))}
 <h2>Sealed timeline</h2><p>Verification: ${chain.verified ? 'verified' : 'FAILED'} · ${esc(chain.entries)} events</p><p class="mono">Head hash: ${esc(chain.head || 'Unavailable')}</p>
 </body></html>`;

@@ -3,13 +3,14 @@
 //   POST { t, action: 'view' }                     -> order status, timeline, files
 //   POST { t, action: 'download', fileId }         -> short-lived download link
 //   POST { t, action: 'confirm-payment', session } -> checks Stripe after the client returns from paying
-//   POST { t, action: 'respond', ...fields, files }-> sends an auditable client reply; address changes are accepted only
-//                                                      while Nick has explicitly requested an action
+//   POST { t, action: 'respond', ...fields, files }-> answers Nick's question, or sends him a note on an open request;
+//                                                      address changes are accepted only while Nick has asked for them
 //   POST { t, action: 'respond-finish', fileIds }  -> confirms those uploads and tells Nick
+//   POST { t, action: 'renew-payment-link' }       -> a fresh 24-hour payment link when the last one expired unpaid
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, hitRateLimit, peekRateLimit, text, longText, cleanFileList,
-         prepareUploads, confirmUploads, addEvent, auditClientAction, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
-import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, flagUnappliedPayment, renewExpiredPaymentLink, sendEmail } from './_lib/orders.mjs';
+         prepareUploads, confirmUploads, addEvent, uuid, sha256, randomToken, timingSafeMatch, signToken, checkToken, verifyPin, HttpError, ADMIN_EMAILS, IS_PROD } from './_lib/core.mjs';
+import { orderByToken, cleanTrackToken, clientView, fileForOrder, markPaid, flagUnappliedPayment, renewExpiredPaymentLink, sendEmail, logClientAction, CLIENT_NOTE_STATUSES } from './_lib/orders.mjs';
 import { getClientSecurity, pinLocked } from './_lib/clients.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
 
@@ -30,9 +31,8 @@ export const POST = handle(async (request) => {
     const unlocked = isOrderUnlocked(order, body);
 
     if (body.action === 'view') {
-        const view = await clientView(order, { unlocked });
-        await auditClientAction(request, order.id, 'tracking_view');
-        return json(view);
+        await logClientAction(request, order.id, 'view', unlocked ? 'unlocked page' : 'locked page');
+        return json(await clientView(order, { unlocked }));
     }
 
     if (body.action === 'send-unlock-code') {
@@ -89,8 +89,8 @@ export const POST = handle(async (request) => {
             verified = true;
         }
         const unlockToken = makeUnlockToken(order);
+        await logClientAction(request, order.id, 'unlock');
         const view = await clientView(order, { unlocked: true });
-        await auditClientAction(request, order.id, 'document_unlock');
         return json({ ok: true, unlockToken, ...view });
     }
 
@@ -140,7 +140,7 @@ export const POST = handle(async (request) => {
         fileSha256 = fRow?.sha256 || null;
         // Chain of custody: every document opened from the tracking page is recorded (privately) in the sealed timeline.
         await addEvent(order.id, 'note', 'Document downloaded from tracking page', fRow?.filename || null, false);
-        await auditClientAction(request, order.id, 'file_download', fId);
+        await logClientAction(request, order.id, 'download', fRow?.filename || null);
         return json({ url, sha256: fileSha256, expiresInSeconds: 60 });
     }
 
@@ -148,29 +148,30 @@ export const POST = handle(async (request) => {
         if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) throw new HttpError(400, 'Invalid payment session.');
         await rateLimit(`track-pay:${sha256(body.t)}`, 10, 900);
         const session = await stripeClient().checkout.sessions.retrieve(body.session);
-        if (session.metadata?.order_id === order.id && session.payment_status === 'paid' &&
-            !(await markPaid(order.id, session.amount_total, session.id))) {
-            await flagUnappliedPayment(order.id, session.amount_total, session.id).catch(err => console.error(err.message));
+        if (session.metadata?.order_id === order.id && session.payment_status === 'paid') {
+            if (await markPaid(order.id, session.amount_total, session.id)) await logClientAction(request, order.id, 'payment', session.id);
+            else await flagUnappliedPayment(order.id, session.amount_total, session.id).catch(err => console.error(err.message));
         }
-        const latest = await orderByToken(body.t);
-        if (session.metadata?.order_id === order.id && session.payment_status === 'paid' &&
-            latest.paid_at && latest.stripe_session_id === session.id) {
-            await auditClientAction(request, order.id, 'payment_confirmation');
-        }
-        return json(await clientView(latest, { unlocked }));
+        return json(await clientView(await orderByToken(body.t), { unlocked }));
     }
 
-    if (body.action === 'renew-payment-link') {
+    // 'renew-payment' is the name an older cached copy of track.js may still send.
+    if (body.action === 'renew-payment-link' || body.action === 'renew-payment') {
+        await rateLimit(`track-pay:${sha256(body.t)}`, 10, 900);
         await rateLimit(`track-renew:${sha256(body.t)}`, 3, 3600);
-        await renewExpiredPaymentLink(order, siteOrigin(request));
+        const session = await renewExpiredPaymentLink(order, siteOrigin(request));
+        await logClientAction(request, order.id, 'renew_payment', session.id);
         return json(await clientView(await orderByToken(body.t), { unlocked }));
     }
 
     if (body.action === 'respond') {
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
+        // Nick's question can always be answered; on any other open request the client can still send a note or a
+        // file (not an address change, which only Nick's question opens up). Finished requests take no new notes.
+        const answeringAction = order.status === 'action_required';
+        if (!CLIENT_NOTE_STATUSES.includes(order.status)) throw new HttpError(409, 'This request is finished. Call or text Nick if you need anything.');
         // A locked page can't be used to change the service address: unlock with the emailed code or PIN first.
         if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
-        const answeringAction = order.status === 'action_required';
         const changes = {};
         const address = text(body.address, { max: 200 });
         if (address && !answeringAction) throw new HttpError(409, 'Address changes can only be sent when Nick has requested additional information. Please contact Nick for this change.');
@@ -194,9 +195,8 @@ export const POST = handle(async (request) => {
         const files = cleanFileList(body.files);
         if (!Object.keys(changes).length && !reply && !files.length) throw new HttpError(400, 'Please add the missing information, a reply, or a file.');
 
-        if (answeringAction) {
-            changes.status = 'received';
-            changes.action_note = null;
+        if (answeringAction) { changes.status = 'received'; changes.action_note = null; }
+        if (Object.keys(changes).length) {
             const { error } = await db().from('orders').update(changes).eq('id', order.id);
             if (error) throw error;
         }
@@ -213,14 +213,15 @@ export const POST = handle(async (request) => {
             `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
         ].filter(Boolean).join(' · ');
         await addEvent(order.id, answeringAction ? 'action_response' : 'client_message', answeringAction ? 'You sent the requested information' : 'You sent Nick a message', summary || null);
+        await logClientAction(request, order.id, 'reply', `${answeringAction ? 'answered Nick' : 'message'} after ${attemptCount} attempt(s)`);
         const uploads = await prepareUploads(order.id, 'action_upload', files);
-        await auditClientAction(request, order.id, answeringAction ? 'action_reply' : 'client_message');
         return json({ ok: true, uploads, responseType: answeringAction ? 'action_response' : 'client_message' });
     }
 
     if (body.action === 'respond-finish') {
         if (order.doc_lock && !unlocked) throw new HttpError(403, 'This request is locked. Unlock it first.');
         await rateLimit(`track-write:${sha256(body.t)}`, 10, 900);
+        if (!CLIENT_NOTE_STATUSES.includes(order.status)) return json(await clientView(order, { unlocked }));
         const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
         // Told to the client too, so the page doesn't say "sent" for a file that isn't on the request yet.
         const fileStatus = { filesStillChecking: stillChecking, filesMissing: missing };

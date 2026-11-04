@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.join(__dirname, '..');
-const PAGES = ['index.html', 'track.html', 'admin.html', 'account.html'];
+const PAGES = ['index.html', 'track.html', 'admin.html', 'account.html', 'feedback.html'];
 const css = fs.readFileSync(path.join(root, 'build', 'site.css'), 'utf8').trim();
 if (css.includes('</style')) throw new Error('Compiled CSS contains "</style"; refusing to inline it.');
 

@@ -3,6 +3,10 @@
     {
       "path": "/api/keepalive",
       "schedule": "0 15 * * *"
+    },
+    {
+      "path": "/api/safewalk",
+      "schedule": "* * * * *"
     }
   ],
   "redirects": [
@@ -106,7 +110,7 @@
       ]
     },
     {
-      "source": "/(track|admin|account|demo)\\.html",
+      "source": "/(track|admin|account|demo|feedback)\\.html",
       "headers": [
         {
           "key": "Referrer-Policy",
@@ -183,6 +187,12 @@
     },
     "api/keepalive.mjs": {
       "maxDuration": 30
+    },
+    "api/safewalk.mjs": {
+      "maxDuration": 10
+    },
+    "api/feedback.mjs": {
+      "maxDuration": 10
     }
   }
 }

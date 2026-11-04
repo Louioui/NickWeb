@@ -1,8 +1,16 @@
--- Keep the Stripe-confirmed amount with the payment timestamp for accurate receipts.
+-- Payments: record the amount Stripe actually captured, store each Checkout link's real expiry, and write the payment
+-- and its sealed timeline entry in one transaction.
+-- Replaces the branch-only migrations 20261030040000_atomic_payment_event, 20261030070000_paid_amount_receipts and
+-- 20261030090000_payment_link_expiry, which were never applied. orders already has the restrictive "deny public roles"
+-- policy (20261029041432), so no new policy is needed.
+
+-- 1. The Stripe-confirmed amount, for receipts. Once recorded it can't be changed.
 alter table public.orders add column if not exists paid_amount_cents integer;
+alter table public.orders drop constraint if exists orders_paid_amount_cents_check;
 alter table public.orders add constraint orders_paid_amount_cents_check
   check (paid_amount_cents is null or (paid_amount_cents > 0 and paid_amount_cents <= 10000000));
--- Earlier payments already have an append-only event written from Stripe's amount_total.
+
+-- Earlier payments: their append-only timeline entry was written from Stripe's amount_total ("Payment received: $X.XX").
 with prior_payments as (
   select distinct on (order_id) order_id,
     (substring(title from '^Payment received: \$([0-9]+\.[0-9]{2})$')::numeric * 100)::integer as cents
@@ -14,11 +22,6 @@ update public.orders o set paid_amount_cents = p.cents
 from prior_payments p
 where o.id = p.order_id and o.paid_at is not null and o.paid_amount_cents is null
   and p.cents between 1 and 10000000;
-alter table public.orders enable row level security;
-revoke all on public.orders from anon, authenticated;
-drop policy if exists orders_deny_public_paid_amount on public.orders;
-create policy orders_deny_public_paid_amount on public.orders as restrictive
-  for all to anon, authenticated using (false) with check (false);
 
 create or replace function public.protect_recorded_payment_amount()
 returns trigger
@@ -33,12 +36,18 @@ begin
   return new;
 end;
 $$;
+revoke all on function public.protect_recorded_payment_amount() from public, anon, authenticated;
 drop trigger if exists orders_paid_amount_immutable on public.orders;
 create trigger orders_paid_amount_immutable before update on public.orders
   for each row execute function public.protect_recorded_payment_amount();
-revoke all on function public.protect_recorded_payment_amount() from public, anon, authenticated;
-grant execute on function public.protect_recorded_payment_amount() to service_role;
 
+-- 2. When the current Stripe Checkout link expires, so the tracking page can offer a renewal.
+alter table public.orders add column if not exists payment_expires_at timestamptz;
+
+-- 3. Mark an order paid and write its sealed "Payment received" entry in the same transaction. If the entry can't be
+--    written, paid_at is rolled back too, so Stripe's retry can apply the payment. Same rules as canMarkPaid in
+--    api/_lib/orders.mjs: unpaid, the order's own session (or none yet), and at least the amount due. A served order
+--    under legal hold keeps its status.
 create or replace function public.record_paid_order(p_order uuid, p_amount_cents integer, p_session_id text)
 returns boolean
 language plpgsql

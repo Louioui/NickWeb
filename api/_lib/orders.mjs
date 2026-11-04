@@ -1,5 +1,5 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
-import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS } from './core.mjs';
+import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS, clientIp, sha256, hitRateLimit } from './core.mjs';
 import { createCheckout, checkoutExpiresAt, stripeClient } from './stripe.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
@@ -41,6 +41,10 @@ export const STATUSES = {
 
 export const money = (cents) => '$' + (cents / 100).toFixed(2);
 
+// Statuses on which the client can write to Nick from the tracking page: answering his question, or a note or file on
+// any other open request. Finished requests (served, closed, cancelled) take no new notes; the client calls Nick.
+export const CLIENT_NOTE_STATUSES = ['action_required', 'received', 'awaiting_payment', 'paid', 'accepted', 'attempting'];
+
 // Only the amount captured from Stripe is suitable for a receipt. Older paid rows without that amount need review.
 export function receiptForOrder(order) {
     if (!order?.paid_at || !Number.isSafeInteger(order.paid_amount_cents) || order.paid_amount_cents <= 0) return null;
@@ -50,7 +54,9 @@ export function receiptForOrder(order) {
     const difference = order.paid_amount_cents - items.reduce((sum, item) => sum + item.cents, 0);
     if (difference) items.push({ label: 'Other charges or adjustments', cents: difference });
     return { code: order.code, caseNumber: order.case_number || null, court: order.court || null,
-        paidAt: order.paid_at, amountPaidCents: order.paid_amount_cents, items };
+        clientReference: order.client_reference || null, clientName: order.client_name || null, clientFirm: order.client_firm || null,
+        tier: tier?.name || order.tier || null, addons: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
+        paidAt: order.paid_at, amountPaidCents: order.paid_amount_cents, amountPaid: money(order.paid_amount_cents), items };
 }
 
 export function estimate(tier, addonKeys) {
@@ -133,7 +139,9 @@ export async function clientView(order, { unlocked = false } = {}) {
         canRenewPayment: !order.paid_at && !!order.stripe_session_id && Number.isSafeInteger(order.amount_due_cents) && order.amount_due_cents > 0 &&
             (paymentExpired || !order.payment_expires_at),
         paidAt: order.paid_at,
+        // Receipt details, once paid and unlocked (case details stay hidden on a locked page).
         receipt: isLocked ? null : receiptForOrder(order),
+        canReply: !isLocked && CLIENT_NOTE_STATUSES.includes(order.status),
         actionNote: order.status === 'action_required' && !isLocked ? order.action_note : null,
         docLock: !!order.doc_lock,
         unlocked: !isLocked,
@@ -182,6 +190,19 @@ export async function markPaid(orderId, amountCents, sessionId) {
     return !!data;
 }
 
+// Closes a Checkout session this request created but could not save on the order (another request or a payment got
+// there first), so only one link can be paid. Never closes the session the order now holds: if Stripe ever returned the
+// same session to two requests, that one is the live link.
+export async function expireLosingSession(orderId, sessionId) {
+    try {
+        const { data: current } = await db().from('orders').select('stripe_session_id').eq('id', orderId).maybeSingle();
+        if (current?.stripe_session_id === sessionId) return;
+        await stripeClient().checkout.sessions.expire(sessionId);
+    } catch (err) {
+        console.error('Could not expire a losing payment link:', err?.message);
+    }
+}
+
 export async function renewExpiredPaymentLink(order, origin) {
     if (order.paid_at) throw new HttpError(409, 'This order is already paid.');
     if (!Number.isSafeInteger(order.amount_due_cents) || order.amount_due_cents < 100 ||
@@ -217,7 +238,7 @@ export async function renewExpiredPaymentLink(order, origin) {
     }).eq('id', order.id).eq('stripe_session_id', order.stripe_session_id).eq('amount_due_cents', order.amount_due_cents)
         .is('paid_at', null).select('id').maybeSingle();
     if (error || !saved) {
-        await stripeClient().checkout.sessions.expire(session.id).catch(() => {});
+        await expireLosingSession(order.id, session.id);
         if (error) throw error;
         throw new HttpError(409, 'This payment link was already renewed. Refresh for the latest one.');
     }
@@ -262,43 +283,6 @@ export async function flagUnappliedPayment(orderId, amountCents, sessionId) {
     }).catch(() => false)));
     if (!sent.some(Boolean)) throw new Error(`Payment review alert for ${order.code} could not be emailed`);
     await addEvent(orderId, 'payment', 'Payment needs review', `Stripe payment ${sessionId} for ${paid} was not applied because ${reason}. Check it in Stripe, then refund it or record it.`, false);
-    return true;
-}
-
-// A Stripe dispute or early fraud warning on one of Nick's payments. The Stripe account is shared with another site,
-// so only payments carrying one of these orders' ids get here. Nick is emailed once per dispute or warning (Stripe
-// redelivers events), with a private timeline entry; if no email goes out, it throws so Stripe retries.
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-export async function flagDispute(orderId, eventType, obj) {
-    if (!UUID_RE.test(String(orderId)) || typeof obj?.id !== 'string') return false;
-    const { data: order, error } = await db().from('orders').select('id, code').eq('id', orderId).maybeSingle();
-    if (error) throw error;
-    if (!order) return false;
-    const { data: earlier, error: eErr } = await db().from('order_events').select('detail').eq('order_id', orderId).eq('kind', 'payment').eq('client_visible', false);
-    if (eErr) throw eErr;
-    if ((earlier || []).some(e => String(e.detail || '').includes(obj.id))) return false;   // already flagged
-    const fraud = eventType === 'radar.early_fraud_warning.created';
-    // Early fraud warnings carry no amount, only the charge.
-    const amount = Number.isFinite(obj.amount) ? money(obj.amount) : null;
-    const payment = amount ? `the ${amount} payment` : 'a payment';
-    const dueBy = obj.evidence_details?.due_by
-        ? new Date(obj.evidence_details.due_by * 1000).toLocaleDateString('en-US', { dateStyle: 'long', timeZone: 'America/Los_Angeles' }) : null;
-    const reason = String(obj.reason || obj.fraud_type || 'not given').replaceAll('_', ' ');
-    const lines = fraud
-        ? [`Stripe flagged ${payment} on ${order.code} as possibly fraudulent (${reason}).`,
-            'No money has been taken back yet. Consider refunding it in Stripe before it becomes a dispute.']
-        : [`${payment[0].toUpperCase()}${payment.slice(1)} on ${order.code} was disputed by the cardholder (${reason}).`,
-            dueBy ? `Respond in Stripe before ${dueBy}, or the dispute is lost by default.` : 'Respond to it in Stripe as soon as possible.',
-            'Download the evidence pack for this order from your dashboard and upload it to the dispute in Stripe.'];
-    console.error(`Stripe ${fraud ? 'fraud warning' : 'dispute'} on ${order.code}: ${obj.id}${amount ? ` (${amount})` : ''}`);
-    const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
-        to, subject: `${order.code}: ${fraud ? 'a payment was flagged as possible fraud' : 'a payment was disputed'}`,
-        heading: fraud ? 'A payment was flagged as possible fraud' : 'A payment was disputed',
-        lines,
-    }).catch(() => false)));
-    if (!sent.some(Boolean)) throw new Error(`${fraud ? 'Fraud warning' : 'Dispute'} alert for ${order.code} could not be emailed`);
-    await addEvent(orderId, 'payment', fraud ? 'Fraud warning on payment' : 'Payment disputed',
-        `Stripe ${fraud ? 'early fraud warning' : 'dispute'} ${obj.id} on ${payment}: ${reason}.${dueBy ? ` Evidence due by ${dueBy}.` : ''}`, false);
     return true;
 }
 
@@ -369,4 +353,113 @@ ${button ? `<p style="margin:24px 0 8px"><a href="${escHtml(button.url)}" style=
 </td></tr>
 <tr><td style="padding:16px 28px;border-top:1px solid #e6e0d2;font-size:12px;color:#6b6b62">Questions? Call or text Nick at (209) 922-6817 or reply to this email.<br><br>You're receiving this because a service request was made at nicksprocessservices.dev with this email address. It's a message about that request only; we don't send marketing emails. If you didn't make this request, reply and let us know.</td></tr>
 </table></td></tr></table></body></html>`;
+}
+
+// A refund, a card dispute or an early fraud warning on an order's payment. The money moved (or may move) inside
+// Stripe, so the order is never changed automatically: Nick gets a private timeline entry and an email, once per Stripe
+// event, and decides what to do. The Stripe account is shared with another site, so only payments carrying one of these
+// orders' ids get here. Like flagUnappliedPayment, the entry is written only after an email was accepted; otherwise this
+// throws and Stripe retries. The entry names both the Stripe event and the dispute/warning, and either one already on
+// the timeline counts as flagged, so a redelivered event or a second event for the same dispute isn't emailed twice.
+const STRIPE_EVENT_RE = /^evt_[A-Za-z0-9_]{8,128}$/;
+const STRIPE_OBJECT_RE = /^(?:dp|du|issfr|ch|re)_[A-Za-z0-9_]{1,128}$/;
+export async function flagPaymentReversal(orderId, { eventId, objectId = null, kind, amountCents, reason, dueBy = null }) {
+    uuid(orderId, 'Order');
+    if (!['refund', 'dispute', 'fraud_warning'].includes(kind)) return false;
+    const ids = [eventId, objectId].filter(id => typeof id === 'string' && (STRIPE_EVENT_RE.test(id) || STRIPE_OBJECT_RE.test(id)));
+    if (!ids.length) return false;
+    const { data: order, error } = await db().from('orders').select('id, code').eq('id', orderId).maybeSingle();
+    if (error) throw error;
+    if (!order) return false;
+    const { data: earlier, error: eErr } = await db().from('order_events').select('detail').eq('order_id', orderId).eq('kind', 'payment').eq('client_visible', false);
+    if (eErr) throw eErr;
+    if ((earlier || []).some(e => ids.some(id => String(e.detail || '').includes(id)))) return false;   // already flagged
+    // Early fraud warnings carry no amount, only the charge.
+    const amount = Number.isFinite(Number(amountCents)) && amountCents != null ? money(Number(amountCents)) : null;
+    const why = String(reason || 'no reason given').replaceAll('_', ' ').slice(0, 60);
+    const due = Number.isSafeInteger(dueBy) && dueBy > 0
+        ? new Date(dueBy * 1000).toLocaleDateString('en-US', { dateStyle: 'long', timeZone: 'America/Los_Angeles' }) : null;
+    const payment = amount ? `the ${amount} payment` : 'a payment';
+    const title = { refund: 'Payment refunded', dispute: 'Payment disputed', fraud_warning: 'Fraud warning on payment' }[kind];
+    const subject = { refund: 'a payment was refunded', dispute: 'a payment was disputed', fraud_warning: 'a payment was flagged as possible fraud' }[kind];
+    const lines = {
+        // charge.refunded carries the charge's running total (amount_refunded) as of that event, not this one refund,
+        // and Stripe may deliver events out of order, so it is described as of the event rather than as current.
+        refund: [`When this refund happened, the card payment on ${order.code} had been refunded ${amount || '$0.00'} in total. Stripe can deliver refund events out of order, so check Stripe for the current total.`,
+            'The order still shows as paid. Check Stripe and update the order if needed.'],
+        dispute: [`${amount || 'The'} card payment on ${order.code} was disputed by the cardholder (${why}).`,
+            due ? `Respond in Stripe before ${due}, or the dispute is lost by default.` : 'Respond to it in Stripe as soon as possible.',
+            'Download the evidence pack for this order from your dashboard and upload it to the dispute in Stripe.'],
+        fraud_warning: [`Stripe flagged ${payment} on ${order.code} as possibly fraudulent (${why}).`,
+            'No money has been taken back yet. Consider refunding it in Stripe before it becomes a dispute.'],
+    }[kind];
+    console.error(`Stripe ${title.toLowerCase()} on ${order.code}: ${ids.join(' / ')}${amount ? ` (${amount})` : ''}`);
+    const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({ to, subject: `${order.code}: ${subject}`, heading: title, lines }).catch(() => false)));
+    if (!sent.some(Boolean)) throw new Error(`${title} alert for ${order.code} could not be emailed`);
+    const what = kind === 'refund' ? `${amount || '$0.00'} refunded in total as of this event`
+        : kind === 'dispute' ? `${amount || 'payment'} disputed (${why})${due ? `; evidence due by ${due}` : ''}`
+        : `early fraud warning on ${payment} (${why})`;
+    await addEvent(orderId, 'payment', title, `Stripe ${ids.join(' / ')}: ${what}. Nothing was changed on the order automatically.`, false);
+    return true;
+}
+
+// The branch-era entry point for disputes and early fraud warnings; same rules, one implementation.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export async function flagDispute(orderId, eventType, obj, eventId = null) {
+    if (!UUID_RE.test(String(orderId))) return false;
+    const fraud = eventType === 'radar.early_fraud_warning.created';
+    return flagPaymentReversal(orderId, { eventId, objectId: obj?.id ?? null, kind: fraud ? 'fraud_warning' : 'dispute',
+        amountCents: fraud ? null : obj?.amount, reason: obj?.reason || obj?.fraud_type || null, dueBy: obj?.evidence_details?.due_by ?? null });
+}
+
+// Records what a client did on their tracking page, for Nick's dispute evidence. Never blocks the client: if the table
+// doesn't exist yet or the write fails, the action still goes ahead.
+const CLIENT_ACTIONS = new Set(['view', 'unlock', 'download', 'reply', 'payment', 'renew_payment']);
+export async function logClientAction(request, orderId, action, detail = null) {
+    if (!CLIENT_ACTIONS.has(action)) return;
+    try {
+        const ip = clientIp(request);
+        if (action === 'view') {
+            // A tracking page refreshes itself every 20 seconds; one view entry an hour per visitor is enough.
+            const { data: n } = await db().rpc('hit_rate_limit', { p_bucket: `audit-view:${orderId}:${sha256(ip)}`, p_window_seconds: 3600 });
+            if (n !== 1) return;
+        }
+        await db().from('client_audit_logs').insert({
+            order_id: orderId, action, detail: detail ? String(detail).slice(0, 300) : null, ip_hash: sha256(ip),
+            user_agent: String(request.headers.get('user-agent') || '').slice(0, 200) || null,
+        }).then(() => {}, () => {});
+    } catch { /* never block the client */ }
+}
+
+// A client who chose the daily summary gets no per-update status emails; the daily job sends one digest instead.
+export async function prefersDigest(emailAddr) {
+    const { data, error } = await db().from('client_preferences').select('notify_mode').eq('email', String(emailAddr || '').toLowerCase()).maybeSingle();
+    return !error && data?.notify_mode === 'daily';
+}
+
+// The daily summary: for each client who chose it, one email listing what changed on their requests in the last day.
+export async function sendDailyDigests(origin) {
+    // Once per UTC day, whoever calls: Vercel can retry the cleanup job, and until CRON_SECRET is set anyone can run it.
+    // The counter is an atomic database increment, so two runs at once can't both send.
+    // Taken only after the preferences read succeeds, so a database hiccup doesn't use up the day's run.
+    const { data: prefs, error } = await db().from('client_preferences').select('email').eq('notify_mode', 'daily').limit(500);
+    if (error || !prefs?.length) return 0;
+    if (await hitRateLimit('daily-digest-run', 86400) > 1) return 0;
+    const since = new Date(Date.now() - 864e5).toISOString();
+    let sent = 0;
+    for (const { email: to } of prefs) {
+        const { data: ords } = await db().from('orders').select('id, code, recipient_name, status').eq('client_email', to).limit(100);
+        if (!ords?.length) continue;
+        const { data: evs } = await db().from('order_events').select('order_id, title, created_at')
+            .in('order_id', ords.map(o => o.id)).eq('client_visible', true).gte('created_at', since).order('created_at', { ascending: true }).limit(500);
+        if (!evs?.length) continue;
+        const byOrder = new Map(ords.map(o => [o.id, o]));
+        const lines = [...new Set(evs.map(e => e.order_id))].map(id => {
+            const o = byOrder.get(id);
+            return `${o.code} (${o.recipient_name}): ${evs.filter(e => e.order_id === id).map(e => e.title).join('; ')}. Now: ${STATUSES[o.status]?.label || o.status}.`;
+        });
+        if (await sendEmail({ to, subject: "Your daily update from Nick's Process Services", heading: 'What changed today',
+            lines: [...lines, 'Open your account to see each request.'], button: { label: 'Open your account', url: `${origin}/account.html` } }).catch(() => false)) sent++;
+    }
+    return sent;
 }

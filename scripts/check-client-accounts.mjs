@@ -74,9 +74,10 @@ check('devteam@partnershipwithmedia-dev.com can log into admin dashboard', () =>
 const devAdminCookie1 = devAdminLogin1.headers.get('set-cookie').split(';')[0];
 const devAdminCookie2 = devAdminLogin2.headers.get('set-cookie').split(';')[0];
 
-assert.equal((await call({ action: 'generate-recovery-codes' }, devAdminCookie1, 'admin')).status, 403);
-assert.equal((await call({ action: 'send-step-up-code' }, devAdminCookie1, 'admin')).status, 200);
-const genRes = await (await call({ action: 'generate-recovery-codes', totp: '12345678' }, devAdminCookie1, 'admin')).json();
+const bareGen = await call({ action: 'generate-recovery-codes' }, devAdminCookie1, 'admin');
+check('F-09: minting recovery codes with only a session is refused', () => assert.equal(bareGen.status, 403));
+await call({ action: 'stepup-send-code' }, devAdminCookie1, 'admin');
+const genRes = await (await call({ action: 'generate-recovery-codes', totp: '87654321' }, devAdminCookie1, 'admin')).json();
 check('admin can generate 8 single-use backup recovery codes', () => {
     assert.equal(genRes.codes.length, 8);
     assert.equal(genRes.remaining, 8);
@@ -114,9 +115,13 @@ assert.notEqual(firstLink.order.stripe_session_id, afterReplace.order.stripe_ses
 assert.equal((await handleMockRoute(new Request(`http://localhost${firstLink.order.payment_url}`))).status, 410);
 passed++; console.log('PASS mock payment link replacement invalidates the old session');
 const listData = await (await call({ action: 'list' }, nickCookie, 'admin')).json();
-check('mock active jobs include a last client contact date', () => {
-    assert.ok(listData.orders.filter(o => !['served', 'closed', 'cancelled'].includes(o.status)).every(o =>
-        Number.isFinite(Date.parse(o.last_contact_at)) && o.last_contact_at >= o.created_at));
+// Last contact is Nick's newest entry the client can see (list_order_activity), or null when he hasn't updated the
+// client yet (the dashboard shows that in red). It is never before the request was made.
+check('mock active jobs carry Nick\'s last client contact (or null before his first update)', () => {
+    const active = listData.orders.filter(o => !['served', 'closed', 'cancelled'].includes(o.status));
+    assert.ok(active.every(o => 'last_contact_at' in o && (o.last_contact_at === null ||
+        (Number.isFinite(Date.parse(o.last_contact_at)) && o.last_contact_at >= o.created_at))));
+    assert.ok(active.some(o => o.last_contact_at !== null), 'no active demo job shows a contact date');
 });
 const servedOrder = listData.orders.find(o => o.code === 'NP-894771');
 const detailData = await (await call({ action: 'get', id: servedOrder.id }, nickCookie, 'admin')).json();
@@ -152,7 +157,9 @@ const mockPack = zipJson(Buffer.from(await mockPackResponse.arrayBuffer()));
 check('mock dispute pack includes verified file and client download evidence', () => {
     assert.equal(mockPackResponse.headers.get('content-type'), 'application/zip');
     assert.equal(mockPack.files.find(f => f.kind === 'proof')?.sha256, proofFile.sha256);
-    assert.ok(mockPack.downloads.some(d => d.file_id === proofFile.id));
+    // client_audit_logs (20261030061450) names the downloaded file; it has no file id column.
+    assert.ok(mockPack.downloads.some(d => d.filename === proofFile.filename));
+    assert.ok(mockPack.client_activity.some(a => a.action === 'download' && a.detail === proofFile.filename));
     assert.equal(mockPack.chain.verified, true);
     assert.ok(mockPack.attestation?.created_at && mockPack.payment.stripe_session_id);
     assert.equal(mockPack.order.track_token, undefined);

@@ -3,12 +3,13 @@
 // It mirrors the behavior of api/*.mjs (same request and response shapes); it is never deployed.
 import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { TIERS, ADDONS, STATUSES, estimate, money, cleanTrackToken, receiptForOrder, attemptDetail } from '../api/_lib/orders.mjs';
-import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken } from '../api/_lib/core.mjs';
-import { stripPhotoBytes } from '../api/_lib/photo-metadata.mjs';
+import { generateTotpSecret, totpCode, verifyTotp, timingSafeMatch, hashPin, verifyPin, signToken, checkToken, verifyFileMagic } from '../api/_lib/core.mjs';
+import { stripPhotoBytes } from '../api/_lib/photos.mjs';
 import { countPdfPages, printingSummary } from '../api/_lib/pdf-pages.mjs';
 import { zipEvidencePack } from '../api/_lib/evidence-pack.mjs';
 
 export const MOCK_ADMIN_CODE = '12345678';
+export const MOCK_STEPUP_CODE = '87654321';
 export const MOCK_CLIENT_CODE = '123456';
 export { totpCode };
 const ADMIN_EMAIL = 'nicksprocessservices@outlook.com';
@@ -29,14 +30,14 @@ const sessions = new Set();
 const sessionEmails = new Map();
 const adminRecoveryCodes = new Map();
 const adminTotpSecrets = new Map(); // email -> { secret, enabled }
-const adminStepUpCodes = new Map(); // email -> { code, expires }
 const adminBurnFails = new Map();   // email -> count
 const adminCodesBurned = new Set(); // email if active code was burned
 const adminAuditLogs = [];
 const clientAuditLogs = [];
-function auditClient(req, orderId, action, fileId = null) {
+// Same actions and columns as client_audit_logs (20261030061450): the detail names the file or what was sent.
+function auditClient(req, orderId, action, detail = null) {
     const ip = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || '127.0.0.1';
-    clientAuditLogs.push({ order_id: orderId, action, file_id: fileId, ip_hash: sha256Hex(ip), created_at: now() });
+    clientAuditLogs.push({ order_id: orderId, action, detail, ip_hash: sha256Hex(ip), created_at: now() });
 }
 function auditAdmin(emailAddr, action, targetCode = null, detailText = null) {
     adminAuditLogs.unshift({ email: emailAddr, action, target_code: targetCode, detail: detailText, created_at: now() });
@@ -175,6 +176,8 @@ function maskMockAddress(o) {
     return street + (o.city ? `, ${o.city}` : '') + (o.zip ? ` ${o.zip}` : '');
 }
 
+// Same as api/track.mjs: open requests that take a note at any time, besides answering Nick's question.
+const MOCK_OPEN_FOR_NOTES = ['action_required', 'received', 'awaiting_payment', 'paid', 'accepted', 'attempting'];
 function clientView(o, { unlocked = false } = {}) {
     const visibleEvents = events.filter(e => e.order_id === o.id && e.client_visible).sort((a, b) => a.created_at.localeCompare(b.created_at))
         .map(({ created_at, kind, title, detail }) => ({ created_at, kind, title, detail }));
@@ -198,6 +201,7 @@ function clientView(o, { unlocked = false } = {}) {
             (paymentExpired || !o.payment_expires_at),
         // Same as api/_lib/orders.mjs: a locked view keeps status and dates, not what was said or sent.
         paidAt: o.paid_at, receipt: isLocked ? null : receiptForOrder(o), actionNote: o.status === 'action_required' && !isLocked ? o.action_note : null,
+        canReply: !isLocked && MOCK_OPEN_FOR_NOTES.includes(o.status),
         docLock: !!o.doc_lock,
         unlocked: !isLocked,
         legalHold: !!o.legal_hold,
@@ -242,59 +246,7 @@ function prepareUploads(orderId, kind, list) {
         return { fileId: id, name, uploadUrl: `/__mock-upload/${id}` };
     });
 }
-const POLYGLOT_SCRIPT_RE = /<\s*(?:script|!doctype\s+html|html|iframe|svg|object|embed)\b|(?:javascript|vbscript)\s*:|\bon(?:load|error)\s*=/i;
-const PDF_DANGEROUS_ACTION_RE = /\/(?:JavaScript|JS|Launch|OpenAction|AA|SubmitForm|EmbeddedFiles|RichMedia|XFA)\b/i;
-const DOCX_MACRO_OR_EXEC_RE = /(?:vbaProject\.bin|vbaData\.xml|activeX\/activeX|\.(?:exe|dll|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|msi|com|hta|jar|sh)(?:[\x00-\x20"'<>\/\\]|$))/i;
-function verifyFileMagic(bytes, filename) {
-    if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes.length > 25 * 1024 * 1024) return false;
-    const ext = typeof filename === 'string' && filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
-    const headLen = Math.min(bytes.length, 4096);
-    let head = '';
-    for (let i = 0; i < headLen; i++) head += String.fromCharCode(bytes[i]);
-    if (POLYGLOT_SCRIPT_RE.test(head)) return false;
-    if (ext === 'pdf') {
-        const pdfText = Buffer.from(bytes).toString('latin1');
-        if (PDF_DANGEROUS_ACTION_RE.test(pdfText) || POLYGLOT_SCRIPT_RE.test(pdfText)) return false;
-        return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D;
-    }
-    if (ext === 'docx') {
-        if (bytes[0] !== 0x50 || bytes[1] !== 0x4B || bytes[2] !== 0x03 || bytes[3] !== 0x04) return false;
-        const scanLen = Math.min(bytes.length, 65536);
-        let zipScan = head;
-        for (let i = headLen; i < scanLen; i++) zipScan += String.fromCharCode(bytes[i]);
-        if (bytes.length > scanLen) {
-            const tailStart = Math.max(scanLen, bytes.length - 65536);
-            for (let i = tailStart; i < bytes.length; i++) zipScan += String.fromCharCode(bytes[i]);
-        }
-        if (!zipScan.includes('[Content_Types].xml') && !zipScan.includes('word/')) return false;
-        if (DOCX_MACRO_OR_EXEC_RE.test(zipScan)) return false;
-        return true;
-    }
-    if (ext === 'jpg' || ext === 'jpeg') {
-        if (bytes.length > 4096) {
-            let tail = '';
-            for (let i = Math.max(0, bytes.length - 4096); i < bytes.length; i++) tail += String.fromCharCode(bytes[i]);
-            if (POLYGLOT_SCRIPT_RE.test(tail)) return false;
-        }
-        return bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
-    }
-    if (ext === 'png') {
-        if (bytes.length < 8 || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4E || bytes[3] !== 0x47 ||
-            bytes[4] !== 0x0D || bytes[5] !== 0x0A || bytes[6] !== 0x1A || bytes[7] !== 0x0A) return false;
-        if (bytes.length >= 16 && (bytes[12] !== 0x49 || bytes[13] !== 0x48 || bytes[14] !== 0x44 || bytes[15] !== 0x52)) return false;
-        return true;
-    }
-    if (ext === 'webp') {
-        return bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
-            bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
-    }
-    if (ext === 'heic' || ext === 'heif') {
-        if (bytes.length < 12 || bytes[4] !== 0x66 || bytes[5] !== 0x74 || bytes[6] !== 0x79 || bytes[7] !== 0x70) return false;
-        const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
-        return /^(?:heic|heix|hevc|hevx|heim|heis|hevm|hevs|mif1|msf1)$/.test(brand);
-    }
-    return false;
-}
+// The real file check from api/_lib/core.mjs, so the demo server can never drift from what the site accepts.
 async function confirmUploads(orderId, ids) {
     const out = [];
     for (const id of (Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && UUID_RE.test(id))) {
@@ -380,22 +332,51 @@ function useMockTotp(adminEmail, secret, code) {
     row.last_used_step = step;
     return true;
 }
+// Same rules as requireStepUp in api/admin.mjs. With the authenticator off, the demo's emailed step-up code is always
+// 87654321 (after "Email me a code"), single use, 5 minutes. With it on: a current app code or an unused recovery code.
+const mockTrustedDevices = new Map();   // device token -> { email, expires }
+const mockStepUpCodes = new Map();   // email -> expiry time
 function requireMockStepUp(adminEmail, totpInput) {
     const row = adminTotpSecrets.get(adminEmail);
+    const typed = String(totpInput || '').trim().toUpperCase();
     if (!row?.enabled) {
-        const issued = adminStepUpCodes.get(adminEmail);
-        adminStepUpCodes.delete(adminEmail);
-        if (!issued || issued.expires < Date.now() || String(totpInput || '').replace(/[\s-]/g, '') !== issued.code) fail(403, 'That security code is wrong or expired. Request a new one.');
+        // Either demo code works (87654321, or MOCK_ADMIN_CODE as the older demo used), once, for 5 minutes.
+        const digits = typed.replace(/[\s-]+/g, '');
+        if (!/^\d{8}$/.test(digits)) fail(403, 'Email yourself a step-up code, then enter the 8-digit code to continue.');
+        const until = mockStepUpCodes.get(adminEmail);
+        if (![MOCK_STEPUP_CODE, MOCK_ADMIN_CODE].includes(digits) || !until || until < Date.now()) fail(403, 'That step-up code is wrong or expired. Email yourself a new one.');
+        mockStepUpCodes.delete(adminEmail);
         return true;
     }
-    if (!useMockTotp(adminEmail, row.secret, totpInput)) fail(403, 'Enter the current 6-digit code from your authenticator app.');
+    const recovery = typed.replace(/[^A-Z0-9]/g, '');
+    if (!/^\d{6}$/.test(typed) && recovery.length === 8) {
+        const set = adminRecoveryCodes.get(adminEmail);
+        if (!set?.delete(recovery)) fail(403, 'That recovery code is wrong or already used.');
+        return true;
+    }
+    if (!useMockTotp(adminEmail, row.secret, typed)) fail(403, 'Enter the current 6-digit code from your authenticator app, or one of your recovery codes.');
     return true;
 }
 
+// Survey answers (feedback.html and Nick's Survey window), kept in memory like everything else in the demo.
+const mockSurveys = [];
+const cleanMockAnswers = (re, raw) => Object.fromEntries(Object.entries(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {})
+    .filter(([k, v]) => re.test(k) && typeof v === 'string' && v.trim()).slice(0, 60).map(([k, v]) => [k, v.trim().slice(0, 4000)]));
 const handlers = {
+    async feedback(req, body) {
+        // Same rules as api/feedback.mjs and api/_lib/surveys.mjs.
+        if (body.website) return json({ ok: true });
+        if (body.consent !== true) fail(400, 'Please tick the box to give permission to use your answers.');
+        const answers = cleanMockAnswers(/^c(0[1-9]|[12]\d|30)$/, body.answers);
+        if (!Object.keys(answers).length) fail(400, 'Please answer at least one question.');
+        mockSurveys.unshift({ id: randomUUID(), form: 'client-v1', contact_name: cleanText(body.name, 120, false, 'Name') || null,
+            contact_email: body.email ? cleanEmail(body.email) : null, answers, created_at: now(), updated_at: now() });
+        return json({ ok: true });
+    },
     async client(req, body) {
         const action = body.action;
         if (String(action).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
+        if (action === 'get-notify' || action === 'set-notify') fail(503, 'Email preferences are not available in the demo.');
         if (action === 'send-code') {
             const addr = cleanEmail(body.email);
             const signup = body.intent === 'signup';
@@ -411,7 +392,11 @@ const handlers = {
             // Same order as api/client.mjs: ask for the PIN first, check the email code, and only then the PIN.
             const sec = clientSecurity.get(addr);
             const pin = String(body.pin || '').trim();
-            if (sec?.pin_hash && !pin) return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
+            // Trusted devices (30 days), as in api/_lib/clients.mjs: a remembered device skips the PIN, never the code.
+            const deviceTok = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_device=([A-Za-z0-9_-]{40,64})/)?.[1];
+            const trustedRow = deviceTok && mockTrustedDevices.get(deviceTok);
+            const trusted = !!trustedRow && trustedRow.email === addr && trustedRow.expires > Date.now();
+            if (sec?.pin_hash && !pin && !trusted) return json({ ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' }, 200);
             if (sec?.pin_hash && sec.locked_until > Date.now()) fail(429, 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.');
             const pending = clientCodes.get(addr);
             if (!pending || pending.expires < Date.now() || pending.attempts >= 5) fail(401, 'That code is invalid or expired. Request another email.');
@@ -420,7 +405,7 @@ const handlers = {
                 if (pending.attempts >= 5) clientCodes.delete(addr);
                 fail(401, 'That code is invalid or expired. Request another email.');
             }
-            if (sec?.pin_hash) {
+            if (sec?.pin_hash && !trusted) {
                 if (!verifyPin(pin, sec.pin_hash)) {
                     if (sec.locked_until && sec.locked_until <= Date.now()) { sec.failed_tries = 0; sec.locked_until = 0; }
                     sec.failed_tries = (sec.failed_tries || 0) + 1;
@@ -440,7 +425,14 @@ const handlers = {
             clientCodes.delete(addr);
             const value = token();
             clientSessions.set(value, addr);
-            return json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
+            const res = json({ ok: true }, 200, { 'set-cookie': `nps_client=${value}; Path=/api/client; HttpOnly; SameSite=Strict` });
+            if (body.remember !== false) {
+                const dev = randomBytes(32).toString('base64url');
+                mockTrustedDevices.set(dev, { email: addr, expires: Date.now() + 30 * 86400e3 });
+                res.headers.append('set-cookie', `nps_device=${dev}; Path=/api/client; HttpOnly; SameSite=Strict; Max-Age=${30 * 86400}`);
+            }
+            if (!trusted) email(addr, 'Security alert: New sign-in to your account');
+            return res;
         }
         const value = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_client=([^;]+)/)?.[1];
         const verifiedEmail = value && /^[A-Za-z0-9_-]{16,160}$/.test(value) ? clientSessions.get(value) : null;
@@ -450,8 +442,11 @@ const handlers = {
                 for (const [k, em] of [...clientSessions.entries()]) {
                     if (em === verifiedEmail) clientSessions.delete(k);
                 }
+                for (const [k, d] of [...mockTrustedDevices.entries()]) if (d.email === verifiedEmail) mockTrustedDevices.delete(k);   // as forgetDevices
             }
-            return json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' });
+            const res = json({ ok: true }, 200, { 'set-cookie': 'nps_client=; Path=/api/client; Max-Age=0' });
+            res.headers.append('set-cookie', 'nps_device=; Path=/api/client; HttpOnly; SameSite=Strict; Max-Age=0');
+            return res;
         }
         if (!verifiedEmail || !clients.has(verifiedEmail)) fail(401, 'Please sign in to see your requests.');
         const baseProfile = clients.get(verifiedEmail);
@@ -499,6 +494,21 @@ const handlers = {
             }
             addEvent(o.id, 'note', 'Client requested confidential document purge / retention seal', `Requested by verified account ${verifiedEmail}`, true);
             return json({ ok: true, code: o.code });
+        }
+        if (action === 'receipt') {   // same rules as api/client.mjs
+            const code = String(body.code || '').trim().toUpperCase();
+            const o = [...orders.values()].find(ord => ord.client_email.toLowerCase() === verifiedEmail && ord.code === code);
+            if (!o) fail(404, 'Order not found.');
+            if (!o.paid_at) fail(409, 'This request has not been paid yet.');
+            return json({ receipt: clientView(o, { unlocked: true }).receipt });
+        }
+        if (action === 'proof-links') {
+            const mine = [...orders.values()].filter(o => o.client_email.toLowerCase() === verifiedEmail);
+            const out = [];
+            for (const o of mine) for (const f of files.values()) {
+                if (f.order_id === o.id && f.kind === 'proof' && f.uploaded) out.push({ code: o.code, name: f.filename, sha256: f.sha256 || null, url: `/__mock-file/${f.id}` });
+            }
+            return json({ files: out.slice(0, 50) });
         }
         if (action === 'list') {
             const list = [...orders.values()].filter(o => o.client_email.toLowerCase() === verifiedEmail).sort((a,b) => b.created_at.localeCompare(a.created_at)).slice(0,100);
@@ -563,7 +573,7 @@ const handlers = {
     async track(req, body, url) {
         const o = orderByToken(body.t);
         const unlocked = isMockUnlocked(req, o, body);
-        if (body.action === 'view') { auditClient(req, o.id, 'tracking_view'); return json(clientView(o, { unlocked })); }
+        if (body.action === 'view') { auditClient(req, o.id, 'view', unlocked ? 'unlocked page' : 'locked page'); return json(clientView(o, { unlocked })); }
         if (body.action === 'send-unlock-code') {
             trackUnlockCodes.set(o.id, { code: MOCK_CLIENT_CODE, tries: 0, expires: Date.now() + 600000 });
             const maskedEmail = o.client_email.replace(/^(..).*(@.*)$/, '$1•••$2');
@@ -591,7 +601,7 @@ const handlers = {
                 verified = true;
             }
             const unlockToken = makeMockUnlockToken(req, o);
-            auditClient(req, o.id, 'document_unlock');
+            auditClient(req, o.id, 'unlock');
             return json({ ok: true, unlockToken, ...clientView(o, { unlocked: true }) });
         }
         if (body.action === 'toggle-doc-lock') {
@@ -616,21 +626,23 @@ const handlers = {
             const f = files.get(fid);
             if (!f || f.order_id !== o.id || !f.uploaded) fail(404, 'File not found.');
             addEvent(o.id, 'note', 'Document downloaded from tracking page', f.filename, false);   // same as api/track.mjs
-            auditClient(req, o.id, 'file_download', fid);
+            auditClient(req, o.id, 'download', f.filename);
             return json({ url: `/__mock-file/${f.id}`, sha256: f.sha256 || null, expiresInSeconds: 60 });
         }
         if (body.action === 'confirm-payment') {
             if (typeof body.session !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(body.session)) fail(400, 'Invalid payment session.');
             // Like api/track.mjs (which asks Stripe): the matching unpaid session counts, whatever the status. Held orders are billed while served.
             if (body.session === o.stripe_session_id && !o.paid_at && (!o.payment_expires_at || Date.parse(o.payment_expires_at) > Date.now())) markPaid(o, body.session);
-            if (body.session === o.stripe_session_id && o.paid_at) auditClient(req, o.id, 'payment_confirmation');
+            if (body.session === o.stripe_session_id && o.paid_at) auditClient(req, o.id, 'payment', body.session);
             return json(clientView(o, { unlocked }));
         }
-        if (body.action === 'renew-payment-link') {
+        if (body.action === 'renew-payment-link' || body.action === 'renew-payment') {
             renewMockPayment(o);
+            auditClient(req, o.id, 'renew_payment');
             return json(clientView(o, { unlocked }));
         }
         if (body.action === 'respond') {
+            if (!MOCK_OPEN_FOR_NOTES.includes(o.status)) fail(409, 'This request is finished. Call or text Nick if you need anything.');
             if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Enter the code we email you (or your Security PIN) to unlock it first.');
             const answeringAction = o.status === 'action_required';
             const changes = {};
@@ -666,11 +678,12 @@ const handlers = {
                 `[Cutoff stamp: after ${attemptCount} attempt(s) · SHA-256: ${amendDigest}]`,
             ].filter(Boolean).join(' · ');
             addEvent(o.id, answeringAction ? 'action_response' : 'client_message', answeringAction ? 'You sent the requested information' : 'You sent Nick a message', summary || null);
-            auditClient(req, o.id, answeringAction ? 'action_reply' : 'client_message');
+            auditClient(req, o.id, 'reply', answeringAction ? 'answered Nick' : 'message');
             return json({ ok: true, uploads, responseType: answeringAction ? 'action_response' : 'client_message' });
         }
         if (body.action === 'respond-finish') {
             if (o.doc_lock && !unlocked) fail(403, 'This request is locked. Unlock it first.');
+            if (!MOCK_OPEN_FOR_NOTES.includes(o.status)) return json(clientView(o, { unlocked }));
             const up = await confirmUploads(o.id, body.fileIds);
             if (up.length) addEvent(o.id, 'note', `${up.length} file${up.length === 1 ? '' : 's'} added by you`);
             const orderEvents = events.filter(e => e.order_id === o.id);
@@ -698,6 +711,9 @@ const handlers = {
     async admin(req, body) {
         const a = body.action;
         if (String(a).startsWith('passkey')) fail(503, 'Passkeys are not available in the demo. Please use the email code.');
+        // Saved to their own database tables in production; the demo has none, so these say so (as production does
+        // before the Phase 3 migration is applied).
+        if (String(a).startsWith('safewalk') || String(a).startsWith('expense')) fail(503, 'This is not available in the demo.');
         if (a === 'send-code') {
             const addr = cleanEmail(body.email);
             if (MOCK_ADMIN_EMAILS.includes(addr)) {
@@ -761,12 +777,6 @@ const handlers = {
         const cookie = (req.headers.get('cookie') || '').match(/(?:^|;\s*)nps_admin=([^;]+)/)?.[1];
         if (!cookie || !/^[A-Za-z0-9_-]{16,160}$/.test(cookie) || !sessions.has(cookie)) fail(401, 'Please log in.');
         const adminEmail = sessionEmails.get(cookie) || ADMIN_EMAIL;
-        if (a === 'send-step-up-code') {
-            adminStepUpCodes.set(adminEmail, { code: MOCK_ADMIN_CODE, expires: Date.now() + 5 * 60 * 1000 });
-            email(adminEmail, 'Your dashboard security code');
-            auditAdmin(adminEmail, 'stepup_code_sent');
-            return json({ ok: true });
-        }
         if (a === 'me') {
             const totpRow = adminTotpSecrets.get(adminEmail);
             const auditLogs = adminAuditLogs.filter(l => l.email === adminEmail).slice(0, 10).map(({ action, target_code, detail, created_at }) => ({ action, target_code, detail, created_at }));
@@ -801,8 +811,16 @@ const handlers = {
             auditAdmin(adminEmail, 'session_revoked');
             return mockSessionList();
         }
+        if (a === 'stepup-send-code' || a === 'send-step-up-code') {
+            if (adminTotpSecrets.get(adminEmail)?.enabled) fail(400, 'Use the code from your authenticator app instead.');
+            mockStepUpCodes.set(adminEmail, Date.now() + 5 * 60e3);
+            console.log(`[mock] dashboard step-up code for ${adminEmail}: 87654321`);
+            email(adminEmail, 'Your dashboard step-up code: 87654321');
+            auditAdmin(adminEmail, 'stepup_code_sent');
+            return json({ ok: true, minutes: 5 });
+        }
         if (a === 'totp-setup') {
-            // While one is on, changing it needs the current code, and the new secret waits as pending until confirmed.
+            // Always needs a step-up (an emailed code while it's off), and a new secret waits as pending until confirmed.
             const row = adminTotpSecrets.get(adminEmail);
             requireMockStepUp(adminEmail, body?.totp);
             const secret = generateTotpSecret(20);
@@ -847,11 +865,47 @@ const handlers = {
             const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response', 'client_message'];
             const list = [...orders.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(o => {
                 const last = events.filter(e => e.order_id === o.id && kinds.includes(e.kind)).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                const contact = events.filter(e => e.order_id === o.id && ['action', 'action_response', 'client_message'].includes(e.kind))
-                    .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-                return { ...o, client_replied: ['action_response', 'client_message'].includes(last?.kind), last_contact_at: contact?.created_at || o.created_at };
+                // Same as list_order_activity (20261104000300): only Nick's own entries count as contacting the client, and
+                // the newest of his entries and the client's (answers and messages) decides "client replied".
+                const byNick = (e) => ['status', 'attempt', 'action', 'proof'].includes(e.kind) ||
+                    (e.kind === 'payment' && String(e.title || '').startsWith('Payment requested')) || (e.kind === 'note' && e.title === 'Update from Nick');
+                const fromClient = (e) => ['action_response', 'client_message'].includes(e.kind);
+                const mine = events.filter(e => e.order_id === o.id).sort((a, b) => b.created_at.localeCompare(a.created_at));
+                const newest = mine.find(e => byNick(e) || fromClient(e));
+                const contact = mine.find(e => byNick(e) && e.client_visible);
+                return { ...o, client_replied: !!newest && fromClient(newest), last_contact_at: contact?.created_at || null };
             });
             return json({ orders: list, statuses: STATUSES, tiers: TIERS });
+        }
+        if (a === 'survey-save') {
+            if (body.consent !== true) fail(400, 'Please tick the box to give permission to use your answers.');
+            const mine = mockSurveys.find(r => r.form === 'nick-v1' && r.respondent === adminEmail);
+            // Same as saveNickAnswers: batches add to the set; the first batch (replace) starts it again.
+            const answers = { ...(body.replace || !mine ? {} : mine.answers), ...cleanMockAnswers(/^n(0[1-9]|[12]\d|30)$/, body.answers) };
+            for (const id of Array.isArray(body.cleared) ? body.cleared : []) delete answers[id];
+            if (!Object.keys(answers).length) fail(400, 'Please answer at least one question.');
+            if (mine) Object.assign(mine, { answers, updated_at: now() });
+            else mockSurveys.push({ id: randomUUID(), form: 'nick-v1', respondent: adminEmail, answers, created_at: now(), updated_at: now() });
+            return json({ ok: true });
+        }
+        if (a === 'survey-list') {
+            // Same shape as api/admin.mjs: pages of 100, newest first, plus the signed-in admin's own answers.
+            const all = mockSurveys.slice().sort((x, y) => y.created_at.localeCompare(x.created_at));
+            const from = body.before ? all.filter(r => r.created_at < body.before) : all;
+            return json({ ok: true, me: adminEmail, mine: mockSurveys.find(r => r.form === 'nick-v1' && r.respondent === adminEmail) || null,
+                responses: from.slice(0, 100), more: from.length > 100 });
+        }
+        if (a === 'bulk-close') {
+            const ids = (Array.isArray(body.ids) ? body.ids : []).slice(0, 50);
+            const closed = [];
+            for (const id of ids) {
+                const o = orders.get(id);
+                if (!o || !['served', 'cancelled'].includes(o.status)) continue;
+                updateOrder(o, { status: 'closed' });
+                addEvent(o.id, 'status', STATUSES.closed.label, null, true);
+                closed.push(o.code);
+            }
+            return json({ ok: true, closed, skipped: ids.length - closed.length });
         }
         if (a === 'file-url') {
             const fid = cleanUuid(body.fileId, 'File');
@@ -859,7 +913,7 @@ const handlers = {
             if (!f?.uploaded) fail(404, 'File not found.');
             return json({ url: `/__mock-file/${f.id}` });
         }
-        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'renew-payment-link', 'export', 'dispute-pack', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
+        if (!['get', 'update', 'rotate-token', 'toggle-doc-lock', 'unlock-legal-hold', 'payment-link', 'renew-payment-link', 'export', 'evidence-pack', 'dispute-pack', 'delete', 'proof-upload', 'proof-finish'].includes(a)) fail(400, 'Unknown action.');
         const oid = cleanUuid(body.id, 'Order');
         const o = orders.get(oid);
         if (!o) fail(404, 'Order not found.');
@@ -881,12 +935,9 @@ const handlers = {
             return json(adminDetail(o));
         }
         if (a === 'unlock-legal-hold') {
-            // Same as api/admin.mjs: unlocking needs a fresh authenticator code, or the typed reference without one.
+            // Same as api/admin.mjs: unlocking always needs a step-up (app code, recovery code, or emailed code).
             const hold = !!body.hold;
-            if (!hold) {
-                const usedTotp = requireMockStepUp(adminEmail, body.totp);
-                if (!usedTotp && String(body.confirm || '').trim().toUpperCase() !== o.code) fail(400, `Type ${o.code} to confirm unlocking legal hold.`);
-            }
+            if (!hold) requireMockStepUp(adminEmail, body.totp);
             o.legal_hold = hold;
             addEvent(o.id, 'note', hold ? 'Legal hold turned on' : 'Legal hold unlocked by Nick', null, false);
             auditAdmin(adminEmail, hold ? 'legal_hold_on' : 'legal_hold_unlocked', o.code);
@@ -905,8 +956,25 @@ const handlers = {
             } else if (body.kind === 'attempt') {
                 const outcome = cleanText(body.outcome, 120, true, 'Outcome');
                 const when = cleanText(body.when, 40, false, 'When');
+                const atIso = body.at || when;   // same rule as api/admin.mjs: `when` alone must be an ISO time
+                const detail = attemptDetail(atIso, note);
+                const t = atIso ? Date.parse(atIso) : Date.now();
+                if (!Number.isFinite(t) || t > Date.now() + 3600e3 || t < Date.now() - 60 * 864e5) fail(400, 'Check the attempt time.');
+                const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', hourCycle: 'h23' }).format(t));
+                const window = hour < 12 ? 'morning' : hour < 19 ? 'afternoon/evening' : 'night';
                 if (['received', 'paid', 'accepted'].includes(o.status)) updateOrder(o, { status: 'attempting' });
-                addEvent(o.id, 'attempt', `Attempt: ${outcome}`, attemptDetail(when, note), body.clientVisible !== false);
+                addEvent(o.id, 'attempt', `Attempt (${window}): ${outcome}`, detail, body.clientVisible !== false);
+            } else if (body.kind === 'mailing') {
+                // Same as api/admin.mjs: the follow-up mailing after substituted service.
+                const date = String(body.date || '');
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) fail(400, 'Enter the mailing date.');
+                const city = cleanText(body.city, 80, true, 'City mailed from');
+                addEvent(o.id, 'note', 'Substituted service: follow-up mailing sent', `Mailed by first-class mail on ${date} from ${city}.`, true);
+            } else if (body.kind === 'stakeout') {
+                const start = Date.parse(body.start), end = Date.parse(body.end);
+                if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - start > 12 * 3600e3) fail(400, 'Check the stakeout start and end times.');
+                const minutes = Math.round((end - start) / 60e3);
+                addEvent(o.id, 'note', `Stakeout: ${minutes} min`, minutes > 60 ? `${minutes - 60} min past the first hour.` : null, body.clientVisible !== false);
             } else if (body.kind === 'note') {
                 if (!note) fail(400, 'Write a note first.');
                 addEvent(o.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);
@@ -942,6 +1010,22 @@ const handlers = {
             auditAdmin(adminEmail, 'payment_link_renewed', o.code, money(o.amount_due_cents));
             return json(adminDetail(o));
         }
+        if (a === 'evidence-pack') {
+            const d = adminDetail(o);
+            const pick = (ks) => d.events.filter(e => ks.includes(e.kind)).map(({ created_at, title, detail, client_visible }) => ({ created_at, title, detail, shown_to_client: client_visible }));
+            return json({
+                generated_at: now(),
+                order: { code: o.code, status: STATUSES[o.status]?.label, created_at: o.created_at, client: { name: o.client_name, firm: o.client_firm || null, email: o.client_email },
+                    case_number: o.case_number || null, court: o.court || null, client_reference: o.client_reference || null, recipient: o.recipient_name, document: o.doc_type,
+                    tier: TIERS[o.tier]?.name, addons: o.addons.map(k => ADDONS[k]?.name).filter(Boolean), served_at: o.served_at || null, legal_hold: !!o.legal_hold },
+                attestation: pick(['attestation']),
+                payment: { amount_due: o.amount_due_cents != null ? money(o.amount_due_cents) : null, amount_paid: o.paid_amount_cents ? money(o.paid_amount_cents) : null, paid_at: o.paid_at || null, stripe_session_id: o.stripe_session_id || null, entries: pick(['payment']) },
+                attempts: pick(['attempt']),
+                client_activity: clientAuditLogs.filter(l => l.order_id === o.id).map(({ created_at, action, detail, ip_hash }) => ({ created_at, action, detail, network: ip_hash.slice(0, 12) })),
+                files: d.files.map(({ filename, kind, size_bytes, sha256, created_at }) => ({ filename, kind, size_bytes, sha256: sha256 || null, stored_at: created_at })),
+                timeline_seal: orderSeal(o.id),
+            });
+        }
         if (a === 'export') {
             auditAdmin(adminEmail, 'export_order', o.code);
             const { order: detOrder, events: detEvents, files: detFiles, integritySeal } = adminDetail(o);
@@ -955,7 +1039,6 @@ const handlers = {
             if (!chain.verified) fail(409, 'The event chain did not verify. Investigate before exporting evidence.');
             const evs = events.filter(e => e.order_id === o.id).sort((x, y) => x.created_at.localeCompare(y.created_at));
             const fls = [...files.values()].filter(f => f.order_id === o.id);
-            const fileNames = new Map(fls.map(f => [f.id, f.filename]));
             const pack = {
                 exported_at: now(),
                 order: { code: o.code, client_name: o.client_name, recipient_name: o.recipient_name,
@@ -964,8 +1047,8 @@ const handlers = {
                 payment: { stripe_session_id: o.stripe_session_id || null, amount_due_cents: o.amount_due_cents,
                     paid_at: o.paid_at || null },
                 attempts: evs.filter(e => e.kind === 'attempt').map(({ created_at, title, detail }) => ({ created_at, title, detail })),
-                downloads: clientAuditLogs.filter(e => e.order_id === o.id && e.action === 'file_download').map(({ created_at, file_id }) =>
-                    ({ created_at, file_id, filename: fileNames.get(file_id) || null })),
+                downloads: clientAuditLogs.filter(e => e.order_id === o.id && e.action === 'download').map(({ created_at, detail }) => ({ created_at, filename: detail || null })),
+                client_activity: clientAuditLogs.filter(e => e.order_id === o.id).map(({ created_at, action, detail, ip_hash }) => ({ created_at, action, detail, network: ip_hash.slice(0, 12) })),
                 files: fls.filter(f => f.uploaded).map(({ filename, kind, sha256 }) => ({ filename, kind, sha256: sha256 || null })),
                 chain: { verified: chain.verified, head: chain.head, entries: chain.entries },
             };

@@ -1,10 +1,12 @@
 // POST /api/admin { action, ... } — Nick's dashboard. Everything except the two login steps needs his session cookie.
 import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
-         sha256, randomToken, cleanFileList, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
+         sha256, randomToken, cleanFileList, uuidList, cleanDate, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
-import { STATUSES, TIERS, ADDONS, money, receiptForOrder, sendEmail, sendSecurityAlert, markPaid, renewExpiredPaymentLink, orderSeal, attemptDetail } from './_lib/orders.mjs';
+import { STATUSES, TIERS, ADDONS, money, receiptForOrder, sendEmail, sendSecurityAlert, markPaid, renewExpiredPaymentLink, expireLosingSession, orderSeal, attemptDetail, prefersDigest } from './_lib/orders.mjs';
 import { createCheckout, checkoutExpiresAt, stripeClient } from './_lib/stripe.mjs';
+import { saveNickAnswers, listAnswers, ownAnswers } from './_lib/surveys.mjs';
+import { getContact, setContact, activeWalk, startWalk, checkIn, alertOverdueWalks } from './_lib/safewalk.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
 import { zipEvidencePack } from './_lib/evidence-pack.mjs';
 import { printingSummary } from './_lib/pdf-pages.mjs';
@@ -22,11 +24,11 @@ export const POST = handle(async (request) => {
 
     const admin = await requireAdmin(request);
     if (a === 'me') return me(admin);
-    if (a === 'send-step-up-code') return sendStepUpCode(request, admin);
     if (a === 'logout') return logout(request, admin);
     if (a === 'logout-all') return logoutAll(request, admin);
     if (a === 'sessions') return sessions(request, admin);
     if (a === 'revoke-session') return revokeSession(request, body, admin);
+    if (a === 'stepup-send-code' || a === 'send-step-up-code') return sendStepUpCode(request, admin);
     if (a === 'passkeys') return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
     if (a === 'passkey-register-options') return passkeyRegisterOptions(request, body, admin);
     if (a === 'passkey-register-verify') return passkeyRegisterVerify(request, body, admin);
@@ -47,7 +49,17 @@ export const POST = handle(async (request) => {
     if (a === 'proof-finish') return proofFinish(request, body);
     if (a === 'file-url') return fileUrl(request, body, admin);
     if (a === 'export') return exportOrder(request, body, admin);
+    if (a === 'evidence-pack') return evidencePack(request, body, admin);
     if (a === 'dispute-pack') return disputePack(request, body, admin);
+    if (a === 'bulk-close') return bulkClose(request, body, admin);
+    if (a === 'expense-add') return addExpense(request, body, admin);
+    if (a === 'survey-save') { await rateLimit(`admin-survey:${sha256(admin)}`, 60, 900); await saveNickAnswers(admin, body); return json({ ok: true }); }
+    if (a === 'survey-list') { if (!body.before) await auditAdmin(request, admin, 'survey_read'); return json({ ok: true, me: admin, mine: await ownAnswers(admin), ...(await listAnswers(body.before)) }); }
+    if (a === 'safewalk-status') return safeWalkStatus(admin);
+    if (a === 'safewalk-start') return json({ ok: true, walk: await startWalk(admin, body.minutes, body.id ? await getOrder(body.id) : null) });
+    if (a === 'safewalk-safe') { await checkIn(admin); return json({ ok: true, walk: null }); }
+    if (a === 'safewalk-contact') return safeWalkContact(request, body, admin);
+    if (a === 'expenses-csv') return expensesCsv(request, body, admin);
     if (a === 'delete') return deleteOrder(request, body, admin);
     throw new HttpError(400, 'Unknown action.');
 });
@@ -116,19 +128,23 @@ async function checkTotp(addr, secretEnc, code, bucket) {
 }
 
 // Step-up check before sensitive actions. With an authenticator on, a fresh code is required; returns whether one was checked.
-// A fresh authenticator code, or (phone lost) one single-use recovery code, confirms a sensitive action.
+// Sensitive actions need a fresh second check. With the authenticator on: a current authenticator code, or (phone lost)
+// one single-use recovery code. With it off: an 8-digit step-up code emailed to Nick a moment ago (stepup-send-code),
+// so a stolen session cookie alone can never delete records, mint recovery codes or enrol its own authenticator.
 async function requireStepUp(admin, code) {
     const row = await getAdminTotp(admin);
+    const typed = String(code || '').trim().toUpperCase();
     if (!row?.enabled) {
         await rateLimit(`admin-stepup:${sha256(admin)}`, 10, 900);
-        const typed = String(code || '').replace(/[\s-]/g, '');
-        if (!/^\d{8}$/.test(typed)) throw new HttpError(403, 'Enter the 8-digit security code emailed to you.');
-        const { data, error } = await db().rpc('use_admin_stepup_code', { p_email: admin, p_hash: sha256(`${admin}:${typed}`) });
+        const digits = typed.replace(/[\s-]+/g, '');
+        if (!/^\d{8}$/.test(digits)) throw new HttpError(403, 'Email yourself a step-up code, then enter the 8-digit code to continue.');
+        // Step-up codes are their own purpose in admin_codes (20261104000100), so a pending login code and a step-up
+        // code never replace each other or share guesses.
+        const { data, error } = await db().rpc('use_admin_stepup_code', { p_email: admin, p_hash: stepUpHash(admin, digits) });
         if (error) throw error;
-        if (!data) throw new HttpError(403, 'That security code is wrong or expired. Request a new one.');
+        if (!data) throw new HttpError(403, 'That step-up code is wrong or expired. Email yourself a new one.');
         return true;
     }
-    const typed = String(code || '').trim().toUpperCase();
     const recovery = typed.replace(/[^A-Z0-9]/g, '');
     if (!/^\d{6}$/.test(typed.replace(/\s+/g, '')) && recovery.length === 8) {
         await rateLimit(`admin-stepup:${sha256(admin)}`, 10, 900);
@@ -142,17 +158,28 @@ async function requireStepUp(admin, code) {
     }
     return true;
 }
-
+// Step-up codes live in the login-code table under their own purpose, and also hash differently, so one can never be
+// used as the other.
+const stepUpHash = (addr, digits) => sha256(`stepup:${addr}:${digits}`);
+const STEPUP_MINUTES = 5;
 async function sendStepUpCode(request, admin) {
-    await rateLimit(`admin-stepup-send:${sha256(admin)}`, 5, 900);
+    await rateLimit(`admin-stepup-send:${sha256(admin)}`, 3, 900);
     await rateLimit(`admin-stepup-send-ip:${clientIp(request)}`, 5, 900);
+    if ((await getAdminTotp(admin))?.enabled) throw new HttpError(400, 'Use the code from your authenticator app instead.');
     const code = String(randomInt(0, 100000000)).padStart(8, '0');
-    const { error } = await db().from('admin_codes').insert({ email: admin, code_hash: sha256(`${admin}:${code}`), purpose: 'stepup', expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+    const { error } = await db().from('admin_codes').insert({ email: admin, code_hash: stepUpHash(admin, code), purpose: 'stepup',
+        expires_at: new Date(Date.now() + STEPUP_MINUTES * 60e3).toISOString() });
     if (error) throw error;
-    await sendEmail({ to: admin, subject: 'Your dashboard security code', heading: `Your security code is ${code}`,
-        lines: ['Enter this code to confirm the sensitive dashboard action. It expires in 5 minutes.', "If you didn't request it, sign out all devices and contact your developer."] });
+    await sendEmail({
+        to: admin,
+        subject: `Your dashboard step-up code: ${code}`,
+        heading: `Your step-up code is ${code}`,
+        lines: [`Enter it to confirm the change you just started on your dashboard. It expires in ${STEPUP_MINUTES} minutes.`,
+            "If you didn't start a change, someone may be signed in to your dashboard: use Log Out All Devices now."],
+    });
+    if (!IS_PROD && !process.env.RESEND_API_KEY) console.log(`[dev] admin step-up code for ${admin}: ${code}`);
     await auditAdmin(request, admin, 'stepup_code_sent');
-    return json({ ok: true });
+    return json({ ok: true, minutes: STEPUP_MINUTES });
 }
 
 const recoveryHash = (addr, code) => keyedHash('admin-recovery-v1', `${addr}:${code}`);
@@ -301,6 +328,131 @@ async function passkeyRemove(request, body, admin) {
     return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
 }
 
+// Standard and Expedited service promise morning, evening and night attempts. Each attempt is labelled with its window,
+// in California time, from the time Nick gives (within the last 60 days) or now.
+const ATTEMPT_WINDOWS = ['morning', 'afternoon/evening', 'night'];
+function attemptWindow(at) {
+    let t = Date.now();
+    if (typeof at === 'string' && at) {
+        const parsed = Date.parse(at);
+        if (!Number.isFinite(parsed) || parsed > Date.now() + 3600e3 || parsed < Date.now() - 60 * 864e5) throw new HttpError(400, 'Check the attempt time.');
+        t = parsed;
+    }
+    const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', hourCycle: 'h23' }).format(t));
+    return hour < 12 ? ATTEMPT_WINDOWS[0] : hour < 19 ? ATTEMPT_WINDOWS[1] : ATTEMPT_WINDOWS[2];
+}
+
+// Close several finished jobs at once. Only Served or Cancelled jobs move to Closed; anything else is left alone.
+async function bulkClose(request, body, admin) {
+    await rateLimit(`admin-bulk:${sha256(admin)}`, 10, 900);
+    const ids = uuidList(body.ids).slice(0, 50);
+    if (!ids.length) throw new HttpError(400, 'Choose at least one finished job.');
+    const { data: rows, error } = await db().from('orders').select('id, code, status').in('id', ids);
+    if (error) throw error;
+    const closable = (rows || []).filter(o => ['served', 'cancelled'].includes(o.status));
+    const closed = [];
+    for (const o of closable) {
+        // Only if it's still Served or Cancelled now, so a job reopened in the meantime isn't closed by mistake.
+        const { data: changed, error: uErr } = await db().from('orders').update({ status: 'closed' })
+            .eq('id', o.id).eq('status', o.status).select('id');
+        if (uErr) throw uErr;
+        if (!changed?.length) continue;
+        await addEvent(o.id, 'status', STATUSES.closed.label, null, true);
+        closed.push(o.code);
+    }
+    if (closed.length) await auditAdmin(request, admin, 'bulk_close', null, `Closed ${closed.join(', ')}`.slice(0, 300));
+    return json({ ok: true, closed, skipped: ids.length - closed.length });
+}
+
+// One bundle for a card dispute or a court question: the client's attestation, payment, every attempt, what the client
+// opened and downloaded, file fingerprints and the timeline seal. Facts from the record only; no claims added.
+async function evidencePack(request, body, admin) {
+    await rateLimit(`admin-export:${sha256(admin)}`, 15, 900);
+    const { order, events, files, integritySeal } = await detail(body.id);
+    const { data: clientLog, error: cErr } = await db().from('client_audit_logs').select('created_at, action, detail, ip_hash')
+        .eq('order_id', order.id).order('created_at', { ascending: true }).limit(2000);
+    await auditAdmin(request, admin, 'evidence_pack', order.code);
+    const pick = (kinds) => events.filter(e => kinds.includes(e.kind)).map(({ created_at, title, detail: d, client_visible }) =>
+        ({ created_at, title, detail: d, shown_to_client: client_visible }));
+    return json({
+        generated_at: new Date().toISOString(),
+        order: {
+            code: order.code, status: STATUSES[order.status]?.label || order.status, created_at: order.created_at,
+            client: { name: order.client_name, firm: order.client_firm || null, email: order.client_email },
+            case_number: order.case_number || null, court: order.court || null, client_reference: order.client_reference || null,
+            recipient: order.recipient_name, document: order.doc_type, tier: order.tier_name, addons: order.addon_names,
+            served_at: order.served_at || null, legal_hold: !!order.legal_hold,
+        },
+        attestation: pick(['attestation']),
+        payment: { amount_due: order.amount_due_cents != null ? money(order.amount_due_cents) : null,
+            amount_paid: Number.isSafeInteger(order.paid_amount_cents) ? money(order.paid_amount_cents) : null, paid_at: order.paid_at || null,
+            stripe_session_id: order.stripe_session_id || null, entries: pick(['payment']) },
+        attempts: pick(['attempt']),
+        client_activity: cErr ? { unavailable: 'The client activity log is not set up yet.' }
+            : (clientLog || []).map(({ created_at, action, detail: d, ip_hash }) => ({ created_at, action, detail: d, network: ip_hash ? ip_hash.slice(0, 12) : null })),
+        files: files.map(({ filename, kind, size_bytes, sha256: h, created_at }) => ({ filename, kind, size_bytes, sha256: h || null, stored_at: created_at })),
+        timeline_seal: integritySeal,
+    });
+}
+
+// Miles driven and fees paid (parking, filing, postage) per job, for Nick's taxes. Kept in their own table, so they
+// never appear on the client's timeline.
+const EXPENSES_UNAVAILABLE = 'Expense logging is not set up yet (its database table needs to be added).';
+async function addExpense(request, body, admin) {
+    await rateLimit(`admin-expense:${sha256(admin)}`, 60, 900);
+    const order = await getOrder(body.id);
+    const miles = body.miles === '' || body.miles == null ? 0 : Number(body.miles);
+    const fees = body.fees === '' || body.fees == null ? 0 : Math.round(Number(body.fees) * 100);
+    if (!Number.isFinite(miles) || miles < 0 || miles > 2000 || !Number.isFinite(fees) || fees < 0 || fees > 1000000 || (!miles && !fees)) {
+        throw new HttpError(400, 'Enter the miles driven and/or a fee amount.');
+    }
+    const label = text(body.label, { max: 120 });
+    const { error } = await db().from('order_expenses').insert({ order_id: order.id, miles: Math.round(miles * 10) / 10, fees_cents: fees, label });
+    if (error) throw error.code === '42P01' || /schema cache|does not exist/i.test(error.message || '') ? new HttpError(503, EXPENSES_UNAVAILABLE) : error;
+    return json({ ok: true, ...(await expenseTotals(order.id)) });
+}
+async function expenseTotals(orderId) {
+    const { data, error } = await db().from('order_expenses').select('miles, fees_cents').eq('order_id', orderId);
+    if (error) return { miles: null, feesCents: null };
+    return { miles: Math.round((data || []).reduce((n, r) => n + Number(r.miles || 0), 0) * 10) / 10, feesCents: (data || []).reduce((n, r) => n + (r.fees_cents || 0), 0) };
+}
+const csvCell = (v) => { const t = String(v ?? ''); return /^[=+\-@\t\r]/.test(t) ? `"'${t.replace(/"/g, '""')}"` : /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+async function expensesCsv(request, body, admin) {
+    await rateLimit(`admin-export:${sha256(admin)}`, 15, 900);
+    const from = cleanDate(body.from, { label: 'From' }) || `${new Date().getFullYear()}-01-01`;
+    const to = cleanDate(body.to, { label: 'To' }) || new Date().toISOString().slice(0, 10);
+    const { data, error } = await db().from('order_expenses').select('created_at, miles, fees_cents, label, order_id')
+        .gte('created_at', `${from}T00:00:00Z`).lt('created_at', `${to}T23:59:59.999Z`).order('created_at', { ascending: true }).limit(5000);
+    if (error) throw new HttpError(503, EXPENSES_UNAVAILABLE);
+    const ids = [...new Set((data || []).map(r => r.order_id))];
+    const { data: ords } = ids.length ? await db().from('orders').select('id, code, city').in('id', ids) : { data: [] };
+    const byId = new Map((ords || []).map(o => [o.id, o]));
+    const lines = [['Date', 'Reference', 'City', 'Miles', 'Fees (USD)', 'Note'].join(',')];
+    let miles = 0, fees = 0;
+    for (const r of data || []) {
+        miles += Number(r.miles || 0); fees += r.fees_cents || 0;
+        const o = byId.get(r.order_id) || {};
+        lines.push([r.created_at.slice(0, 10), o.code || '', o.city || '', Number(r.miles || 0).toFixed(1), (r.fees_cents / 100).toFixed(2), r.label || ''].map(csvCell).join(','));
+    }
+    lines.push(['Total', '', '', miles.toFixed(1), (fees / 100).toFixed(2), ''].map(csvCell).join(','));
+    await auditAdmin(request, admin, 'expenses_export', null, `${from} to ${to}`);
+    return json({ ok: true, csv: lines.join('\n'), from, to, rows: (data || []).length });
+}
+
+async function safeWalkStatus(admin) {
+    await alertOverdueWalks().catch(err => console.error('Safe-Walk check failed:', err?.message));   // also checked whenever the dashboard is open
+    return json({ ok: true, contact: await getContact(admin), walk: await activeWalk(admin) });
+}
+// Changing who gets the alert is a security change: it needs the same fresh step-up as other sensitive actions.
+async function safeWalkContact(request, body, admin) {
+    await rateLimit(`admin-safewalk:${sha256(admin)}`, 10, 900);
+    await requireStepUp(admin, body.totp);
+    const contact = await setContact(admin, body.contact);
+    await auditAdmin(request, admin, 'safewalk_contact', null, contact ? 'Emergency contact set' : 'Emergency contact removed');
+    await sendSecurityAlert(admin, 'Safe-Walk emergency contact changed', [contact ? `Safe-Walk alerts now go to ${contact}.` : 'Safe-Walk alerts are now off (no emergency contact).']);
+    return json({ ok: true, contact });
+}
+
 async function requireAdmin(request) {
     const token = getCookie(request, COOKIE);
     if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{40,64}$/.test(token)) throw new HttpError(401, 'Please log in.');
@@ -399,7 +551,7 @@ async function generateRecoveryCodes(request, body, admin) {
 async function totpSetup(request, body, admin) {
     await rateLimit(`admin-totp:${sha256(admin)}`, 6, 900);
     const row = await getAdminTotp(admin);
-    await requireStepUp(admin, body?.totp);
+    await requireStepUp(admin, body?.totp);   // also when turning it on, so a stolen session can't enrol its own phone
     const secret = generateTotpSecret(20);
     const enc = encryptSecret(secret);
     const { error } = row
@@ -441,31 +593,25 @@ async function totpDisable(request, body, admin) {
 // --- Jobs ---
 async function list() {
     const { data, error } = await db().from('orders')
-        .select('id, code, status, created_at, updated_at, client_name, client_firm, client_email, recipient_name, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
+        .select('id, code, status, created_at, updated_at, client_name, client_firm, client_email, recipient_name, address, unit, city, zip, tier, deadline, estimated_total_cents, amount_due_cents, paid_at')
         .order('created_at', { ascending: false }).limit(500);
     if (error) throw error;
-    const orders = await withClientReplied(data);
-    const activeIds = orders.filter(o => !['served', 'closed', 'cancelled'].includes(o.status)).map(o => o.id);
-    if (activeIds.length) {
-        const { data: contacts, error: contactError } = await db().rpc('list_order_contact_dates', { p_order_ids: activeIds });
-        if (contactError) throw contactError;
-        const byId = new Map((contacts || []).map(c => [c.order_id, c.last_contact_at]));
-        for (const order of orders) if (byId.has(order.id)) order.last_contact_at = byId.get(order.id);
-    }
-    return json({ orders, statuses: STATUSES, tiers: TIERS });
+    return json({ orders: await withClientReplied(data), statuses: STATUSES, tiers: TIERS });
 }
 
-// A job "has a client reply" when the client's answer or message is newer than anything Nick has done on it since.
-// Aura messages do not change the operational order state, so every listed job is checked, in the database (one row per
-// order, ids in the request body) so a full 500-job list neither overflows the URL nor loses older jobs to a row limit.
+// For each job still in play: has the client written (an answer or a message) since Nick's last entry, and when did
+// Nick last update the client (his newest entry the client can see)? "Nick's entries" are status changes, attempts,
+// questions, proof, payment requests and the notes he shares; system notes and the client's own entries don't count.
+// Worked out in the database (list_order_activity), with the ids in the request body: an .in() list in the URL fails
+// past ~200 jobs, and a row limit across all jobs hid older jobs' latest entries. Closed and cancelled jobs are skipped.
 async function withClientReplied(list) {
-    if (!list.length) return list;
-    const { data, error } = await db().rpc('list_order_client_replied', { p_order_ids: list.map(o => o.id) });
+    const ids = list.filter(o => !['closed', 'cancelled'].includes(o.status)).map(o => o.id);
+    if (!ids.length) return list.map(o => ({ ...o, client_replied: false, last_contact_at: null }));
+    const { data, error } = await db().rpc('list_order_activity', { p_order_ids: ids });
     if (error) throw error;
-    const replied = new Set((data || []).filter(r => r.client_replied).map(r => r.order_id));
-    return list.map(o => ({ ...o, client_replied: replied.has(o.id) }));
+    const byId = new Map((data || []).map(r => [r.order_id, r]));
+    return list.map(o => ({ ...o, client_replied: !!byId.get(o.id)?.client_replied, last_contact_at: byId.get(o.id)?.last_contact_at || null }));
 }
-
 async function getOrder(id) {
     uuid(id, 'Order');
     const { data, error } = await db().from('orders').select('*').eq('id', id).maybeSingle();
@@ -482,6 +628,10 @@ async function detail(id) {
     ]);
     let files = fileRes.data;
     if (fileRes.error) {
+        const withoutPages = await db().from('order_files').select('id, kind, filename, size_bytes, sha256, created_at, uploaded').eq('order_id', id).order('created_at');
+        files = withoutPages.error ? null : withoutPages.data;
+    }
+    if (!files) {
         const fallback = await db().from('order_files').select('id, kind, filename, size_bytes, created_at, uploaded').eq('order_id', id).order('created_at');
         files = fallback.data;
     }
@@ -499,6 +649,7 @@ async function detail(id) {
         files: uploadedFiles,
         printing: printingSummary(uploadedFiles),
         integritySeal,
+        expenses: await expenseTotals(order.id),
         statuses: STATUSES,
     };
 }
@@ -521,7 +672,7 @@ async function update(request, body, admin) {
         const { error: uErr } = await db().from('orders').update(patch).eq('id', order.id);
         if (uErr) throw uErr;
         await addEvent(order.id, 'status', STATUSES[body.status].label, note, body.clientVisible !== false);
-        if (body.notify) await sendEmail({
+        if (body.notify && !(await prefersDigest(order.client_email))) await sendEmail({
             to: order.client_email, subject: `${order.code}: ${STATUSES[body.status].label}`,
             heading: STATUSES[body.status].label,
             lines: [STATUSES[body.status].client, ...(note ? [note] : [])],
@@ -529,9 +680,17 @@ async function update(request, body, admin) {
         });
     } else if (kind === 'attempt') {
         const outcome = text(body.outcome, { max: 120, required: true, label: 'Outcome' });
-        const when = text(body.when, { max: 40 });   // blank means now; the event timestamp is authoritative
+        // The time Nick gives (the dashboard sends it as an ISO time in `at`; older pages sent it in `when`), or now. It
+        // is checked (not in the future, within the last 60 days), labels the attempt with its service window and is
+        // sealed into the entry as "Attempted at: <ISO time>"; the entry's own timestamp records when it was logged.
+        // With `at` given, `when` is only the dashboard's display text. Without it, `when` must itself be an ISO time:
+        // free text such as "yesterday" is ambiguous and refused.
+        const when = text(body.when, { max: 40 });
+        const at = typeof body.at === 'string' && body.at ? body.at : when;
+        const detail = attemptDetail(at, note);   // checks the format and that it isn't in the future
+        const window = attemptWindow(at);
         if (['received', 'paid', 'accepted'].includes(order.status)) await db().from('orders').update({ status: 'attempting' }).eq('id', order.id);
-        await addEvent(order.id, 'attempt', `Attempt: ${outcome}`, attemptDetail(when, note), body.clientVisible !== false);
+        await addEvent(order.id, 'attempt', `Attempt (${window}): ${outcome}`, detail, body.clientVisible !== false);
     } else if (kind === 'note') {
         if (!note) throw new HttpError(400, 'Write a note first.');
         await addEvent(order.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);
@@ -546,6 +705,22 @@ async function update(request, body, admin) {
             lines: [note, 'Open your tracking page to send the missing details or upload a file.'],
             button: { label: 'Send the information', url: trackUrl },
         });
+    } else if (kind === 'mailing') {
+        // Substituted service (CCP § 415.20) is followed by a first-class mailing; Nick records when and from where.
+        const date = cleanDate(body.date, { label: 'Mailing date' });
+        if (!date) throw new HttpError(400, 'Enter the mailing date.');
+        const city = text(body.city, { max: 80, required: true, label: 'City mailed from' });
+        await addEvent(order.id, 'note', 'Substituted service: follow-up mailing sent', `Mailed by first-class mail on ${date} from ${city}.${note ? ` ${note}` : ''}`, true);
+    } else if (kind === 'stakeout') {
+        // A stakeout timed on Nick's phone: start, end and minutes, plus any time past the first included hour.
+        const start = Date.parse(body.start), end = Date.parse(body.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end > Date.now() + 60e3 || start < Date.now() - 2 * 864e5 || end - start > 12 * 3600e3) {
+            throw new HttpError(400, 'Check the stakeout start and end times.');
+        }
+        const minutes = Math.round((end - start) / 60e3);
+        const pt = (t) => new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' }).format(t);
+        const over = Math.max(0, minutes - 60);
+        await addEvent(order.id, 'note', `Stakeout: ${minutes} min`, `${pt(start)} to ${pt(end)} (California time).${over ? ` ${over} min past the first hour.` : ''}${note ? ` ${note}` : ''}`, body.clientVisible !== false);
     } else {
         throw new HttpError(400, 'Unknown update.');
     }
@@ -590,10 +765,7 @@ async function unlockLegalHold(request, body, admin) {
     const order = await getOrder(body.id);
     const hold = !!body.hold;
     if (!hold) {
-        const usedTotp = await requireStepUp(admin, body.totp);
-        if (!usedTotp && String(body.confirm || '').trim().toUpperCase() !== order.code) {
-            throw new HttpError(400, `Type ${order.code} to confirm unlocking legal hold.`);
-        }
+        await requireStepUp(admin, body.totp);
     }
     const { error } = await db().from('orders').update({ legal_hold: hold }).eq('id', order.id);
     if (error) throw error;
@@ -642,7 +814,7 @@ async function paymentLink(request, body, admin) {
     save = order.stripe_session_id ? save.eq('stripe_session_id', order.stripe_session_id) : save.is('stripe_session_id', null);
     const { data: saved, error: linkErr } = await save.select('id').maybeSingle();
     if (linkErr || !saved) {
-        await stripeClient().checkout.sessions.expire(session.id).catch(() => {});
+        await expireLosingSession(order.id, session.id);
         if (linkErr) throw linkErr;
         throw new HttpError(409, 'The payment link changed while this one was being prepared. Refresh and try again.');
     }
@@ -746,11 +918,10 @@ async function disputePack(request, body, admin) {
     const [events, fileRows, auditRows, chain] = await Promise.all([
         allEvidenceRows('order_events', 'id, kind, title, detail, created_at', order.id),
         allEvidenceRows('order_files', 'id, filename, kind, sha256, uploaded, created_at', order.id),
-        allEvidenceRows('client_audit_logs', 'id, action, file_id, created_at', order.id),
+        allEvidenceRows('client_audit_logs', 'id, action, detail, ip_hash, created_at', order.id),
         orderSeal(order.id),
     ]);
     if (!chain.verified) throw new HttpError(409, 'The event chain did not verify. Investigate before exporting evidence.');
-    const fileNames = new Map(fileRows.map(f => [f.id, f.filename]));
     const pack = {
         exported_at: new Date().toISOString(),
         order: { code: order.code, client_name: order.client_name, recipient_name: order.recipient_name,
@@ -759,8 +930,10 @@ async function disputePack(request, body, admin) {
         payment: { stripe_session_id: order.stripe_session_id || null, amount_due_cents: order.amount_due_cents,
             paid_at: order.paid_at || null },
         attempts: events.filter(e => e.kind === 'attempt').map(({ created_at, title, detail }) => ({ created_at, title, detail })),
-        downloads: auditRows.filter(e => e.action === 'file_download').map(({ created_at, file_id }) =>
-            ({ created_at, file_id, filename: fileNames.get(file_id) || null })),
+        // client_audit_logs (20261030061450) names the downloaded file in `detail`.
+        downloads: auditRows.filter(e => e.action === 'download').map(({ created_at, detail }) => ({ created_at, filename: detail || null })),
+        client_activity: auditRows.map(({ created_at, action, detail, ip_hash }) => ({ created_at, action, detail: detail || null,
+            network: ip_hash ? ip_hash.slice(0, 12) : null })),
         files: fileRows.filter(f => f.uploaded).map(({ filename, kind, sha256 }) => ({ filename, kind, sha256: sha256 || null })),
         chain: { verified: chain.verified, head: chain.head, entries: chain.entries },
     };

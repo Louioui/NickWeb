@@ -259,7 +259,8 @@ await step('/api/admin blocks all SQLi, PostgREST, auth bypass, and destructive 
         const badStatus = await callMock('admin', { action: 'update', id: sampleOrder.id, kind: 'status', status: payload }, adminCookie);
         assert.equal(badStatus.status, 400);
         const badDelete = await callMock('admin', { action: 'delete', id: sampleOrder.id, confirm: payload }, adminCookie);
-        assert.ok([400, 403].includes(badDelete.status), 'Delete with SQLi confirmation code must fail');
+        // Refused either way: 403 because no step-up code was given (F-09), never deleted.
+        assert.ok([400, 403].includes(badDelete.status), `Delete with SQLi confirmation code must fail (got ${badDelete.status})`);
         totalAssertions += 8;
     }
 
@@ -703,7 +704,7 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     assert.equal(verifyFileMagic(zipWithExeAsDocx, 'embedded-exe.docx'), false, '.docx containing embedded .exe entry must be rejected');
     totalAssertions += 9;
 
-    // 11e. Stripe Checkout 24-hour hard expiry, 1-minute idempotency key, & strict canMarkPaid session/amount verification
+    // 11e. Stripe Checkout 24-hour hard expiry, one idempotency key per create attempt, & strict canMarkPaid session/amount verification
     const fixedNow = 1730000000000;
     const sampleOrd = { id: '4c190c16-ccb0-40c6-9c81-da1842658d52', code: 'NP-649025', client_email: 'paralegal@example.com', track_token: 'AbCdEfGhIjKlMnOpQrStUvWxYz012345' };
     const cp1 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow, 'operation-a');
@@ -720,13 +721,13 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     assert.equal(canMarkPaid(unpaidOrder, 0, 'cs_live_active123456'), false, 'Zero amount must be rejected');
     assert.equal(canMarkPaid(unpaidOrder, 12500, 'bad_session'), false, 'Malformed session ID must be rejected');
     assert.equal(canMarkPaid({ ...unpaidOrder, paid_at: '2026-10-29T00:00:00Z' }, 12500, 'cs_live_active123456'), false, 'Already-paid order must be rejected');
-    totalAssertions += 9;
+    totalAssertions += 10;
 
     // 11f. Tamper-evident admin audit log records failed login, successful login, recovery-code generation, export, and delete
     const activeAdminCookie = adminCookies[5];
     await callMock('admin', { action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '99999999' });
-    await callMock('admin', { action: 'send-step-up-code' }, activeAdminCookie);
-    await callMock('admin', { action: 'generate-recovery-codes', totp: '12345678' }, activeAdminCookie);
+    await callMock('admin', { action: 'stepup-send-code' }, activeAdminCookie);   // F-09: step-up needed with two-step off
+    await callMock('admin', { action: 'generate-recovery-codes', totp: '87654321' }, activeAdminCookie);
     const tempOrderRes = await (await callMock('request', {
         clientName: 'Audit Delete Tester',
         clientEmail: 'audit@example.com',
@@ -743,8 +744,8 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     const listForAudit = await (await callMock('admin', { action: 'list' }, activeAdminCookie)).json();
     const tempOrder = listForAudit.orders.find(o => o.code === tempOrderRes.code);
     await callMock('admin', { action: 'export', id: tempOrder.id }, activeAdminCookie);
-    await callMock('admin', { action: 'send-step-up-code' }, activeAdminCookie);
-    await callMock('admin', { action: 'delete', id: tempOrder.id, confirm: tempOrder.code, totp: '12345678' }, activeAdminCookie);
+    await callMock('admin', { action: 'stepup-send-code' }, activeAdminCookie);
+    await callMock('admin', { action: 'delete', id: tempOrder.id, confirm: tempOrder.code, totp: '87654321' }, activeAdminCookie);
 
     const meAudit = await (await callMock('admin', { action: 'me' }, activeAdminCookie)).json();
     const loggedActions = meAudit.auditLogs.map(l => l.action);

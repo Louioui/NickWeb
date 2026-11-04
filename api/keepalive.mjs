@@ -1,6 +1,7 @@
 // GET /api/keepalive — run daily by Vercel Cron (vercel.json). A real query keeps the free Supabase project
 // from pausing after 7 quiet days, and clears out expired login codes and sessions.
-import { db, handle, json, HttpError, BUCKET, addEvent, rateLimit, timingSafeMatch, inspectStoredFile } from './_lib/core.mjs';
+import { db, handle, json, HttpError, BUCKET, addEvent, rateLimit, timingSafeMatch, inspectStoredFile, siteOrigin } from './_lib/core.mjs';
+import { sendDailyDigests } from './_lib/orders.mjs';
 
 const BATCH = 100;
 
@@ -49,11 +50,12 @@ export const GET = handle(async (request) => {
             missing.push(f.id);
             continue;
         }
-        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256, page_count: check.pageCount || null }).eq('id', f.id);
+        const { error: uErr } = await db().from('order_files').update({ uploaded: true, sha256: check.sha256, page_count: check.pages ?? null }).eq('id', f.id);
         if (uErr) throw uErr;
         await addEvent(f.order_id, 'note', 'Document received', f.filename);
         recovered++;
     }
     if (missing.length) await db().from('order_files').delete().in('id', missing);
-    return json({ ok: true, orders: count, uploadsRecovered: recovered, emptyUploadsRemoved: missing.length, uploadsToRetry: retryLater });
+    const digests = await sendDailyDigests(siteOrigin(request)).catch(err => { console.error('Daily digests failed:', err?.message); return 0; });
+    return json({ ok: true, orders: count, uploadsRecovered: recovered, emptyUploadsRemoved: missing.length, uploadsToRetry: retryLater, digests });
 });

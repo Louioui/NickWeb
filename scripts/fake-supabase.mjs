@@ -3,7 +3,7 @@
 // Like supabase-js, every call resolves to { data, error } and never throws.
 import { randomUUID } from 'node:crypto';
 
-const PRIMARY_KEY = { client_security_settings: 'email', track_unlock_codes: 'order_id', admin_totp: 'email', admin_sessions: 'token_hash', client_trusted_devices: 'token_hash', webauthn_credentials: 'credential_id' };
+const PRIMARY_KEY = { admin_settings: 'email', client_preferences: 'email', client_security_settings: 'email', track_unlock_codes: 'order_id', admin_totp: 'email', admin_sessions: 'token_hash', client_trusted_devices: 'token_hash', webauthn_credentials: 'credential_id' };
 
 export function createFakeSupabase() {
     const state = {
@@ -14,6 +14,7 @@ export function createFakeSupabase() {
         failEventInsert: false,      // fail the next timeline insert to exercise transaction recovery
         failExists: new Set(),       // paths whose info() fails with an auth error (storage unusable, not "missing")
         noBucket: new Set(),         // paths whose info() fails with "Bucket not found"
+        failUpdate: new Set(),       // paths whose update() (store a cleaned photo back) fails
         rateHits: new Map(),
         otp: new Map(),              // email -> code accepted by auth.verifyOtp
         linkHashes: new Map(),       // token hash from admin.generateLink -> email (single use)
@@ -107,19 +108,19 @@ export function createFakeSupabase() {
             return ++r.hits;
         },
         verify_order_chain: ({ p_order }) => [{ ok: true, head: 'f'.repeat(64), entries: rows('order_events').filter(e => e.order_id === p_order).length }],
-        list_order_contact_dates: ({ p_order_ids }) => p_order_ids.map(id => {
-            const order = rows('orders').find(o => o.id === id);
-            if (!order) return null;
-            const latest = rows('order_events').filter(e => e.order_id === id && ['action', 'action_response', 'client_message'].includes(e.kind))
-                .map(e => e.created_at).sort().at(-1);
-            return { order_id: id, last_contact_at: latest || order.created_at };
-        }).filter(Boolean),
-        list_order_client_replied: ({ p_order_ids }) => p_order_ids.map(id => {
-            const kinds = ['action', 'status', 'attempt', 'payment', 'proof', 'action_response', 'client_message'];
-            const latest = rows('order_events').filter(e => e.order_id === id && kinds.includes(e.kind))
-                .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-            return latest && { order_id: id, client_replied: ['action_response', 'client_message'].includes(latest.kind) };
-        }).filter(Boolean),
+        // Same rules as public.list_order_activity (supabase/migrations/20261104000300_client_messages_and_activity.sql):
+        // the newest of Nick's entries and the client's entries decides "client replied" (ties broken by the chain's seq,
+        // here the insertion order), and last contact is Nick's newest entry the client can see.
+        list_order_activity: ({ p_order_ids }) => [...new Set(p_order_ids)].map(id => {
+            const byNick = e => ['status', 'attempt', 'action', 'proof'].includes(e.kind) ||
+                (e.kind === 'payment' && String(e.title || '').startsWith('Payment requested')) || (e.kind === 'note' && e.title === 'Update from Nick');
+            const fromClient = e => ['action_response', 'client_message'].includes(e.kind);
+            const events = rows('order_events').map((e, i) => ({ e, seq: e.seq ?? i })).filter(({ e }) => e.order_id === id);
+            const latest = events.filter(({ e }) => byNick(e) || fromClient(e))
+                .sort((a, b) => b.e.created_at.localeCompare(a.e.created_at) || b.seq - a.seq)[0];
+            const contact = events.filter(({ e }) => byNick(e) && e.client_visible !== false).map(({ e }) => e.created_at).sort().at(-1);
+            return { order_id: id, client_replied: !!latest && fromClient(latest.e), last_contact_at: contact || null };
+        }),
         admin_codes_last_hour: () => 0,
         use_admin_code: ({ p_email, p_hash }) => {
             const r = rows('admin_codes').filter(c => c.email === p_email && (c.purpose || 'login') === 'login' && !c.used && c.expires_at > new Date().toISOString())
@@ -142,6 +143,21 @@ export function createFakeSupabase() {
             if (!r) return false;
             r.used = true;
             return true;
+        },
+        // Same steps as public.firm_remove_member (supabase/migrations/20261031120000_field_ops_prefs_firms.sql).
+        firm_remove_member: ({ p_firm, p_email, p_actor }) => {
+            const members = rows('firm_members').filter(m => m.firm_id === p_firm && !m.removed_at);
+            const email = String(p_email).toLowerCase().trim();
+            if (!members.some(m => m.email === String(p_actor).toLowerCase().trim() && m.role === 'admin')) throw new Error('Only an admin of this firm can remove staff.');
+            const target = members.find(m => m.email === email);
+            if (target?.role === 'admin' && members.filter(m => m.role === 'admin').length <= 1) throw new Error('The last admin of a firm cannot be removed.');
+            if (!target) throw new Error('That person is not a current member of this firm.');
+            target.removed_at = new Date().toISOString();
+            state.tables.client_trusted_devices = rows('client_trusted_devices').filter(d => d.email !== email);
+            state.tables.webauthn_credentials = rows('webauthn_credentials').filter(c => !(c.owner_kind === 'client' && c.owner_email === email));
+            for (const [access, e] of [...state.sessions]) if (e === email) { state.sessions.delete(access); state.refreshTokens.delete(state.pairs.get(access)); }
+            return rows('orders').filter(o => o.firm_id === p_firm && o.client_email === email && !['served', 'closed', 'cancelled'].includes(o.status))
+                .map(o => { o.track_token = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '').slice(0, 11); return { order_id: o.id, code: o.code, track_token: o.track_token }; });
         },
         use_admin_totp_step: ({ p_email, p_step }) => {
             const r = rows('admin_totp').find(t => t.email === p_email);
@@ -179,6 +195,10 @@ export function createFakeSupabase() {
         download: async (p) => {
             if (state.failDownload.has(p) || !state.storage.has(p)) return { data: null, error: { message: 'download failed' } };
             return { data: new Blob([state.storage.get(p)]), error: null };
+        },
+        update: async (p, body) => {
+            if (state.failUpdate?.has(p) || state.failUpload?.has(p)) return { data: null, error: { message: 'write failed', status: 500 } };
+            state.storage.set(p, new Uint8Array(body)); return { data: { path: p }, error: null };
         },
         remove: async (paths) => { paths.forEach(p => state.storage.delete(p)); return { data: [], error: null }; },
         upload: async (p, data) => state.failUpload.has(p) ? { data: null, error: { message: 'upload failed' } }
@@ -250,7 +270,7 @@ export function createFakeSupabase() {
     client.__state = state;
     client.__reset = () => {
         state.tables = {};
-        for (const k of ['storage', 'failDownload', 'failUpload', 'failExists', 'noBucket', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
+        for (const k of ['storage', 'failDownload', 'failUpload', 'failExists', 'noBucket', 'failUpdate', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
         state.revoked = [];
         state.failEventInsert = false;
     };

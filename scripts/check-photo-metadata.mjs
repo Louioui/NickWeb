@@ -9,7 +9,7 @@ const source = await readFile(new URL('../assets/js/nps.js', import.meta.url), '
 const context = { window: {}, TextDecoder, TextEncoder, DataView, Uint8Array, File, fetch: () => {}, crypto: webcrypto };
 vm.runInNewContext(`${source}\nthis.NPS = NPS;`, context);
 const { stripPhotoBytes } = context.NPS;
-const { stripPhotoBytes: stripServerPhotoBytes } = await import('../api/_lib/photo-metadata.mjs');
+const { stripPhotoBytes: stripServerPhotoBytes } = await import('../api/_lib/photos.mjs');
 
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -120,5 +120,16 @@ const mismatching = await context.NPS.verifyFileSha256('https://storage.test/pro
 assert.equal(mismatching.ok, false);
 passed++;
 console.log('PASS in-browser file verifier distinguishes matching from altered bytes');
+
+// The server keeps its own copy of the cleaner (api/_lib/photos.mjs). It must give byte-for-byte the same result.
+const server = await import('../api/_lib/photos.mjs');
+const noiseAgain = new Uint8Array(4096).map((_, i) => (i * 131 + 7) & 255);
+check('server copy of the cleaner matches the browser one on every sample', () => {
+    for (const [buf, type] of [[png, 'image/png'], [webp, 'image/webp'], [heic, 'image/heic'], [heicNoPrefix, 'image/heic'],
+        [jpeg, 'image/jpeg'], [noiseAgain, 'image/heic'], [bytes('not a png at all'), 'image/png'], [bytes('RIFF\x04\0\0\0XXXX'), 'image/webp']]) {
+        const a = stripPhotoBytes(buf, type), b = server.stripPhotoBytes(buf, type);
+        assert.deepEqual(a === null ? null : [...a], b === null ? null : [...b], `${type} differs`);
+    }
+});
 
 console.log(`${passed} photo metadata checks passed`);
