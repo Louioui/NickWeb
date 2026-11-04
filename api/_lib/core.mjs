@@ -2,6 +2,7 @@
 // Files under api/_lib are not deployed as their own endpoints (Vercel skips paths starting with "_").
 import { createClient } from '@supabase/supabase-js';
 import { stripPhotoBytes, photoType } from './photos.mjs';
+import { inspectPdf } from './pdf-pages.mjs';
 import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 
 export const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wlbmtcrgftermdtwnbgb.supabase.co';
@@ -416,8 +417,9 @@ export function verifyFileMagic(bytes, filename) {
     if (bytes.length > 4096 && POLYGLOT_SCRIPT_RE.test(Buffer.from(bytes.subarray(bytes.length - 4096)).toString('latin1'))) return false;
 
     if (ext === 'pdf') {
-        // %PDF- and no Acrobat JavaScript / Launch actions anywhere in the file (not just its first 4 KB). Actions hidden
-        // inside compressed object streams can't be seen this way; this is a filter, not a full PDF parser.
+        // Inspect the entire PDF, including objects between the header and trailer. Actions hidden inside compressed
+        // object streams can't be seen this way; this is a filter, not a full PDF parser (inspectStoredFile also opens
+        // stored PDFs with pdf.js, which does see them).
         // Actions live in the PDF's dictionaries, which sit outside its (compressed) data streams; scanning only that
         // part finds an action anywhere in the file without matching random bytes inside images or fonts.
         const structure = pdfStructure(bytes);
@@ -501,16 +503,29 @@ export async function inspectStoredFile(path, filename) {
         let buf = Buffer.from(await blob.arrayBuffer());
         if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
         // Photos are cleaned again here (location and other hidden metadata), in case they were uploaded without the
-        // site's page. A changed file is stored back first; if that fails, the file waits for the next check.
+        // site's page. A photo that can't be cleaned safely is refused rather than kept with its metadata. A changed
+        // file is stored back first; if that fails, the file waits for the next check.
         const type = photoType(filename);
-        const clean = type ? stripPhotoBytes(new Uint8Array(buf), type) : null;
-        if (clean && !Buffer.from(clean).equals(buf)) {
-            const { error: wErr } = await db().storage.from(BUCKET).update(path, Buffer.from(clean), { contentType: type, upsert: true });
-            if (wErr) return { state: 'unknown' };
-            buf = Buffer.from(clean);
-            if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
+        if (type) {
+            const clean = stripPhotoBytes(new Uint8Array(buf), type);
+            if (!clean) return { state: 'bad' };
+            if (!Buffer.from(clean).equals(buf)) {
+                const { error: wErr } = await db().storage.from(BUCKET).update(path, Buffer.from(clean), { contentType: type, upsert: true });
+                if (wErr) return { state: 'unknown' };
+                buf = Buffer.from(clean);
+                if (!verifyFileMagic(buf, filename)) return { state: 'bad' };
+            }
         }
-        const pages = /\.pdf$/i.test(String(filename)) ? countPdfPages(buf) : null;
+        // PDFs are opened with pdf.js: JavaScript or attached files anywhere (even inside compressed object streams,
+        // which verifyFileMagic can't see) refuse the file, and its page tree gives the page count for the printing
+        // fee. A PDF pdf.js can't read is still accepted (real court filings are sometimes slightly malformed) and is
+        // counted from its text instead.
+        let pages = null;
+        if (/\.pdf$/i.test(String(filename))) {
+            const pdf = await inspectPdf(new Uint8Array(buf));
+            if (pdf.unsafe) return { state: 'bad' };
+            pages = pdf.pages ?? countPdfPages(buf);
+        }
         return { state: 'ok', sha256: sha256(buf), pages };
     } catch {
         return { state: 'unknown' };

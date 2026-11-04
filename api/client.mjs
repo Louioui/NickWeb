@@ -4,7 +4,7 @@ import { clientAuth, clientCookie, savedClientSession, requireClient, verifiedCl
          getClientSecurity, pinLocked, recordPinFailure, clearPinFailures,
          rememberDevice, isTrustedDevice, forgetDevices, DEVICE_COOKIE, isFreshSignIn } from './_lib/clients.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, dropPasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
-import { STATUSES, TIERS, money, sendEmail, sendSecurityAlert, clientView, logClientAction } from './_lib/orders.mjs';
+import { STATUSES, TIERS, money, receiptForOrder, sendEmail, sendSecurityAlert, logClientAction } from './_lib/orders.mjs';
 
 const PIN_LOCKED_MESSAGE = 'Account temporarily locked after repeated wrong Security PINs. Please wait 15 minutes.';
 const ASK_FOR_PIN = { ok: false, requiresPin: true, message: 'Enter your 6-digit Security PIN to complete 2-step sign-in.' };
@@ -302,13 +302,16 @@ export const POST = handle(async request => {
         return json({ ok: true, code: order.code }, 200, headers);
     }
     if (action === 'receipt') {
-        // The receipt for one of this client's paid requests: the same details the unlocked tracking page shows.
+        // The receipt for one of this client's paid requests: the same details the unlocked tracking page shows, with
+        // the amount Stripe actually captured.
         await rateLimit(`client-receipt:${user.id}`, 30, 900);
         const code = cleanOrderCode(body.code);
         const { data: order, error } = await db().from('orders').select('*').eq('client_email', clientEmail).eq('code', code).maybeSingle();
         if (error || !order) throw new HttpError(404, 'Order not found.');
         if (!order.paid_at) throw new HttpError(409, 'This request has not been paid yet.');
-        return json({ receipt: (await clientView(order, { unlocked: true })).receipt }, 200, headers);
+        const receipt = receiptForOrder(order);
+        if (!receipt) throw new HttpError(409, 'The payment amount for this earlier order needs review before a receipt can be shown.');
+        return json({ receipt }, 200, headers);
     }
     if (action === 'proof-links') {
         // 60-second download links for every Proof of Service on this client's own requests, with each file's SHA-256

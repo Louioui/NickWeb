@@ -10,6 +10,8 @@ export function createFakeSupabase() {
         tables: {},
         storage: new Map(),          // path -> Uint8Array
         failDownload: new Set(),     // paths whose download returns an error
+        failUpload: new Set(),       // paths whose scrubbed replacement upload fails
+        failEventInsert: false,      // fail the next timeline insert to exercise transaction recovery
         failExists: new Set(),       // paths whose info() fails with an auth error (storage unusable, not "missing")
         noBucket: new Set(),         // paths whose info() fails with "Bucket not found"
         failUpdate: new Set(),       // paths whose update() (store a cleaned photo back) fails
@@ -36,7 +38,8 @@ export function createFakeSupabase() {
         lt(c, v) { this.filters.push(r => r[c] < v); return this; }
         gt(c, v) { this.filters.push(r => r[c] > v); return this; }
         gte(c, v) { this.filters.push(r => r[c] >= v); return this; }
-        in(c, list) { this.filters.push(r => list.includes(r[c])); return this; }
+        // PostgREST puts .in() lists in the URL; gateways reject URLs past roughly 8KB, so model that limit here.
+        in(c, list) { if (list.join(',').length > 8000) this.uriTooLong = true; this.filters.push(r => list.includes(r[c])); return this; }
         is(c, v) { this.filters.push(r => (r[c] ?? null) === v); return this; }
         order(c, { ascending = true } = {}) { (this.orderBy ||= []).push({ c, ascending }); return this; }
         limit(n) { this.limitN = n; return this; }
@@ -45,10 +48,15 @@ export function createFakeSupabase() {
         maybeSingle() { this.one = 'maybe'; return this; }
         then(resolve, reject) { return Promise.resolve().then(() => this.run()).then(resolve, reject); }
         run() {
+            if (this.uriTooLong) return { data: null, error: { code: '414', message: 'URI Too Long' } };
             const all = rows(this.table);
             const match = all.filter(r => this.filters.every(f => f(r)));
             let out;
             if (this.op === 'insert' || this.op === 'upsert') {
+                if (this.op === 'insert' && this.table === 'order_events' && state.failEventInsert) {
+                    state.failEventInsert = false;
+                    return { data: null, error: { message: 'simulated timeline insert failure' } };
+                }
                 // Like Postgres, a plain insert of an existing primary key fails with 23505 and writes nothing.
                 const key = PRIMARY_KEY[this.table];
                 if (this.op === 'insert' && key && this.payload.some(p => all.some(r => r[key] === p[key]))) {
@@ -100,9 +108,30 @@ export function createFakeSupabase() {
             return ++r.hits;
         },
         verify_order_chain: ({ p_order }) => [{ ok: true, head: 'f'.repeat(64), entries: rows('order_events').filter(e => e.order_id === p_order).length }],
+        // Same rules as public.list_order_activity (supabase/migrations/20261104000300_client_messages_and_activity.sql):
+        // the newest of Nick's entries and the client's entries decides "client replied" (ties broken by the chain's seq,
+        // here the insertion order), and last contact is Nick's newest entry the client can see.
+        list_order_activity: ({ p_order_ids }) => [...new Set(p_order_ids)].map(id => {
+            const byNick = e => ['status', 'attempt', 'action', 'proof'].includes(e.kind) ||
+                (e.kind === 'payment' && String(e.title || '').startsWith('Payment requested')) || (e.kind === 'note' && e.title === 'Update from Nick');
+            const fromClient = e => ['action_response', 'client_message'].includes(e.kind);
+            const events = rows('order_events').map((e, i) => ({ e, seq: e.seq ?? i })).filter(({ e }) => e.order_id === id);
+            const latest = events.filter(({ e }) => byNick(e) || fromClient(e))
+                .sort((a, b) => b.e.created_at.localeCompare(a.e.created_at) || b.seq - a.seq)[0];
+            const contact = events.filter(({ e }) => byNick(e) && e.client_visible !== false).map(({ e }) => e.created_at).sort().at(-1);
+            return { order_id: id, client_replied: !!latest && fromClient(latest.e), last_contact_at: contact || null };
+        }),
         admin_codes_last_hour: () => 0,
         use_admin_code: ({ p_email, p_hash }) => {
-            const r = rows('admin_codes').filter(c => c.email === p_email && !c.used && c.expires_at > new Date().toISOString())
+            const r = rows('admin_codes').filter(c => c.email === p_email && (c.purpose || 'login') === 'login' && !c.used && c.expires_at > new Date().toISOString())
+                .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+            if (!r || (r.attempts || 0) >= 5) return false;
+            r.attempts = (r.attempts || 0) + 1;
+            r.used = r.code_hash === p_hash;
+            return r.used;
+        },
+        use_admin_stepup_code: ({ p_email, p_hash }) => {
+            const r = rows('admin_codes').filter(c => c.email === p_email && c.purpose === 'stepup' && !c.used && c.expires_at > new Date().toISOString())
                 .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
             if (!r || (r.attempts || 0) >= 5) return false;
             r.attempts = (r.attempts || 0) + 1;
@@ -136,6 +165,23 @@ export function createFakeSupabase() {
             r.last_used_step = p_step;
             return true;
         },
+        record_paid_order: ({ p_order, p_amount_cents, p_session_id }) => {
+            const r = rows('orders').find(o => o.id === p_order);
+            if (!r || r.paid_at || (r.stripe_session_id && r.stripe_session_id !== p_session_id) ||
+                (r.amount_due_cents != null && p_amount_cents < r.amount_due_cents) ||
+                !Number.isSafeInteger(p_amount_cents) || p_amount_cents <= 0 || !/^cs_[A-Za-z0-9_]{8,128}$/.test(p_session_id)) return false;
+            if (state.failEventInsert) {
+                state.failEventInsert = false;
+                throw new Error('simulated timeline insert failure');
+            }
+            r.paid_at = new Date().toISOString();
+            r.paid_amount_cents = p_amount_cents;
+            r.stripe_session_id = p_session_id;
+            if (!r.legal_hold) r.status = 'paid';
+            rows('order_events').push({ id: randomUUID(), order_id: p_order, kind: 'payment',
+                title: `Payment received: $${(p_amount_cents / 100).toFixed(2)}`, client_visible: true, created_at: new Date().toISOString() });
+            return true;
+        },
     };
 
     const bucket = {
@@ -151,10 +197,12 @@ export function createFakeSupabase() {
             return { data: new Blob([state.storage.get(p)]), error: null };
         },
         update: async (p, body) => {
-            if (state.failUpdate?.has(p)) return { data: null, error: { message: 'write failed', status: 500 } };
+            if (state.failUpdate?.has(p) || state.failUpload?.has(p)) return { data: null, error: { message: 'write failed', status: 500 } };
             state.storage.set(p, new Uint8Array(body)); return { data: { path: p }, error: null };
         },
         remove: async (paths) => { paths.forEach(p => state.storage.delete(p)); return { data: [], error: null }; },
+        upload: async (p, data) => state.failUpload.has(p) ? { data: null, error: { message: 'upload failed' } }
+            : (state.storage.set(p, Buffer.from(data)), { data: { path: p }, error: null }),
         createSignedUploadUrl: async (p) => ({ data: { signedUrl: `https://storage.test/upload/${p}` }, error: null }),
         createSignedUrl: async (p) => ({ data: { signedUrl: `https://storage.test/download/${p}` }, error: null }),
     };
@@ -162,7 +210,10 @@ export function createFakeSupabase() {
     const authError = (message, code) => ({ message, code, status: 401 });
     const client = {
         from: (t) => new Query(t),
-        rpc: async (name, args) => { try { return { data: rpcs[name](args), error: null }; } catch (e) { return { data: null, error: { message: e.message } }; } },
+        rpc: async (name, args) => {
+            try { return { data: rpcs[name](args), error: null }; }
+            catch (error) { return { data: null, error }; }
+        },
         storage: { from: () => bucket },
         auth: {
             signInWithOtp: async () => ({ data: {}, error: null }),
@@ -219,8 +270,9 @@ export function createFakeSupabase() {
     client.__state = state;
     client.__reset = () => {
         state.tables = {};
-        for (const k of ['storage', 'failDownload', 'failExists', 'noBucket', 'failUpdate', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
+        for (const k of ['storage', 'failDownload', 'failUpload', 'failExists', 'noBucket', 'failUpdate', 'rateHits', 'otp', 'linkHashes', 'users', 'sessions', 'refreshTokens', 'pairs']) state[k].clear();
         state.revoked = [];
+        state.failEventInsert = false;
     };
     client.__addUser = (email) => {
         const user = { id: randomUUID(), email, email_confirmed_at: new Date().toISOString(), user_metadata: {} };

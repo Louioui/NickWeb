@@ -4,33 +4,40 @@
 import { mock } from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { createFakeSupabase } from './fake-supabase.mjs';
+import { testPdf } from './test-pdf.mjs';
+import { countPdfPages, printingSummary } from '../api/_lib/pdf-pages.mjs';
 
 const db = createFakeSupabase();
 const stripeSessions = new Map();
+const stripeIntents = new Map();
+const paymentIntents = stripeIntents;   // the name Master's tests use
+const idempotent = new Map();           // idempotency key -> the session it created first
+let stripeIdempotency = true;           // like Stripe: a repeated key returns the first session (tests may switch it off)
 class FakeStripe {
     constructor() {
         this.webhooks = { constructEventAsync: async (raw) => JSON.parse(raw) };
+        this.paymentIntents = { retrieve: async (id) => { const row = stripeIntents.get(id); if (row instanceof Error) throw row; return row || { id, metadata: {} }; } };
         this.checkout = { sessions: {
-            retrieve: async (id) => stripeSessions.get(id) || { id, payment_status: 'unpaid', metadata: {} },
-            expire: async (id) => { const ses = stripeSessions.get(id); if (ses) ses.status = 'expired'; return ses || {}; },
+            retrieve: async (id) => { const row = stripeSessions.get(id); if (row instanceof Error) throw row; return row || { id, payment_status: 'unpaid', metadata: {} }; },
+            expire: async (id) => { const row = stripeSessions.get(id); if (row?.expireError) throw new Error('Stripe expiry failed'); if (row) row.status = 'expired'; return row || {}; },
             create: async (params, options) => {
-                // Like Stripe: with stripeIdempotency on, a repeated idempotency key returns the session it created first.
+                // Like Stripe: a repeated idempotency key returns the session it created first, and is refused when the
+                // parameters differ from the first request's.
                 if (stripeIdempotency && options?.idempotencyKey && idempotent.has(options.idempotencyKey)) {
-                    // Stripe refuses a reused key whose parameters differ from the first request's.
                     const first = idempotent.get(options.idempotencyKey);
                     if (first.__params !== JSON.stringify(params)) throw Object.assign(new Error('Keys for idempotent requests can only be used with the same parameters they were first used with.'), { type: 'StripeIdempotencyError' });
                     return first;
                 }
-                const id = `cs_test_${randomUUID().replace(/-/g, '')}`; const ses = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid' };
-                stripeSessions.set(id, ses); if (options?.idempotencyKey) idempotent.set(options.idempotencyKey, Object.assign(ses, { __params: JSON.stringify(params) })); return ses;
+                const id = `cs_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+                const row = { id, url: `https://checkout.stripe.com/c/pay/${id}`, status: 'open', payment_status: 'unpaid', expires_at: params.expires_at,
+                    metadata: params.metadata, amount_total: params.line_items[0].price_data.unit_amount };
+                stripeSessions.set(id, row);
+                if (options?.idempotencyKey) idempotent.set(options.idempotencyKey, Object.defineProperty(row, '__params', { value: JSON.stringify(params), enumerable: false }));
+                return row;
             },
         } };
-        this.paymentIntents = { retrieve: async (id) => paymentIntents.get(id) || { id, metadata: {} } };
     }
 }
-const paymentIntents = new Map();
-const idempotent = new Map();
-let stripeIdempotency = false;   // set to true to make a repeated idempotency key return the first session
 mock.module('@supabase/supabase-js', { namedExports: { createClient: () => db } });
 mock.module('stripe', { defaultExport: FakeStripe });
 
@@ -79,7 +86,7 @@ const post = (path, body, headers = {}) => new Request(`https://site.test${path}
     method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
 });
 const tables = () => db.__state.tables;
-const reset = () => { db.__reset(); stripeSessions.clear(); idempotent.clear(); stripeIdempotency = false; emails.length = 0; resendUp = true; };
+const reset = () => { db.__reset(); stripeSessions.clear(); stripeIntents.clear(); idempotent.clear(); stripeIdempotency = true; emails.length = 0; resendUp = true; };
 const ADMIN = 'nicksprocessservices@outlook.com';
 const CLIENT = 'client@example.com';
 const PIN = '246810';
@@ -98,6 +105,17 @@ function seedOrder(over = {}) {
 const setPin = (email, extra = {}) => (tables().client_security_settings ||= []).push({ email, pin_hash: core.hashPin(PIN), failed_tries: 0, locked_until: null, ...extra });
 const pinRow = (email) => (tables().client_security_settings || []).find(r => r.email === email);
 const events = (orderId) => (tables().order_events || []).filter(e => e.order_id === orderId);
+function storedZipEntries(bytes) {
+    const entries = new Map();
+    for (let at = 0; bytes.readUInt32LE(at) === 0x04034b50;) {
+        const size = bytes.readUInt32LE(at + 18), nameLength = bytes.readUInt16LE(at + 26), extraLength = bytes.readUInt16LE(at + 28);
+        const name = bytes.subarray(at + 30, at + 30 + nameLength).toString();
+        const begin = at + 30 + nameLength + extraLength;
+        entries.set(name, bytes.subarray(begin, begin + size).toString());
+        at = begin + size;
+    }
+    return entries;
+}
 
 // --- F-01: the PIN must also guard magic-link sign-in (the `session` action) ---
 await check('F-01 magic-link sign-in asks for the PIN instead of setting a cookie', async () => {
@@ -130,6 +148,20 @@ await check('F-01 the cookie issued after sign-in (code + PIN) works for later r
 });
 
 const cookieFor = (session, userId) => clients.clientCookie(new Request('https://site.test/api/client'), session, userId).split(';')[0];
+await check('receipt uses captured Stripe amount and is scoped to the signed-in client', async () => {
+    reset(); const user = db.__addUser(CLIENT);
+    const paid = seedOrder({ status: 'paid', amount_due_cents: 7500, paid_at: new Date().toISOString(),
+        paid_amount_cents: 9000, case_number: 'CV-42', court: 'Superior Court', addons: ['photo'] });
+    const cookie = cookieFor({ access_token: db.__sessionFor(CLIENT), refresh_token: 'r' }, user.id);
+    const good = await clientPOST(post('/api/client', { action: 'receipt', code: paid.code }, { cookie }));
+    const data = await good.json();
+    expect(good.status === 200 && data.receipt.amountPaidCents === 9000, 'captured amount absent');
+    expect(data.receipt.items.reduce((sum, item) => sum + item.cents, 0) === 9000, 'receipt lines do not total captured amount');
+    expect(data.receipt.caseNumber === 'CV-42' && data.receipt.court === 'Superior Court', 'case metadata absent');
+    paid.client_email = 'other@example.com';
+    const denied = await clientPOST(post('/api/client', { action: 'receipt', code: paid.code }, { cookie }));
+    expect(denied.status === 404, 'another client could fetch the receipt');
+});
 await check('F-01 a signed cookie for one client is refused with another client\'s tokens', async () => {
     reset(); const a = db.__addUser(CLIENT); db.__addUser('other@example.com');
     const cookie = cookieFor({ access_token: db.__sessionFor('other@example.com'), refresh_token: 'r' }, a.id);
@@ -275,9 +307,8 @@ await check('F-03 the right PIN still unlocks normally', async () => {
     const body = await res.json();
     expect(res.status === 200 && body.unlockToken, `unlock failed (${res.status} ${JSON.stringify(body)})`);
 });
-
 // --- F-04: file checks fail closed ---
-const PDF = new TextEncoder().encode('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n');
+const PDF = testPdf();
 function seedFile(o, over = {}) {
     const f = { id: randomUUID(), order_id: o.id, kind: 'client_document', storage_path: `orders/${o.id}/client/${randomUUID()}-a.pdf`,
         filename: 'a.pdf', size_bytes: PDF.length, content_type: 'application/pdf', uploaded: false, created_at: new Date().toISOString(), ...over };
@@ -286,6 +317,120 @@ function seedFile(o, over = {}) {
     return f;
 }
 const fileRow = (id) => (tables().order_files || []).find(f => f.id === id);
+await check('client audit log records tracking, unlock, download, reply and payment without raw IP', async () => {
+    reset(); setPin(CLIENT);
+    const o = seedOrder({ doc_lock: true, status: 'action_required', amount_due_cents: 7500, stripe_session_id: 'cs_test_audit123' });
+    const file = seedFile(o, { uploaded: true });
+    const call = (action, extra = {}) => trackPOST(post('/api/track', { t: o.track_token, action, ...extra }, { 'x-forwarded-for': '203.0.113.17' }));
+    expect((await call('view')).status === 200, 'tracking view failed');
+    const unlocked = await call('verify-unlock-code', { code: PIN });
+    const unlockToken = (await unlocked.json()).unlockToken;
+    expect(unlocked.status === 200 && unlockToken, 'unlock failed');
+    expect((await call('download', { fileId: file.id, unlockToken })).status === 200, 'download failed');
+    expect((await call('respond', { reply: 'Gate code is 2468', unlockToken })).status === 200, 'reply failed');
+    stripeSessions.set(o.stripe_session_id, { id: o.stripe_session_id, payment_status: 'paid', amount_total: 7500, metadata: { order_id: o.id } });
+    expect((await call('confirm-payment', { session: o.stripe_session_id, unlockToken })).status === 200, 'payment confirmation failed');
+    const logs = (tables().client_audit_logs || []).filter(x => x.order_id === o.id);
+    expect(['view', 'unlock', 'download', 'reply', 'payment'].every(action => logs.some(x => x.action === action)), `missing audit action: ${logs.map(x => x.action)}`);
+    expect(logs.every(x => /^[0-9a-f]{64}$/.test(x.ip_hash) && !JSON.stringify(x).includes('203.0.113.17')), 'raw IP stored in audit log');
+});
+// Messages are open on any open request (CLIENT_NOTE_STATUSES); a finished request takes none (see the P2 tests).
+await check('Aura client messages are available on open requests without reopening them or allowing unsolicited address changes', async () => {
+    reset();
+    const served = seedOrder({ status: 'attempting', doc_lock: false });
+    const message = await trackPOST(post('/api/track', { t: served.track_token, action: 'respond', reply: 'Thank you. Please send me a copy of the proof when it is ready.' }));
+    const messageBody = await message.json();
+    expect(message.status === 200 && messageBody.responseType === 'client_message', `message failed (${message.status} ${JSON.stringify(messageBody)})`);
+    const stored = tables().orders.find(x => x.id === served.id);
+    expect(stored.status === 'attempting', `message changed the workflow state: ${JSON.stringify(stored)}`);
+    expect(events(served.id).some(e => e.kind === 'client_message' && e.title === 'You sent Nick a message'), 'message event was not recorded');
+    expect((tables().client_audit_logs || []).some(e => e.order_id === served.id && e.action === 'reply' && /^message/.test(e.detail || '')), 'message audit action missing');
+    const adminToken = 'M'.repeat(43);
+    (tables().admin_sessions ||= []).push({ token_hash: core.sha256(adminToken), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString() });
+    const dashboard = await (await adminPOST(post('/api/admin', { action: 'list' }, { cookie: `nps_admin=${adminToken}` }))).json();
+    expect(dashboard.orders.find(x => x.id === served.id)?.client_replied === true, 'dashboard did not flag the message');
+    const addressChange = await trackPOST(post('/api/track', { t: served.track_token, action: 'respond', address: '999 Attacker Ave', reply: 'Please update this.' }));
+    expect(addressChange.status === 409, `unsolicited address change returned ${addressChange.status}`);
+    expect(tables().orders.find(x => x.id === served.id).address === '12 Main St', 'unsolicited address change was saved');
+});
+await check('a reply already emailed under the pre-message marker title is not emailed to Nick again', async () => {
+    reset();
+    const o = seedOrder({ status: 'received', doc_lock: false });
+    const at = (ms) => new Date(Date.now() - ms).toISOString();
+    (tables().order_events ||= []).push(
+        { id: randomUUID(), order_id: o.id, kind: 'action_response', title: 'You sent the requested information', created_at: at(2000) },
+        { id: randomUUID(), order_id: o.id, kind: 'note', title: 'Reply emailed', created_at: at(1000) },
+    );
+    const res = await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }));
+    expect(res.status === 200, `respond-finish returned ${res.status}`);
+    expect(emails.length === 0, `legacy-marked reply re-emailed ${emails.length} time(s)`);
+});
+await check('twelve concurrent respond-finish calls for one message email Nick exactly once', async () => {
+    reset();
+    const o = seedOrder({ status: 'attempting', doc_lock: false });
+    expect((await trackPOST(post('/api/track', { t: o.track_token, action: 'respond', reply: 'Hello Nick' }))).status === 200, 'message failed');
+    await Promise.all(Array.from({ length: 12 }, () => trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }))));
+    expect(emails.length === core.ADMIN_EMAILS.length, `one message sent ${emails.length} email(s)`);
+});
+await check('a failed notification is not recorded as sent, and a later call after the claim expires delivers it', async () => {
+    reset();
+    const o = seedOrder({ status: 'attempting', doc_lock: false });
+    await trackPOST(post('/api/track', { t: o.track_token, action: 'respond', reply: 'Hello Nick' }));
+    resendUp = false;
+    const failed = await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }));
+    expect(failed.status === 200, `respond-finish returned ${failed.status} although the message is saved`);
+    expect(!events(o.id).some(e => e.title === 'Client reply emailed'), 'a rejected email was recorded as delivered');
+    resendUp = true;
+    tables().rate_limits = (tables().rate_limits || []).filter(r => !r.bucket.startsWith('reply-email:'));   // the claim window passing
+    await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }));
+    expect(emails.length === core.ADMIN_EMAILS.length && events(o.id).some(e => e.title === 'Client reply emailed'), `retry sent ${emails.length} email(s)`);
+});
+await check('a new message sharing a timestamp with the previous email marker is still emailed', async () => {
+    reset();
+    const o = seedOrder({ status: 'attempting', doc_lock: false });
+    const at = new Date(Date.now() - 1000).toISOString();
+    const first = randomUUID();
+    (tables().order_events ||= []).push(
+        { id: first, order_id: o.id, kind: 'client_message', title: 'You sent Nick a message', created_at: at },
+        { id: randomUUID(), order_id: o.id, kind: 'note', title: 'Client reply emailed', detail: `Emailed Nick about reply ${first}`, created_at: at },
+        { id: randomUUID(), order_id: o.id, kind: 'client_message', title: 'You sent Nick a message', created_at: at },
+    );
+    // Same-millisecond rows: make the newest message sort first, as Postgres may return it.
+    tables().order_events.reverse();
+    await trackPOST(post('/api/track', { t: o.track_token, action: 'respond-finish', fileIds: [] }));
+    expect(emails.length === core.ADMIN_EMAILS.length, `second message on a timestamp tie sent ${emails.length} email(s)`);
+});
+await check('a locked Aura request still requires document unlock before any client message', async () => {
+    reset(); setPin(CLIENT);
+    const locked = seedOrder({ status: 'attempting', doc_lock: true });
+    const denied = await trackPOST(post('/api/track', { t: locked.track_token, action: 'respond', reply: 'Can you call me?' }));
+    expect(denied.status === 403, `locked message returned ${denied.status}`);
+    expect(!events(locked.id).some(e => e.kind === 'client_message'), 'locked message was recorded');
+});
+await check('admin dispute pack contains paginated evidence, excludes tokens, and needs admin auth', async () => {
+    reset();
+    const o = seedOrder({ recipient_name: '<script>Unsafe</script>', stripe_session_id: 'cs_test_evidence123', paid_at: new Date().toISOString(), amount_due_cents: 7500 });
+    const f = seedFile(o, { filename: 'proof.pdf', kind: 'proof', uploaded: true, sha256: 'a'.repeat(64) });
+    const at = new Date().toISOString();
+    (tables().order_events ||= []).push({ id: randomUUID(), order_id: o.id, kind: 'attestation', title: 'Client legal attestation', created_at: at });
+    for (let n = 0; n < 501; n++) (tables().order_events ||= []).push({ id: randomUUID(), order_id: o.id, kind: 'attempt', title: 'Attempt: No answer', detail: `Try ${n}`, created_at: at });
+    // client_audit_logs as in 20261030061450: the downloaded file is named in `detail`.
+    (tables().client_audit_logs ||= []).push({ id: randomUUID(), order_id: o.id, action: 'download', detail: f.filename, created_at: at, ip_hash: 'b'.repeat(64) });
+    const denied = await adminPOST(post('/api/admin', { action: 'dispute-pack', id: o.id }));
+    expect(denied.status === 401, `unauthenticated evidence export returned ${denied.status}`);
+    const token = 'A'.repeat(43);
+    (tables().admin_sessions ||= []).push({ token_hash: core.sha256(token), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: at });
+    const res = await adminPOST(post('/api/admin', { action: 'dispute-pack', id: o.id }, { cookie: `nps_admin=${token}` }));
+    expect(res.status === 200 && res.headers.get('content-type') === 'application/zip', `evidence export returned ${res.status}`);
+    const entries = storedZipEntries(Buffer.from(await res.arrayBuffer()));
+    const pack = JSON.parse(entries.get('evidence.json'));
+    expect(pack.attestation.created_at === at && pack.payment.stripe_session_id === o.stripe_session_id && pack.payment.paid_at === o.paid_at, 'attestation or payment missing');
+    expect(pack.attempts.length === 501 && pack.downloads[0].filename === 'proof.pdf' && pack.files[0].sha256 === f.sha256, 'attempt, download or fingerprint missing');
+    expect(pack.chain.verified && /^[0-9a-f]{64}$/.test(pack.chain.head), 'sealed chain head missing');
+    expect(!entries.get('evidence.json').includes(o.track_token) && !entries.get('evidence.json').includes('ip_hash'), 'private token or IP digest exported');
+    expect(entries.get('evidence.html').includes('&lt;script&gt;Unsafe&lt;/script&gt;') && !entries.get('evidence.html').includes('<script>Unsafe</script>'), 'HTML output was not escaped');
+});
+
 await check('F-04 a failed download leaves the file unconfirmed', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o);
     db.__state.failDownload.add(f.storage_path);
@@ -296,6 +441,26 @@ await check('F-04 a good file is still confirmed with its fingerprint', async ()
     reset(); const o = seedOrder(); const f = seedFile(o);
     const done = await core.confirmUploads(o.id, [f.id]);
     expect(done.files.length === 1 && done.stillChecking === 0 && fileRow(f.id).uploaded && /^[0-9a-f]{64}$/.test(fileRow(f.id).sha256 || ''), 'good file not confirmed');
+});
+await check('F-11 direct JPEG upload is scrubbed in Storage before fingerprinting', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'photo.jpg' });
+    const payload = Buffer.from('Exif\0\0GPS 37.9577N');
+    const image = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0, payload.length + 2]), payload,
+        Buffer.from([0xff, 0xda, 1, 2, 3, 0xff, 0xd9])]);
+    db.__state.storage.set(f.storage_path, image);
+    const done = await core.confirmUploads(o.id, [f.id]);
+    const stored = Buffer.from(db.__state.storage.get(f.storage_path));
+    expect(done.files.length === 1 && !stored.includes(Buffer.from('GPS')), 'GPS metadata remained in stored image');
+    expect(fileRow(f.id).sha256 === core.sha256(stored), 'fingerprint does not match scrubbed bytes');
+});
+await check('F-11 failed Storage replacement keeps a photo unconfirmed for retry', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'photo.jpg' });
+    const payload = Buffer.from('Exif\0\0GPS');
+    db.__state.storage.set(f.storage_path, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0, payload.length + 2]), payload,
+        Buffer.from([0xff, 0xda, 1, 2, 3, 0xff, 0xd9])]));
+    db.__state.failUpload.add(f.storage_path);
+    const done = await core.confirmUploads(o.id, [f.id]);
+    expect(done.stillChecking === 1 && !fileRow(f.id).uploaded, 'photo was confirmed although metadata rewrite failed');
 });
 await check('F-04 a file that never reached storage is counted as missing, not "still being checked"', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o);
@@ -308,6 +473,135 @@ const adminCookie = () => {
     (tables().admin_sessions ||= []).push({ token_hash: core.sha256(token), email: ADMIN, expires_at: new Date(Date.now() + 864e5).toISOString(), last_seen_at: new Date().toISOString() });
     return `nps_admin=${token}`;
 };
+await check('payment link replacement stops when Stripe cannot verify or close the old link', async () => {
+    for (const failure of ['lookup', 'expire', 'mismatch']) {
+        reset(); const id = 'cs_test_oldlink123';
+        const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+            payment_url: 'https://checkout.stripe.com/c/pay/old' });
+        stripeSessions.set(id, failure === 'lookup' ? new Error('Stripe unavailable') :
+            { id, status: 'open', payment_status: 'unpaid', metadata: { order_id: failure === 'mismatch' ? randomUUID() : o.id },
+                expireError: failure === 'expire' });
+        const res = await adminPOST(post('/api/admin', { action: 'payment-link', id: o.id, amount: '75.00' }, { cookie: adminCookie() }));
+        expect(res.status === 503, `${failure} returned ${res.status}`);
+        expect(o.stripe_session_id === id && o.amount_due_cents === 7500 && emails.length === 0, `${failure} replaced the old link`);
+    }
+});
+await check('concurrent payment-link replacements keep only one new session payable', async () => {
+    reset(); const id = 'cs_test_oldlink123';
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+        payment_url: 'https://checkout.stripe.com/c/pay/old' });
+    stripeSessions.set(id, { id, status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    const cookie = adminCookie();
+    const results = await Promise.all(['80.00', '80.00'].map(amount => adminPOST(post('/api/admin',
+        { action: 'payment-link', id: o.id, amount }, { cookie }))));
+    expect(results.filter(r => r.status === 200).length === 1 && results.filter(r => r.status === 409).length === 1,
+        `concurrent results ${results.map(r => r.status)}`);
+    const open = [...stripeSessions.values()].filter(s => s.status === 'open');
+    expect(open.length === 1 && open[0].id === o.stripe_session_id, 'orphaned session remained payable');
+});
+await check('client renews only an expired Stripe link for the original amount', async () => {
+    reset(); const id = 'cs_test_expired123';
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+        payment_url: 'https://checkout.stripe.com/c/pay/old', payment_expires_at: new Date(Date.now() - 60e3).toISOString() });
+    stripeSessions.set(id, { id, status: 'expired', payment_status: 'unpaid', amount_total: 7500, metadata: { order_id: o.id } });
+    const res = await trackPOST(post('/api/track', { action: 'renew-payment-link', t: o.track_token }));
+    const view = await res.json();
+    expect(res.status === 200 && view.amountDue === '$75.00' && view.payUrl === o.payment_url && !view.paymentExpired,
+        `renewal failed: ${res.status} ${JSON.stringify(view)}`);
+    expect(o.amount_due_cents === 7500 && o.stripe_session_id !== id && o.payment_expires_at > new Date().toISOString(), 'amount or expiry changed incorrectly');
+    expect(events(o.id).filter(e => e.title?.startsWith('Payment link renewed:')).length === 1, 'renewal event missing');
+    expect((await trackPOST(post('/api/track', { action: 'renew-payment-link', t: o.track_token }))).status === 409,
+        'active replacement renewed again');
+});
+await check('Nick can renew an expired link, while a still-open link is refused', async () => {
+    reset(); const id = 'cs_test_expired123';
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+        payment_url: 'https://checkout.stripe.com/c/pay/old', payment_expires_at: new Date(Date.now() - 60e3).toISOString() });
+    stripeSessions.set(id, { id, status: 'open', payment_status: 'unpaid', amount_total: 7500,
+        expires_at: Math.floor(Date.now() / 1000) + 1000, metadata: { order_id: o.id } });
+    const cookie = adminCookie();
+    expect((await adminPOST(post('/api/admin', { action: 'renew-payment-link', id: o.id }, { cookie }))).status === 409,
+        'Stripe-open link was renewed based only on the database clock');
+    stripeSessions.get(id).status = 'expired';
+    const res = await adminPOST(post('/api/admin', { action: 'renew-payment-link', id: o.id }, { cookie }));
+    expect(res.status === 200 && o.stripe_session_id !== id && o.amount_due_cents === 7500, `admin renewal failed (${res.status})`);
+});
+await check('parallel expired-link renewals produce one payable session and one renewal event', async () => {
+    reset(); const id = 'cs_test_expired123';
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 7500, stripe_session_id: id,
+        payment_url: 'https://checkout.stripe.com/c/pay/old', payment_expires_at: new Date(Date.now() - 60e3).toISOString() });
+    stripeSessions.set(id, { id, status: 'expired', payment_status: 'unpaid', amount_total: 7500, metadata: { order_id: o.id } });
+    const results = await Promise.all(Array.from({ length: 3 }, () => trackPOST(post('/api/track',
+        { action: 'renew-payment-link', t: o.track_token }))));
+    expect(results.filter(r => r.status === 200).length === 1, `renewal statuses: ${results.map(r => r.status)}`);
+    expect([...stripeSessions.values()].filter(s => s.status === 'open').length === 1, 'multiple payable sessions remain');
+    expect(events(o.id).filter(e => e.title?.startsWith('Payment link renewed:')).length === 1, 'duplicate renewal events');
+});
+// Last contact is Nick's newest entry the client can see (list_order_activity, 20261104000300); the client's own reply
+// or message flags "client replied" but is not Nick contacting the client.
+await check('dashboard last contact is Nick\'s latest client-visible entry; the client\'s reply flags the job', async () => {
+    reset();
+    const created = new Date(Date.now() - 5 * 864e5).toISOString();
+    const question = new Date(Date.now() - 2 * 864e5).toISOString();
+    const reply = new Date(Date.now() - 864e5).toISOString();
+    const o = seedOrder({ created_at: created, status: 'attempting' });
+    (tables().order_events ||= []).push(
+        { id: randomUUID(), order_id: o.id, kind: 'action', title: 'Nick asked for more information', client_visible: true, created_at: question },
+        { id: randomUUID(), order_id: o.id, kind: 'action_response', title: 'You sent the requested information', created_at: reply },
+    );
+    const res = await adminPOST(post('/api/admin', { action: 'list' }, { cookie: adminCookie() }));
+    const row = (await res.json()).orders.find(x => x.id === o.id);
+    expect(res.status === 200 && row?.last_contact_at === question, `Nick's question was not the last contact: ${row?.last_contact_at}`);
+    expect(row?.client_replied === true, 'the client reply was not flagged');
+});
+await check('a client message flags the job; a job Nick hasn\'t updated yet has no last contact', async () => {
+    reset();
+    const created = new Date(Date.now() - 5 * 864e5).toISOString();
+    const message = new Date(Date.now() - 3600e3).toISOString();
+    const talked = seedOrder({ created_at: created, status: 'attempting' });
+    const quiet = seedOrder({ created_at: created, status: 'attempting' });
+    (tables().order_events ||= []).push(
+        { id: randomUUID(), order_id: talked.id, kind: 'note', title: 'Internal note', client_visible: false, created_at: created },
+        { id: randomUUID(), order_id: talked.id, kind: 'client_message', title: 'You sent Nick a message', created_at: message });
+    const body = await (await adminPOST(post('/api/admin', { action: 'list' }, { cookie: adminCookie() }))).json();
+    const byId = new Map(body.orders.map(x => [x.id, x]));
+    expect(byId.get(talked.id)?.client_replied === true, 'client message not flagged as awaiting Nick');
+    expect(byId.get(talked.id)?.last_contact_at === null, `an internal note or the client's message counted as contact: ${byId.get(talked.id)?.last_contact_at}`);
+    expect(byId.get(quiet.id)?.last_contact_at === null && byId.get(quiet.id)?.client_replied === false, `quiet job: ${JSON.stringify(byId.get(quiet.id))}`);
+});
+await check('a full 500-order dashboard loads and flags replies without an oversized id filter', async () => {
+    reset();
+    const base = Date.now() - 864e5;
+    const seeded = Array.from({ length: 500 }, (_, i) => seedOrder({ created_at: new Date(base + i * 1000).toISOString(), status: 'attempting' }));
+    const oldest = seeded[0];
+    (tables().order_events ||= []).push({ id: randomUUID(), order_id: oldest.id, kind: 'client_message', created_at: new Date(base + 1).toISOString() });
+    // Thousands of newer Nick events on other orders must not push the oldest order's reply out of view.
+    for (const o of seeded.slice(1)) for (let k = 0; k < 12; k++) tables().order_events.push({ id: randomUUID(), order_id: o.id, kind: 'attempt', created_at: new Date(base + 6e5 + k).toISOString() });
+    const res = await adminPOST(post('/api/admin', { action: 'list' }, { cookie: adminCookie() }));
+    const body = await res.json();
+    expect(res.status === 200, `500-order dashboard failed (${res.status} ${JSON.stringify(body).slice(0, 200)})`);
+    expect(body.orders.find(x => x.id === oldest.id)?.client_replied === true, 'reply on the oldest listed order was truncated away');
+});
+await check('F-09 sensitive admin action needs a fresh, single-use emailed code without TOTP', async () => {
+    reset(); const cookie = adminCookie();
+    const call = (action, extra = {}) => adminPOST(post('/api/admin', { action, ...extra }, { cookie }));
+    expect((await call('generate-recovery-codes')).status === 403, 'missing step-up code accepted');
+    expect((await call('totp-setup')).status === 403, 'authenticator enrollment started without step-up');
+    expect((await call('send-step-up-code')).status === 200, 'could not request step-up code');
+    const row = (tables().admin_codes || []).find(c => c.purpose === 'stepup');
+    expect(row && row.expires_at > new Date().toISOString(), 'short-lived code was not stored');
+    row.code_hash = core.sha256(`stepup:${ADMIN}:87654321`);   // step-up codes hash apart from login codes
+    expect((await call('generate-recovery-codes', { totp: '12345678' })).status === 403, 'login code accepted for step-up');
+    expect((await call('generate-recovery-codes', { totp: '87654321' })).status === 200, 'fresh step-up code refused');
+    const held = seedOrder({ legal_hold: true });
+    expect((await call('unlock-legal-hold', { id: held.id, hold: false, totp: '87654321' })).status === 403, 'step-up code replay accepted');
+    expect((tables().orders || []).find(o => o.id === held.id)?.legal_hold === true, 'legal hold changed on replay');
+    expect((await call('send-step-up-code')).status === 200, 'could not request a second code');
+    const expired = (tables().admin_codes || []).filter(c => c.purpose === 'stepup').at(-1);
+    expired.code_hash = core.sha256(`stepup:${ADMIN}:11223344`);
+    expired.expires_at = new Date(Date.now() - 1000).toISOString();
+    expect((await call('unlock-legal-hold', { id: held.id, hold: false, totp: '11223344' })).status === 403, 'expired code accepted');
+});
 await check('F-04 a proof upload with an unchecked file does not mark the order served or email the client', async () => {
     reset(); const o = seedOrder({ status: 'attempting' });
     const good = seedFile(o, { kind: 'proof' }); const slow = seedFile(o, { kind: 'proof' });
@@ -369,10 +663,58 @@ await check('F-04 the new-request email says when uploads are still being checke
     const toNick = emails.find(e => e.to.includes(ADMIN) && /New request/.test(e.subject));
     expect(res.status === 200 && toNick && /1 document\(s\) attached\. 1 more could not be checked yet/.test(toNick.text), `email: ${toNick?.text}`);
 });
+await check('request confirmation can retry after Resend rejects delivery', async () => {
+    reset(); const o = seedOrder();
+    const { POST: requestPOST } = await import('../api/request.mjs');
+    resendUp = false;
+    const first = await requestPOST(post('/api/request', { step: 'finish', t: o.track_token, fileIds: [] }));
+    expect(!events(o.id).some(e => e.title === 'Confirmation emailed'), 'failed send was marked delivered');
+    resendUp = true;
+    const second = await requestPOST(post('/api/request', { step: 'finish', t: o.track_token, fileIds: [] }));
+    expect(second.status === 200 && emails.some(e => e.to.includes(CLIENT)), `retry did not send client email (${first.status}, ${second.status})`);
+    expect(events(o.id).filter(e => e.title === 'Confirmation emailed').length === 1, 'confirmation marker missing or duplicated');
+});
+await check('attempt time is sealed as ISO and invalid times are refused', async () => {
+    reset(); const o = seedOrder();
+    const cookie = adminCookie();
+    const when = new Date(Date.now() - 3600e3).toISOString();
+    const good = await adminPOST(post('/api/admin', { action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', when, note: 'Three knocks' }, { cookie }));
+    expect(good.status === 200 && events(o.id).some(e => e.kind === 'attempt' && e.detail?.startsWith(`Attempted at: ${when}`)), 'ISO attempt time was not sealed');
+    const bad = await adminPOST(post('/api/admin', { action: 'update', id: o.id, kind: 'attempt', outcome: 'No answer', when: 'yesterday', note: '' }, { cookie }));
+    expect(bad.status === 400 && events(o.id).filter(e => e.kind === 'attempt').length === 1, 'ambiguous time was accepted');
+});
 await check('F-10 a PDF with a script action deep inside (past 4 KB) is refused', async () => {
     const pdf = new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n<< /S /JavaScript /JS (app.alert(1)) >>\n%%EOF`);
     expect(core.verifyFileMagic(pdf, 'a.pdf') === false, 'deep /JavaScript action accepted');
     expect(core.verifyFileMagic(new TextEncoder().encode(`%PDF-1.7\n${'x'.repeat(10000)}\n%%EOF`), 'a.pdf') === true, 'clean PDF refused');
+});
+await check('real PDF page tree drives printing fee; malformed PDFs never get a page count', async () => {
+    reset(); const o = seedOrder();
+    const file = seedFile(o);
+    db.__state.storage.set(file.storage_path, testPdf(101));
+    const confirmed = await core.confirmUploads(o.id, [file.id]);
+    expect(confirmed.files.length === 1 && file.page_count === 101, `page count not stored: ${file.page_count}`);
+    const detail = await adminPOST(post('/api/admin', { action: 'get', id: o.id }, { cookie: adminCookie() }));
+    const view = await detail.json();
+    expect(detail.status === 200 && view.printing.pages === 101 && view.printing.feeCents === 15, 'dashboard fee is not $0.15 for page 101');
+    expect(printingSummary([{ kind: 'client_document', filename: 'a.pdf', page_count: 100 }]).feeCents === 0, 'first 100 pages not free');
+    expect(await countPdfPages(Buffer.from('%PDF-1.7\nnot a page tree\n%%EOF')) === null, 'malformed PDF counted');
+    expect(await countPdfPages(testPdf(1, '/OpenAction << /S /JavaScript /JS (app.alert(1)) >>')) === null, 'PDF action parsed as safe');
+});
+await check('F-10 middle-of-file PDF actions and HTML are refused by the real upload path', async () => {
+    const middle = 'x'.repeat(500000);
+    // Ordinary page actions and XFA court forms are allowed (see "F-10 ordinary link/open action" below); an open or
+    // page action that runs JavaScript, hidden as plain text or with #xx-encoded names, is not.
+    for (const payload of ['<script>alert(1)</script>', '/OpenAction << /S /JavaScript /JS (app.alert(1)) >>', '/AA << /O << /S /JavaScript >> >>',
+        '/OpenAction << /S /J#61vaScript >>', '/Launch', '/SubmitForm', '/EmbeddedFiles', '/RichMedia']) {
+        reset(); const o = seedOrder(); const f = seedFile(o);
+        db.__state.storage.set(f.storage_path, Buffer.from(`%PDF-1.7\n${middle}\n${payload}\n${middle}\n%%EOF`));
+        const result = await core.confirmUploads(o.id, [f.id]);
+        expect(result.rejected === 1 && !fileRow(f.id), `PDF payload accepted: ${payload}`);
+    }
+    reset(); const o = seedOrder(); const f = seedFile(o);
+    db.__state.storage.set(f.storage_path, Buffer.from(`%PDF-1.7\n${middle}\n/AcroForm << /XFA 5 0 R >>\n${middle}\n%%EOF`));
+    expect((await core.confirmUploads(o.id, [f.id])).files.length === 1, 'an XFA court form was refused');
 });
 await check('F-10 HTML appended to the end of a PNG is refused', async () => {
     const png = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, ...new Uint8Array(9000)]);
@@ -382,6 +724,16 @@ await check('F-10 HTML appended to the end of a PNG is refused', async () => {
 });
 const cron = () => keepaliveGET(new Request('https://site.test/api/keepalive', { headers: { authorization: 'Bearer test-cron' } }));
 const dayOld = new Date(Date.now() - 2 * 864e5).toISOString();
+await check('F-11 daily recovery also scrubs direct photo uploads before confirmation', async () => {
+    reset(); const o = seedOrder(); const f = seedFile(o, { filename: 'photo.jpg', created_at: dayOld });
+    const payload = Buffer.from('Exif\0\0GPS 37.9577N');
+    db.__state.storage.set(f.storage_path, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0, payload.length + 2]), payload,
+        Buffer.from([0xff, 0xda, 1, 2, 3, 0xff, 0xd9])]));
+    const response = await cron();
+    const stored = Buffer.from(db.__state.storage.get(f.storage_path));
+    expect(response.status === 200 && fileRow(f.id)?.uploaded, 'daily recovery did not confirm cleaned photo');
+    expect(!stored.includes(Buffer.from('GPS')) && fileRow(f.id).sha256 === core.sha256(stored), 'daily recovery kept GPS data or wrong hash');
+});
 await check('F-04 daily cleanup keeps a file row when storage cannot be reached', async () => {
     reset(); const o = seedOrder(); const f = seedFile(o, { created_at: dayOld });
     db.__state.failExists.add(f.storage_path);
@@ -428,6 +780,72 @@ const webhook = (session) => webhookPOST(new Request('https://site.test/api/stri
     body: JSON.stringify({ type: 'checkout.session.completed', data: { object: session } }),
 }));
 const reviewEvents = (o) => events(o.id).filter(e => e.kind === 'payment' && !e.client_visible);
+await check('a PWM-Dev sale on the shared Stripe account is acknowledged without touching any order or emailing Nick', async () => {
+    reset();
+    const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 10000 });
+    const before = JSON.stringify(tables());
+    for (const type of ['checkout.session.completed', 'checkout.session.async_payment_succeeded']) {
+        const res = await webhookPOST(new Request('https://site.test/api/stripe-webhook', {
+            method: 'POST', headers: { 'stripe-signature': 'fake' },
+            body: JSON.stringify({ type, data: { object: { id: 'cs_test_pwmorigin1', payment_status: 'paid', amount_total: 55000, metadata: { offer: 'origin', client_site: 'example.com' } } } }),
+        }));
+        expect(res.status === 200, `${type} from another site returned ${res.status}, so Stripe would keep retrying`);
+    }
+    expect(JSON.stringify(tables()) === before && !o.paid_at, 'a foreign session changed NickWeb data');
+    expect(emails.length === 0, `a foreign session emailed ${emails.length} time(s)`);
+});
+const stripeEventPOST = (type, object) => webhookPOST(new Request('https://site.test/api/stripe-webhook', {
+    method: 'POST', headers: { 'stripe-signature': 'fake' }, body: JSON.stringify({ type, data: { object } }),
+}));
+const disputeEvents = (o) => events(o.id).filter(e => e.kind === 'payment' && !e.client_visible && /disputed|Fraud warning/.test(e.title));
+await check('a dispute on one of Nick\'s payments emails him once, with the respond-by date, and is recorded privately', async () => {
+    reset();
+    const o = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 12500 });
+    stripeIntents.set('pi_test_nick1', { id: 'pi_test_nick1', metadata: { order_id: o.id, order_code: o.code } });
+    const dispute = { id: 'dp_test_1', object: 'dispute', payment_intent: 'pi_test_nick1', amount: 12500, reason: 'product_not_received', evidence_details: { due_by: 1796000000 } };
+    expect((await stripeEventPOST('charge.dispute.created', dispute)).status === 200, 'dispute webhook failed');
+    expect((await stripeEventPOST('charge.dispute.created', dispute)).status === 200, 'redelivered dispute failed');
+    const alerts = emails.filter(e => /a payment was disputed/.test(e.subject));
+    expect(alerts.length === core.ADMIN_EMAILS.length, `dispute emailed ${alerts.length} time(s)`);
+    expect(/Respond in Stripe before/.test(alerts[0].text) && /product not received/.test(alerts[0].text), 'alert lacks the deadline or reason');
+    expect(disputeEvents(o).length === 1 && !events(o.id).some(e => e.client_visible && /disput/i.test(e.title)), 'dispute not recorded once, privately');
+});
+await check('an early fraud warning on Nick\'s payment is flagged to him', async () => {
+    reset();
+    const o = seedOrder({ paid_at: new Date().toISOString() });
+    stripeIntents.set('pi_test_nick2', { id: 'pi_test_nick2', metadata: { order_id: o.id } });
+    await stripeEventPOST('radar.early_fraud_warning.created', { id: 'issfr_test_1', payment_intent: 'pi_test_nick2', fraud_type: 'made_with_stolen_card' });
+    const alert = emails.find(e => /flagged as possible fraud/.test(e.subject));
+    expect(alert && disputeEvents(o).length === 1, 'fraud warning not flagged');
+    expect(!/\$0\.00/.test(alert.text) && /flagged a payment on/.test(alert.text), 'fraud warning invents an amount');
+});
+await check('a dispute on another site\'s payment (shared Stripe account) is ignored without error', async () => {
+    reset();
+    const o = seedOrder();
+    stripeIntents.set('pi_test_pwm', { id: 'pi_test_pwm', metadata: { offer: 'origin' } });
+    const before = JSON.stringify(tables());
+    for (const type of ['charge.dispute.created', 'radar.early_fraud_warning.created']) {
+        expect((await stripeEventPOST(type, { id: `x_${type}`, payment_intent: 'pi_test_pwm', amount: 55000 })).status === 200, `${type} from another site failed`);
+    }
+    expect((await stripeEventPOST('charge.dispute.created', { id: 'dp_test_none', amount: 100 })).status === 200, 'a dispute with no payment intent failed');
+    expect(JSON.stringify(tables()) === before && emails.length === 0 && disputeEvents(o).length === 0, 'another site\'s dispute touched NickWeb');
+});
+await check('if the dispute alert cannot be emailed, nothing is recorded and Stripe is asked to retry', async () => {
+    reset(); resendUp = false;
+    const o = seedOrder({ paid_at: new Date().toISOString() });
+    stripeIntents.set('pi_test_nick3', { id: 'pi_test_nick3', metadata: { order_id: o.id } });
+    const dispute = { id: 'dp_test_3', payment_intent: 'pi_test_nick3', amount: 7500, reason: 'fraudulent' };
+    const first = await stripeEventPOST('charge.dispute.created', dispute);
+    expect(first.status >= 500 && disputeEvents(o).length === 0, `status ${first.status}, entries ${disputeEvents(o).length}`);
+    resendUp = true;
+    expect((await stripeEventPOST('charge.dispute.created', dispute)).status === 200 && disputeEvents(o).length === 1, 'retry did not alert Nick');
+});
+await check('a Stripe outage while looking up a disputed payment makes Stripe retry', async () => {
+    reset();
+    stripeIntents.set('pi_test_down', new Error('Stripe unavailable'));
+    const res = await stripeEventPOST('charge.dispute.created', { id: 'dp_test_4', payment_intent: 'pi_test_down', amount: 100 });
+    expect(res.status >= 500, `status ${res.status}`);
+});
 await check('F-05 a paid, replaced payment link is flagged once for Nick (and emailed)', async () => {
     reset();
     const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 10000, stripe_session_id: 'cs_test_newlink123' });
@@ -658,7 +1076,8 @@ await check('P2 clients can send a note on any open request; it flags "Client re
     const r = await track(o, { action: 'respond', reply: 'They work nights, try after 8 PM.' });
     expect(r.status === 200, `note refused (${r.status} ${await r.clone().text()})`);
     expect(tables().orders[0].status === 'attempting', 'status changed');
-    expect(evs(o).some(e => e.kind === 'action_response' && e.title === 'You sent Nick a note'), 'no note entry');
+    // A note that answers no question is a client_message (20261104000300), so only answers can change the order.
+    expect(evs(o).some(e => e.kind === 'client_message' && e.title === 'You sent Nick a message'), 'no note entry');
     expect((tables().client_audit_logs || []).some(l => l.action === 'reply'), 'reply not logged');
     const list = await (await adminAct({ action: 'list' }, adminCookie())).json();
     expect(list.orders[0].client_replied === true, 'no Client replied flag');
@@ -695,17 +1114,20 @@ await check('P2 only Nick\'s own entries count as contact, and his shared note c
 });
 await check('P2 an expired, unpaid payment link can be renewed from the tracking page; a live one cannot', async () => {
     reset(); const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_oldsession1', payment_url: 'https://checkout.stripe.com/c/pay/cs_test_oldsession1' });
-    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'open', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    // Renewal checks the old session's order and amount with Stripe before replacing it, so the fixture carries both.
+    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'open', payment_status: 'unpaid', metadata: { order_id: o.id },
+        amount_total: 9000, expires_at: Math.floor(Date.now() / 1000) + 3600 });
     expect((await track(o, { action: 'renew-payment' })).status === 409, 'renewed a link that still works');
     stripeSessions.get('cs_test_oldsession1').status = 'expired';
     const r = await (await track(o, { action: 'renew-payment' })).json();
     expect(tables().orders[0].stripe_session_id !== 'cs_test_oldsession1' && /^https:\/\/checkout\.stripe\.com\//.test(r.payUrl || ''), `not renewed: ${JSON.stringify(r).slice(0, 200)}`);
 });
 await check('P2 the receipt appears once paid, and never on a locked page', async () => {
-    reset(); const paid = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 9000, status: 'paid', case_number: 'CV-1', court: 'LA Superior' });
+    // A receipt shows the amount Stripe captured (paid_amount_cents, 20261104000200).
+    reset(); const paid = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 9000, paid_amount_cents: 9000, status: 'paid', case_number: 'CV-1', court: 'LA Superior' });
     const v = await (await track(paid, { action: 'view' })).json();
     expect(v.receipt?.amountPaid === '$90.00' && v.receipt.caseNumber === 'CV-1', JSON.stringify(v.receipt));
-    reset(); const locked = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 9000, status: 'paid', doc_lock: true });
+    reset(); const locked = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 9000, paid_amount_cents: 9000, status: 'paid', doc_lock: true });
     expect((await (await track(locked, { action: 'view' })).json()).receipt === null, 'receipt shown on a locked page');
 });
 
@@ -935,7 +1357,7 @@ await check('PORT-3 the 64 KB request limit counts bytes, so multi-byte text can
 });
 await check('PORT-4 portal receipt and proof links stay inside the client\'s own requests', async () => {
     reset(); db.__addUser(CLIENT);
-    const mine = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 7500 });
+    const mine = seedOrder({ paid_at: new Date().toISOString(), amount_due_cents: 7500, paid_amount_cents: 7500 });
     const theirs = seedOrder({ id: randomUUID(), code: 'NP-654321', client_email: 'other@example.com', paid_at: new Date().toISOString(), track_token: 'U'.repeat(32) });
     (tables().order_files ||= []).push(
         { id: randomUUID(), order_id: mine.id, kind: 'proof', filename: 'mine.pdf', storage_path: 'p/mine.pdf', uploaded: true, sha256: 'c'.repeat(64) },
@@ -963,22 +1385,22 @@ await check('R-01 the daily digest goes out once a day, however often the cleanu
 });
 await check('R-02 two renewals at once leave one live payment link and one timeline entry', async () => {
     reset(); const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_oldsession1', payment_url: 'https://checkout.stripe.com/c/pay/cs_test_oldsession1' });
-    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id }, amount_total: 9000 });
     await Promise.all([track(o, { action: 'renew-payment' }), track(o, { action: 'renew-payment' })]);
-    const created = events(o.id).filter(e => e.title === 'New payment link created').length;
+    const created = events(o.id).filter(e => e.title.startsWith('Payment link renewed')).length;
     const live = [...stripeSessions.values()].filter(s => s.id !== 'cs_test_oldsession1' && s.status === 'open');
-    expect(created === 1, `${created} "New payment link created" entries`);
+    expect(created === 1, `${created} "Payment link renewed" entries`);
     expect(live.length === 1 && live[0].id === tables().orders[0].stripe_session_id, `${live.length} open links; stored ${tables().orders[0].stripe_session_id}`);
 });
 await check('R-02b a double-click that Stripe answers with one session keeps that session open and on the order', async () => {
     reset(); stripeIdempotency = true;
     const o = seedOrder({ status: 'awaiting_payment', amount_due_cents: 9000, stripe_session_id: 'cs_test_oldsession1', payment_url: 'https://checkout.stripe.com/c/pay/cs_test_oldsession1' });
-    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id } });
+    stripeSessions.set('cs_test_oldsession1', { id: 'cs_test_oldsession1', status: 'expired', payment_status: 'unpaid', metadata: { order_id: o.id }, amount_total: 9000 });
     await Promise.all([track(o, { action: 'renew-payment' }), track(o, { action: 'renew-payment' })]);
     const stored = stripeSessions.get(tables().orders[0].stripe_session_id);
-    const created = events(o.id).filter(e => e.title === 'New payment link created').length;
+    const created = events(o.id).filter(e => e.title.startsWith('Payment link renewed')).length;
     expect(stored && stored.id !== 'cs_test_oldsession1' && stored.status === 'open', `the only live link was ${stored?.status}`);
-    expect(created === 1, `${created} "New payment link created" entries`);
+    expect(created === 1, `${created} "Payment link renewed" entries`);
 });
 const stripeEvent = (id, type, object) => webhookPOST(new Request('https://site.test/api/stripe-webhook', {
     method: 'POST', headers: { 'stripe-signature': 'fake' }, body: JSON.stringify({ id, type, data: { object } }),
@@ -998,6 +1420,21 @@ await check('R-03 a refund or dispute on a paid order is flagged once for Nick, 
     paymentIntents.set('pi_other', { id: 'pi_other', metadata: {} });
     const r = await stripeEvent('evt_refund_2', 'charge.refunded', { id: 'ch_test_2', payment_intent: 'pi_other', amount_refunded: 100 });
     expect(r.status === 200, `a refund for an unknown order answered ${r.status}`);
+});
+await check('R-03b two partial refunds on one charge each reach Nick; a redelivered dispute event for the same dispute does not', async () => {
+    reset();
+    const o = seedOrder({ status: 'paid', paid_at: new Date().toISOString(), amount_due_cents: 9000, stripe_session_id: 'cs_test_paidsession1' });
+    paymentIntents.set('pi_test_123', { id: 'pi_test_123', metadata: { order_id: o.id } });
+    // Same charge, two refund events (Stripe sends charge.refunded for each partial refund, with the running total).
+    await stripeEvent('evt_refund_part1', 'charge.refunded', { id: 'ch_test_1', object: 'charge', payment_intent: 'pi_test_123', amount_refunded: 3000 });
+    await stripeEvent('evt_refund_part2', 'charge.refunded', { id: 'ch_test_1', object: 'charge', payment_intent: 'pi_test_123', amount_refunded: 9000 });
+    const refunds = reviewEvents(o).filter(e => /refund/i.test(e.title));
+    expect(refunds.length === 2, `${refunds.length} refund entries for two partial refunds`);
+    // One dispute delivered under two event ids (dispute created, then Stripe's own redelivery) is one alert.
+    const dispute = { id: 'dp_test_9', object: 'dispute', payment_intent: 'pi_test_123', amount: 9000, reason: 'fraudulent' };
+    await stripeEvent('evt_dispute_a', 'charge.dispute.created', dispute);
+    await stripeEvent('evt_dispute_b', 'charge.dispute.created', dispute);
+    expect(reviewEvents(o).filter(e => /disput/i.test(e.title)).length === 1, 'one dispute alerted twice');
 });
 
 await check('R-04 a tracking link cannot download a file that belongs to another order', async () => {
@@ -1085,18 +1522,24 @@ await check('R-12 the confirmation emails go out once, even when the browser fin
     expect(!emails.length, 'a two-hour-old order sent confirmation emails again');
 });
 
-await check('R-02c two payment links asked for seconds apart in the same minute send Stripe identical requests', async () => {
+// One Stripe idempotency key per create attempt (api/_lib/stripe.mjs). A retry of that attempt sends the same key with
+// identical parameters; two requests a few seconds apart never share a key, so Stripe never sees a reused key with
+// different parameters (which it refuses) and never hands both the same session. Every caller saves its session with a
+// compare-and-swap and closes it if it loses (R-02, R-02b).
+await check('R-02c each payment-link request gets its own Stripe key; a retry of one keeps its key and parameters', async () => {
     const { checkoutParams } = await import('../api/_lib/stripe.mjs');
     const order = { id: randomUUID(), code: 'NP-123456', client_email: CLIENT, track_token: 'T'.repeat(32) };
     const minute = Math.floor(Date.now() / 60000) * 60000;
-    const a = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 2000);
-    const b = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 55000);
-    expect(a.options.idempotencyKey === b.options.idempotencyKey, 'keys differ within one minute');
-    expect(JSON.stringify(a.params) === JSON.stringify(b.params), `parameters differ (expires_at ${a.params.expires_at} vs ${b.params.expires_at}), so Stripe would refuse the second`);
-    const c = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 61000);
-    expect(c.options.idempotencyKey !== a.options.idempotencyKey, 'the next minute reused the key');
+    const a = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 2000, 'attempt-1');
+    const retry = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 2000, 'attempt-1');
+    expect(a.options.idempotencyKey === retry.options.idempotencyKey && JSON.stringify(a.params) === JSON.stringify(retry.params), 'a retried attempt changed its key or parameters');
+    const b = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 5000);
+    const c = checkoutParams(order, 9000, 'Standard', 'https://site.test', minute + 5000);
+    expect(new Set([a, b, c].map(x => x.options.idempotencyKey)).size === 3, 'two separate requests shared a Stripe key');
 });
-await check('R-12b if the confirmation marker cannot be written, a retry still sends the emails', async () => {
+// Emails go out before the marker is written (a failed delivery stays retryable: 'request confirmation can retry after
+// Resend rejects delivery'). If only the marker fails, the call errors but keeps its claim, so no one is emailed twice.
+await check('R-12b if the confirmation marker cannot be written, each recipient is still emailed exactly once', async () => {
     reset();
     const { POST: requestPOST } = await import('../api/request.mjs');
     const created = await (await requestPOST(post('/api/request', requestForm()))).json();
@@ -1113,7 +1556,7 @@ await check('R-12b if the confirmation marker cannot be written, a retry still s
     };
     try {
         const first = await requestPOST(post('/api/request', { step: 'finish', t: created.token, fileIds: [] }));
-        expect(first.status >= 500 && !emails.length, `first finish answered ${first.status} with ${emails.length} emails`);
+        expect(first.status >= 500, `the marker failure was hidden (first finish answered ${first.status})`);
     } finally { db.from = realFrom; }
     await requestPOST(post('/api/request', { step: 'finish', t: created.token, fileIds: [] }));
     expect(emails.filter(e => e.to.includes(CLIENT)).length === 1, 'the retry did not email the client');

@@ -1,6 +1,8 @@
 // Server copy of the browser's photo cleaner (assets/js/nps.js), so a photo uploaded without the site's own page (for
 // example straight to its signed storage link) still loses its GPS location and other hidden metadata. Keep the two in
 // step: scripts/check-photo-metadata.mjs runs both on the same photos and fails if their output ever differs.
+// Returns null when a container cannot be parsed (truncated, trailing data, no image data); callers refuse the photo
+// rather than store it with its metadata.
 const join = (chunks) => {
     const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
     let offset = 0;
@@ -15,13 +17,17 @@ function stripPng(buf) {
     const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const chunks = [buf.subarray(0, 8)];
     let pos = 8;
+    let sawEnd = false;
     while (pos + 12 <= buf.length) {
         const len = view.getUint32(pos);
         const end = pos + 12 + len;
         if (end > buf.length) return null;
-        if (!['eXIf', 'tEXt', 'iTXt', 'zTXt', 'tIME'].includes(ascii(buf, pos + 4, 4))) chunks.push(buf.subarray(pos, end));
+        const id = ascii(buf, pos + 4, 4);
+        if (!['eXIf', 'tEXt', 'iTXt', 'zTXt', 'tIME'].includes(id)) chunks.push(buf.subarray(pos, end));
         pos = end;
+        if (id === 'IEND') { sawEnd = true; break; }
     }
+    if (!sawEnd || pos !== buf.length) return null;
     return join(chunks);
 }
 
@@ -39,6 +45,7 @@ function stripWebp(buf) {
         else if (id !== 'EXIF' && id !== 'XMP ') chunks.push(buf.subarray(pos, end));
         pos = end;
     }
+    if (pos !== buf.length) return null;
     const out = join(chunks);
     new DataView(out.buffer).setUint32(4, out.length - 8, true);
     return out;
@@ -88,19 +95,26 @@ function wipeIsoGps(buf) {
         const mm = out[i] === 0x4D && out[i + 1] === 0x4D && out[i + 2] === 0 && out[i + 3] === 0x2A;
         if (!ii && !mm) continue;
         let ranges = null;
-        try { ranges = gpsRanges(out, i); } catch { /* not EXIF */ }
+        try { ranges = gpsRanges(out, i); } catch { /* malformed EXIF */ }
+        if (!ranges) {
+            const near = out.subarray(i, Math.min(out.length, i + 4096));
+            for (let j = 0; j + 1 < near.length; j++) {
+                if ((near[j] === 0x25 && near[j + 1] === 0x88) || (near[j] === 0x88 && near[j + 1] === 0x25)) return null;
+            }
+        }
         for (const [at, len] of ranges || []) out.fill(0, at, at + len);
     }
     const xmp = new TextDecoder('latin1').decode(out);
     for (let at = xmp.indexOf('<x:xmpmeta'); at !== -1; at = xmp.indexOf('<x:xmpmeta', at + 1)) {
         const end = xmp.indexOf('</x:xmpmeta>', at);
-        if (end !== -1) out.fill(0x20, at, end + 12);
+        if (end === -1) return null;
+        out.fill(0x20, at, end + 12);
     }
     return out;
 }
 
-// Returns cleaned bytes for a photo type, or null to upload the original (unknown type or unexpected structure).
-function stripPhotoBytes(buf, type) {
+// Returns cleaned bytes for a photo type, or null (unknown type or a structure that can't be cleaned safely).
+export function stripPhotoBytes(buf, type) {
     if (type === 'image/png') return stripPng(buf);
     if (type === 'image/webp') return stripWebp(buf);
     if (type === 'image/heic' || type === 'image/heif') return wipeIsoGps(buf);
@@ -113,10 +127,12 @@ function stripJpeg(buf) {
     if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) return null;
     const chunks = [buf.subarray(0, 2)];
     let pos = 2;
+    let sawImage = false;
     while (pos + 4 <= buf.length && buf[pos] === 0xFF) {
         const marker = buf[pos + 1];
         if (marker === 0xDA || marker === 0xD9) {
             chunks.push(buf.subarray(pos));
+            sawImage = true;
             break;
         }
         if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
@@ -126,8 +142,7 @@ function stripJpeg(buf) {
         }
         const segLen = (buf[pos + 2] << 8) | buf[pos + 3];
         if (segLen < 2 || pos + 2 + segLen > buf.length) {
-            chunks.push(buf.subarray(pos));
-            break;
+            return null;
         }
         // Drop APP1 (0xE1: EXIF/GPS/XMP) and COM (0xFE: comments)
         if (marker !== 0xE1 && marker !== 0xFE) {
@@ -135,10 +150,9 @@ function stripJpeg(buf) {
         }
         pos += 2 + segLen;
     }
-    return join(chunks);
+    return sawImage ? join(chunks) : null;
 }
 
-export { stripPhotoBytes };
 
 const PHOTO_TYPES = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif' };
 export const photoType = (filename) => PHOTO_TYPES[String(filename || '').split('.').pop().toLowerCase()] || null;

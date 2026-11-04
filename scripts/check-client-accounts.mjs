@@ -1,10 +1,20 @@
 // Account boundaries in the isolated mock plus the production identity/cookie helpers. No network or live data.
 import assert from 'node:assert/strict';
-import { handleMockApi } from './mock-api.mjs';
+import { handleMockApi, handleMockRoute } from './mock-api.mjs';
 import { verifiedClient, clientCookie, savedClientSession, clientProfile } from '../api/_lib/clients.mjs';
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
 const call = async (body, cookie = '', endpoint = 'client') => handleMockApi(endpoint, new Request(`http://localhost/api/${endpoint}`, { method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify(body) }));
+function zipJson(bytes) {
+    for (let at = 0; bytes.readUInt32LE(at) === 0x04034b50;) {
+        const size = bytes.readUInt32LE(at + 18), nameSize = bytes.readUInt16LE(at + 26), extraSize = bytes.readUInt16LE(at + 28);
+        const name = bytes.subarray(at + 30, at + 30 + nameSize).toString();
+        const begin = at + 30 + nameSize + extraSize;
+        if (name === 'evidence.json') return JSON.parse(bytes.subarray(begin, begin + size).toString());
+        at = begin + size;
+    }
+    throw new Error('JSON missing from ZIP');
+}
 const signup = async addr => {
     assert.equal((await call({ action:'send-code', intent:'signup', email:addr, name:'Demo Client', firm:'Test Firm' })).status,200);
     const response = await call({ action:'verify-code', email:addr, code:'123456' });
@@ -25,6 +35,22 @@ assert.equal((await call({action:'verify-code',email:'fresh@example.com',code:'0
 const a=await signup('paralegal@example.com');
 const all=await (await call({action:'list'},a)).json();
 check('verified sample email sees its five requests',()=>assert.equal(all.orders.length,5));
+const expiredOrder = all.orders.find(o => o.code === 'NP-403182');
+const expiredToken = new URL(expiredOrder.trackUrl, 'http://localhost').hash.slice(3);
+const expiredView = await (await call({ action: 'view', t: expiredToken }, '', 'track')).json();
+check('expired payment link is withheld from tracking view', () => {
+    assert.equal(expiredView.paymentExpired, true);
+    assert.equal(expiredView.payUrl, null);
+    assert.equal(expiredView.canRenewPayment, true);
+});
+const renewedView = await (await call({ action: 'renew-payment-link', t: expiredToken }, '', 'track')).json();
+check('client renews expired mock link for the same amount', () => {
+    assert.equal(renewedView.amountDue, '$175.00');
+    assert.match(renewedView.payUrl, /^\/__mock-pay/);
+    assert.equal(renewedView.paymentExpired, false);
+});
+assert.equal((await call({ action: 'renew-payment-link', t: expiredToken }, '', 'track')).status, 409);
+passed++; console.log('PASS active link cannot be renewed again');
 const b=await signup('unrelated@example.com');
 const empty=await (await call({action:'list',email:'paralegal@example.com',userId:'another-client'},b)).json();
 check('a different client cannot override ownership using body fields',()=>assert.equal(empty.orders.length,0));
@@ -79,9 +105,41 @@ check('logout-all invalidates all active admin sessions for that admin', () => {
 
 const nickLogin = await call({ action: 'verify-code', email: 'nicksprocessservices@outlook.com', code: '12345678' }, '', 'admin');
 const nickCookie = nickLogin.headers.get('set-cookie').split(';')[0];
+const brokenLink = await (await call({ action: 'list' }, nickCookie, 'admin')).json();
+const paymentJob = brokenLink.orders.find(o => o.code === 'NP-403182');
+const firstLink = await (await call({ action: 'get', id: paymentJob.id }, nickCookie, 'admin')).json();
+const replacedLink = await call({ action: 'payment-link', id: paymentJob.id, amount: '175.00' }, nickCookie, 'admin');
+assert.equal(replacedLink.status, 200);
+const afterReplace = await (await call({ action: 'get', id: paymentJob.id }, nickCookie, 'admin')).json();
+assert.notEqual(firstLink.order.stripe_session_id, afterReplace.order.stripe_session_id);
+assert.equal((await handleMockRoute(new Request(`http://localhost${firstLink.order.payment_url}`))).status, 410);
+passed++; console.log('PASS mock payment link replacement invalidates the old session');
 const listData = await (await call({ action: 'list' }, nickCookie, 'admin')).json();
+// Last contact is Nick's newest entry the client can see (list_order_activity), or null when he hasn't updated the
+// client yet (the dashboard shows that in red). It is never before the request was made.
+check('mock active jobs carry Nick\'s last client contact (or null before his first update)', () => {
+    const active = listData.orders.filter(o => !['served', 'closed', 'cancelled'].includes(o.status));
+    assert.ok(active.every(o => 'last_contact_at' in o && (o.last_contact_at === null ||
+        (Number.isFinite(Date.parse(o.last_contact_at)) && o.last_contact_at >= o.created_at))));
+    assert.ok(active.some(o => o.last_contact_at !== null), 'no active demo job shows a contact date');
+});
 const servedOrder = listData.orders.find(o => o.code === 'NP-894771');
 const detailData = await (await call({ action: 'get', id: servedOrder.id }, nickCookie, 'admin')).json();
+check('mock admin printing summary counts client PDFs but excludes proof', () => {
+    assert.equal(detailData.printing.pages, 1);
+    assert.equal(detailData.printing.pdfs, 1);
+    assert.equal(detailData.printing.feeCents, 0);
+    assert.equal(detailData.printing.complete, true);
+});
+const accountReceipt = await (await call({ action: 'receipt', code: servedOrder.code }, a)).json();
+check('mock receipt is itemized and uses the recorded captured amount', () => {
+    assert.equal(accountReceipt.receipt.amountPaidCents, 14000);
+    assert.equal(accountReceipt.receipt.items.reduce((sum, item) => sum + item.cents, 0), 14000);
+    assert.equal(detailData.order.receipt.amountPaidCents, 14000);
+});
+const otherReceiptCookie = await signup('receipt-other@example.com');
+assert.equal((await call({ action: 'receipt', code: servedOrder.code }, otherReceiptCookie)).status, 404);
+passed++; console.log('PASS mock receipt cannot be fetched by another client');
 const proofFile = detailData.files.find(f => f.kind === 'proof');
 check('Proof of Service has a verified 64-char SHA-256 chain-of-custody fingerprint in admin view', () => {
     assert.ok(proofFile && /^[0-9a-f]{64}$/.test(proofFile.sha256));
@@ -92,6 +150,36 @@ const trackData = await (await call({ action: 'view', t: detailData.order.track_
 check('Proof of Service exposes matching SHA-256 fingerprint on client tracking view', () => {
     const clientProof = trackData.files.find(f => f.kind === 'proof');
     assert.equal(clientProof?.sha256, proofFile.sha256);
+});
+await call({ action: 'download', t: detailData.order.track_token, fileId: proofFile.id }, '', 'track');
+const mockPackResponse = await call({ action: 'dispute-pack', id: servedOrder.id }, nickCookie, 'admin');
+const mockPack = zipJson(Buffer.from(await mockPackResponse.arrayBuffer()));
+check('mock dispute pack includes verified file and client download evidence', () => {
+    assert.equal(mockPackResponse.headers.get('content-type'), 'application/zip');
+    assert.equal(mockPack.files.find(f => f.kind === 'proof')?.sha256, proofFile.sha256);
+    // client_audit_logs (20261030061450) names the downloaded file; it has no file id column.
+    assert.ok(mockPack.downloads.some(d => d.filename === proofFile.filename));
+    assert.ok(mockPack.client_activity.some(a => a.action === 'download' && a.detail === proofFile.filename));
+    assert.equal(mockPack.chain.verified, true);
+    assert.ok(mockPack.attestation?.created_at && mockPack.payment.stripe_session_id);
+    assert.equal(mockPack.order.track_token, undefined);
+});
+const finishBody = { step: 'finish', t: detailData.order.track_token, fileIds: [] };
+assert.equal((await call(finishBody, '', 'request')).status, 200);
+assert.equal((await call(finishBody, '', 'request')).status, 200);
+const afterFinish = await (await call({ action: 'get', id: servedOrder.id }, nickCookie, 'admin')).json();
+check('mock request finish records one confirmation when retried', () => {
+    assert.equal(afterFinish.events.filter(e => e.title === 'Confirmation emailed').length, 1);
+});
+const fieldJob = listData.orders.find(o => o.code === 'NP-517309');
+const attemptWhen = new Date(Date.now() - 3600e3).toISOString();
+const recorded = await call({ action: 'update', id: fieldJob.id, kind: 'attempt', outcome: 'No answer', when: attemptWhen }, nickCookie, 'admin');
+const rejected = await call({ action: 'update', id: fieldJob.id, kind: 'attempt', outcome: 'No answer', when: 'yesterday' }, nickCookie, 'admin');
+const attemptDetail = await (await call({ action: 'get', id: fieldJob.id }, nickCookie, 'admin')).json();
+check('mock attempt stores ISO time and rejects ambiguous time', () => {
+    assert.equal(recorded.status, 200);
+    assert.equal(rejected.status, 400);
+    assert.ok(attemptDetail.events.some(e => e.kind === 'attempt' && e.detail?.startsWith(`Attempted at: ${attemptWhen}`)));
 });
 
 console.log(`${passed} client account checks passed`);

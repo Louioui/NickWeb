@@ -65,6 +65,13 @@ function render(o) {
         $('pay-amount').textContent = o.amountDue;
         $('pay-btn').href = safePayUrl;
     }
+    $('renew-payment-panel').classList.toggle('hidden', !o.canRenewPayment);
+    if (o.canRenewPayment) {
+        $('renew-payment-title').textContent = o.paymentExpired ? 'Payment link expired' : 'Check your payment link';
+        $('renew-payment-text').textContent = o.paymentExpired
+            ? `Get a fresh secure Checkout link for the same ${o.amountDue} amount.`
+            : 'If your earlier link has expired, check it here for a fresh one.';
+    }
 
     // The reply box: answering Nick's question, or (on any open, unlocked request) sending him a note or a file.
     const answering = !!o.actionNote;
@@ -99,7 +106,7 @@ function render(o) {
         <li>
             <span class="timeline-dot ${DOT[ev.kind] ?? ''}"></span>
             <p class="text-sm font-semibold text-ink">${esc(ev.title)}</p>
-            ${ev.detail ? `<p class="text-sm text-muted mt-0.5 whitespace-pre-line">${esc(ev.detail)}</p>` : ''}
+            ${ev.detail ? `<p class="text-sm text-muted mt-0.5 whitespace-pre-line">${esc(ev.kind === 'attempt' ? NPS.fmtAttemptDetail(ev.detail) : ev.detail)}</p>` : ''}
             <p class="text-[11px] text-muted mt-1">${esc(NPS.fmtDate(ev.created_at))}</p>
         </li>`).join('');
 }
@@ -129,7 +136,7 @@ async function load() {
             render(o);
             const banner = $('paid-banner');
             banner.innerHTML = o.paidAt
-                ? '<i class="fa-solid fa-circle-check mr-1"></i> <strong>Thank you, your payment was received.</strong> A receipt is on its way to your email.'
+                ? '<i class="fa-solid fa-circle-check mr-1"></i> <strong>Thank you, your payment was received.</strong> Open your printable receipt below when available.'
                 : '<i class="fa-solid fa-clock mr-1"></i> Your payment is processing. This page will update once it clears.';
             banner.classList.remove('hidden');
             return;
@@ -154,20 +161,18 @@ document.addEventListener('click', async (e) => {
     } catch (err) { show(false, err.message); }
     finally { btn.disabled = false; }
 });
-$('renew-pay').addEventListener('click', async () => {
-    const btn = $('renew-pay'), msg = $('renew-pay-msg');
-    btn.disabled = true;
-    try {
-        const o = await trackCall({ action: 'renew-payment' });
-        render(o);
-        msg.className = 'result-box result-ok text-sm mt-3';
-        msg.textContent = o.paidAt ? 'Your payment was already received.' : 'Here is a new payment link. It works for 24 hours.';
-    } catch (err) {
-        msg.className = 'result-box result-warn text-sm mt-3';
-        msg.textContent = err.message;
-    } finally { btn.disabled = false; }
-});
 $('receipt-btn').addEventListener('click', () => { if (lastView?.receipt) NPS.printReceipt(lastView.receipt); });
+
+$('renew-payment-btn').addEventListener('click', async () => {
+    const button = $('renew-payment-btn'), feedback = $('renew-payment-feedback');
+    button.disabled = true; feedback.classList.remove('hidden'); feedback.textContent = 'Checking the payment link…';
+    try {
+        const updated = await trackCall({ action: 'renew-payment-link' });
+        render(updated);
+        feedback.textContent = 'A fresh payment link is ready. Use Pay Securely above.';
+    } catch (err) { feedback.textContent = err.message || 'Could not renew the link. Try again shortly.'; }
+    finally { button.disabled = false; }
+});
 
 document.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-file]');
@@ -182,6 +187,25 @@ document.addEventListener('click', async (e) => {
     } finally {
         btn.disabled = false;
     }
+});
+
+document.addEventListener('click', async (e) => {
+    const button = e.target.closest('[data-verify]');
+    if (!button) return;
+    const file = order?.files.find(f => f.id === button.dataset.verify);
+    const result = button.parentElement.querySelector('[data-integrity-result]');
+    if (!file || !result || !/^[0-9a-f]{64}$/.test(file.sha256 || '')) return;
+    button.disabled = true;
+    result.textContent = 'Checking file bytes…';
+    try {
+        const { url } = await trackCall({ action: 'download', fileId: file.id }, { notify: false });
+        const verification = await NPS.verifyFileSha256(url, file.sha256);
+        result.textContent = verification.ok ? 'Matches sealed record' : 'File does not match the recorded fingerprint. Contact Nick.';
+        result.className = verification.ok ? 'text-xs text-primary font-semibold' : 'text-xs text-[#7a1f1c] font-semibold';
+    } catch (err) {
+        result.textContent = err.message || 'Could not verify the file. Please try again.';
+        result.className = 'text-xs text-[#7a1f1c]';
+    } finally { button.disabled = false; }
 });
 
 $('lock-send').addEventListener('click', async () => {
@@ -246,7 +270,7 @@ $('action-form').addEventListener('submit', async (e) => {
             ? `Your reply was sent, but ${done.filesMissing} file(s) didn't arrive. Please send them again or call Nick at (209) 922-6817.`
             : done.filesStillChecking
             ? `Your reply was sent. ${done.filesStillChecking} file(s) are still being checked and will appear on your request once they are; Nick has been told.`
-            : 'Your reply was sent to Nick. Your request is ready for his review; there’s nothing else you need to do right now.';
+            : 'Your message was sent to Nick. You can continue following your request here.';
         window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
         errBox.textContent = err.message;

@@ -1,4 +1,5 @@
-// POST /api/stripe-webhook — Stripe tells us a checkout was paid. The signature check needs the raw body.
+// POST /api/stripe-webhook — Stripe tells us a checkout was paid, or a payment was disputed. The signature check needs
+// the raw body.
 import { handle, json, HttpError } from './_lib/core.mjs';
 import { markPaid, flagUnappliedPayment, flagPaymentReversal } from './_lib/orders.mjs';
 import { stripeClient } from './_lib/stripe.mjs';
@@ -20,18 +21,22 @@ export const POST = handle(async (request) => {
         if (s.payment_status === 'paid' && s.metadata?.order_id && !(await markPaid(s.metadata.order_id, s.amount_total, s.id))) {
             await flagUnappliedPayment(s.metadata.order_id, s.amount_total, s.id);
         }
-    } else if (event.type === 'charge.refunded' || event.type === 'charge.dispute.created') {
-        // Both carry the PaymentIntent, whose metadata names the order (set in checkoutParams). Requires these two
-        // event types to be ticked on the webhook endpoint in Stripe's dashboard.
+    } else if (event.type === 'charge.refunded' || event.type === 'charge.dispute.created' || event.type === 'radar.early_fraud_warning.created') {
+        // All three carry the PaymentIntent, whose metadata names the order (set in checkoutParams); payments without
+        // one belong to the other site on the shared Stripe account. Requires these event types to be ticked on the
+        // webhook endpoint in Stripe's dashboard.
         const obj = event.data.object;
         const pi = typeof obj.payment_intent === 'string' ? obj.payment_intent : obj.payment_intent?.id;
         if (pi) {
             const intent = await stripeClient().paymentIntents.retrieve(pi);
             const orderId = intent?.metadata?.order_id;
-            if (typeof orderId === 'string' && /^[0-9a-f-]{36}$/i.test(orderId)) {
-                const dispute = event.type === 'charge.dispute.created';
-                await flagPaymentReversal(orderId, { eventId: event.id, kind: dispute ? 'dispute' : 'refund',
-                    amountCents: dispute ? obj.amount : obj.amount_refunded, reason: dispute ? obj.reason : null });
+            if (typeof orderId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(orderId)) {
+                const kind = event.type === 'charge.refunded' ? 'refund' : event.type === 'charge.dispute.created' ? 'dispute' : 'fraud_warning';
+                // Disputes and warnings dedupe on their own id too (one alert per dispute); a refund only on its event id,
+                // since one charge can be refunded several times (partial refunds) and each should reach Nick.
+                await flagPaymentReversal(orderId, { eventId: event.id, objectId: kind === 'refund' ? null : obj.id, kind,
+                    amountCents: kind === 'refund' ? obj.amount_refunded : kind === 'dispute' ? obj.amount : null,
+                    reason: obj.reason || obj.fraud_type || null, dueBy: obj.evidence_details?.due_by ?? null });
             }
         }
     }

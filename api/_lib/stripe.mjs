@@ -1,6 +1,6 @@
 // Stripe Checkout for an order. Nick sets the final amount; the site's price is only an estimate.
 import Stripe from 'stripe';
-import { HttpError, sha256 } from './core.mjs';
+import { HttpError, sha256, randomToken } from './core.mjs';
 
 let stripe = null;
 export function stripeClient() {
@@ -15,12 +15,13 @@ export function stripeClient() {
     return stripe;
 }
 
-export function checkoutParams(order, amountCents, description, origin, nowMs = Date.now()) {
-    // The expiry is rounded to the same minute as the idempotency key, so a retry within that minute sends identical
-    // parameters. Stripe rejects a reused key whose parameters differ, which made a double-click a few seconds apart fail.
-    const minuteBucket = Math.floor(nowMs / 60000);
-    const expiresAt = minuteBucket * 60 + 86340; // 23h 58m to 23h 59m from now, matching the email copy
-    const idempotencyKey = `nps-checkout-${sha256(`${order.id}:${amountCents}:${description || ''}:${minuteBucket}`)}`;
+export function checkoutParams(order, amountCents, description, origin, nowMs = Date.now(), requestToken = randomToken(12)) {
+    const expiresAt = Math.floor(nowMs / 1000) + 86340; // 23h 59m hard expiry matching email copy
+    // One key per create attempt. A shared (per-minute) key hands concurrent or quick repeat requests the same session:
+    // a link Nick replaces within the same minute would come back already expired, and a request that loses the
+    // compare-and-swap on the order would expire the winner's payable link. Every caller saves the new session with a
+    // compare-and-swap and closes its own session if it loses, so a double-click still leaves one live link.
+    const idempotencyKey = `nps-checkout-${sha256(`${order.id}:${amountCents}:${description || ''}:${requestToken}`)}`;
     return {
         params: {
             mode: 'payment',
@@ -48,4 +49,13 @@ export async function createCheckout(order, amountCents, description, origin) {
     const { params, options } = checkoutParams(order, amountCents, description, origin);
     const session = await stripeClient().checkout.sessions.create(params, options);
     return session;
+}
+
+export function checkoutExpiresAt(session) {
+    const seconds = Number(session?.expires_at);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (!Number.isSafeInteger(seconds) || seconds <= nowSeconds || seconds > nowSeconds + 90000) {
+        throw new HttpError(503, 'Stripe did not provide a valid payment-link expiry. Try again.');
+    }
+    return new Date(seconds * 1000).toISOString();
 }

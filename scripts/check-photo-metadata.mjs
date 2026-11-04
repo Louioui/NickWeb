@@ -1,13 +1,15 @@
 // Loads the real browser helper (assets/js/nps.js) and checks that photo metadata (GPS, EXIF, XMP, text) is removed
 // from JPEG, PNG, WebP and HEIC files before upload, while the image data itself is left as it was.
 import assert from 'node:assert/strict';
+import { createHash, webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('../assets/js/nps.js', import.meta.url), 'utf8');
-const context = { window: {}, TextDecoder, TextEncoder, DataView, Uint8Array, File, fetch: () => {} };
+const context = { window: {}, TextDecoder, TextEncoder, DataView, Uint8Array, File, fetch: () => {}, crypto: webcrypto };
 vm.runInNewContext(`${source}\nthis.NPS = NPS;`, context);
 const { stripPhotoBytes } = context.NPS;
+const { stripPhotoBytes: stripServerPhotoBytes } = await import('../api/_lib/photos.mjs');
 
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -92,6 +94,32 @@ check('Unexpected structure uploads the original instead of a damaged file', () 
     assert.equal(stripPhotoBytes(bytes('not a png at all'), 'image/png'), null);
     assert.equal(stripPhotoBytes(bytes('RIFF\x04\0\0\0XXXX'), 'image/webp'), null);
 });
+check('server scrubber matches browser scrubber for JPEG, PNG, WebP and HEIC', () => {
+    for (const [input, type] of [[jpeg, 'image/jpeg'], [png, 'image/png'], [webp, 'image/webp'], [heic, 'image/heic']]) {
+        assert.deepEqual([...stripServerPhotoBytes(input, type)], [...stripPhotoBytes(input, type)], type);
+    }
+});
+check('server scrubber fails closed on truncated JPEG and PNG containers', () => {
+    assert.equal(stripServerPhotoBytes(bytes([0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff]), 'image/jpeg'), null);
+    assert.equal(stripServerPhotoBytes(png.subarray(0, png.length - 5), 'image/png'), null);
+});
+check('server scrubber rejects malformed HEIC GPS offsets', () => {
+    const malformed = heic.slice();
+    const t = 24 + 6;
+    malformed[t + 4] = 0xff;
+    malformed[t + 5] = 0xff;
+    assert.equal(stripServerPhotoBytes(malformed, 'image/heic'), null);
+});
+const proof = bytes('confirmed proof bytes');
+const fingerprint = createHash('sha256').update(proof).digest('hex');
+context.fetch = async () => new Response(proof);
+const matching = await context.NPS.verifyFileSha256('https://storage.test/proof', fingerprint);
+assert.equal(matching.ok, true);
+context.fetch = async () => new Response(bytes('altered proof bytes'));
+const mismatching = await context.NPS.verifyFileSha256('https://storage.test/proof', fingerprint);
+assert.equal(mismatching.ok, false);
+passed++;
+console.log('PASS in-browser file verifier distinguishes matching from altered bytes');
 
 // The server keeps its own copy of the cleaner (api/_lib/photos.mjs). It must give byte-for-byte the same result.
 const server = await import('../api/_lib/photos.mjs');

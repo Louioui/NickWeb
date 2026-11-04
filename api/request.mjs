@@ -87,24 +87,19 @@ async function finish(request, body) {
     const { files: uploaded, stillChecking, missing } = await confirmUploads(order.id, body.fileIds);
     if (uploaded.length) await addEvent(order.id, 'note', `${uploaded.length} document${uploaded.length === 1 ? '' : 's'} uploaded`);
 
-    // Send each email once, even if the browser calls finish twice.
+    // A completed finish is idempotent; failed delivery must remain retryable.
     const { data: already } = await db().from('order_events').select('id').eq('order_id', order.id).eq('title', 'Confirmation emailed').limit(1);
     if (already?.length) return json({ ok: true });
     // Two finishes at the same moment can both pass that read; the atomic counter lets only one send.
     const confirmBucket = `request-confirm:${order.id}`;
     if (await hitRateLimit(confirmBucket, 86400) > 1) return json({ ok: true });
-    try {
-        await addEvent(order.id, 'note', 'Confirmation emailed', null, false);
-    } catch (err) {
-        // Nothing was sent: give the slot back so the browser's retry can still email the client and Nick.
-        await db().from('rate_limits').delete().eq('bucket', confirmBucket).then(() => {}, () => {});
-        throw err;
-    }
+    // Nothing was sent: give the slot back so the browser's retry can still email the client and Nick.
+    const releaseSlot = () => db().from('rate_limits').delete().eq('bucket', confirmBucket).then(() => {}, () => {});
 
     const origin = siteOrigin(request);
     const trackUrl = `${origin}/track.html#t=${order.track_token}`;
     const addonNames = (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean);
-    await Promise.all([
+    const sent = await Promise.all([
         sendEmail({
             to: order.client_email,
             subject: `We received your request ${order.code}`,
@@ -132,6 +127,13 @@ async function finish(request, body) {
             ],
             button: { label: 'Open in your dashboard', url: `${origin}/admin.html#${order.id}` },
         })),
-    ]);
+    ]).catch(async (err) => { await releaseSlot(); throw err; });
+    if (sent.some(ok => !ok)) {
+        await releaseSlot();
+        throw new HttpError(503, 'We saved your request, but could not send its confirmation yet. Please try again.');
+    }
+    // Written only once every email was accepted. If this write fails the slot is kept, so a retry within the day
+    // doesn't email everyone a second time.
+    await addEvent(order.id, 'note', 'Confirmation emailed', null, false);
     return json({ ok: true });
 }

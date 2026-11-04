@@ -1,5 +1,6 @@
 // Business rules for service requests: prices, statuses, what clients may see, and emails.
 import { db, addEvent, signedDownload, uuid, HttpError, IS_PROD, ADMIN_EMAILS, clientIp, sha256, hitRateLimit } from './core.mjs';
+import { createCheckout, checkoutExpiresAt, stripeClient } from './stripe.mjs';
 
 // Same prices as the pricing section on the site (dollars there, cents here). Keep the two in step.
 export const TIERS = {
@@ -15,6 +16,15 @@ export const ADDONS = {
     stakeout: { name: 'Standard Stakeout (Up to 1 Hour)', cents: 10000 },
     coordinated: { name: 'Coordinated Service', cents: 5000 },
 };
+export function attemptDetail(when, note) {
+    if (!when) return note || null;
+    if (typeof when !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(when) ||
+        !Number.isFinite(Date.parse(when)) || new Date(when).toISOString() !== when ||
+        Date.parse(when) > Date.now() + 5 * 60e3) {
+        throw new HttpError(400, 'Enter a valid attempt time that is not in the future.');
+    }
+    return `Attempted at: ${when}${note ? ` · ${note}` : ''}`;
+}
 
 // What each status means to the client. Order here is the normal path of a job.
 export const STATUSES = {
@@ -30,6 +40,24 @@ export const STATUSES = {
 };
 
 export const money = (cents) => '$' + (cents / 100).toFixed(2);
+
+// Statuses on which the client can write to Nick from the tracking page: answering his question, or a note or file on
+// any other open request. Finished requests (served, closed, cancelled) take no new notes; the client calls Nick.
+export const CLIENT_NOTE_STATUSES = ['action_required', 'received', 'awaiting_payment', 'paid', 'accepted', 'attempting'];
+
+// Only the amount captured from Stripe is suitable for a receipt. Older paid rows without that amount need review.
+export function receiptForOrder(order) {
+    if (!order?.paid_at || !Number.isSafeInteger(order.paid_amount_cents) || order.paid_amount_cents <= 0) return null;
+    const tier = TIERS[order.tier];
+    const items = tier ? [{ label: tier.name, cents: tier.cents }] : [];
+    for (const key of order.addons || []) if (Object.hasOwn(ADDONS, key)) items.push({ label: ADDONS[key].name, cents: ADDONS[key].cents });
+    const difference = order.paid_amount_cents - items.reduce((sum, item) => sum + item.cents, 0);
+    if (difference) items.push({ label: 'Other charges or adjustments', cents: difference });
+    return { code: order.code, caseNumber: order.case_number || null, court: order.court || null,
+        clientReference: order.client_reference || null, clientName: order.client_name || null, clientFirm: order.client_firm || null,
+        tier: tier?.name || order.tier || null, addons: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
+        paidAt: order.paid_at, amountPaidCents: order.paid_amount_cents, amountPaid: money(order.paid_amount_cents), items };
+}
 
 export function estimate(tier, addonKeys) {
     if (typeof tier !== 'string' || !Object.hasOwn(TIERS, tier)) throw new HttpError(400, 'Please choose a service tier.');
@@ -89,6 +117,7 @@ export async function clientView(order, { unlocked = false } = {}) {
         files = fallback.data;
     }
     const isLocked = !!order.doc_lock && !unlocked;
+    const paymentExpired = !!order.payment_expires_at && !order.paid_at && Date.parse(order.payment_expires_at) <= Date.now();
     const fullAddr = [order.address, order.unit].filter(Boolean).join(', ') + (order.city ? `, ${order.city}` : '') + ` ${order.zip}`;
     const seal = await orderSeal(order.id);
     return {
@@ -105,15 +134,14 @@ export async function clientView(order, { unlocked = false } = {}) {
         estimate: money(order.estimated_total_cents),
         amountDue: order.amount_due_cents != null ? money(order.amount_due_cents) : null,
         // Held (served) orders keep their status when billed afterwards, so an unpaid link alone shows the Pay button.
-        payUrl: (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
+        payUrl: !paymentExpired && (order.status === 'awaiting_payment' || (order.legal_hold && !order.paid_at)) && isSafePaymentUrl(order.payment_url) ? order.payment_url : null,
+        paymentExpired,
+        canRenewPayment: !order.paid_at && !!order.stripe_session_id && Number.isSafeInteger(order.amount_due_cents) && order.amount_due_cents > 0 &&
+            (paymentExpired || !order.payment_expires_at),
         paidAt: order.paid_at,
         // Receipt details, once paid and unlocked (case details stay hidden on a locked page).
-        receipt: order.paid_at && !isLocked ? {
-            code: order.code, caseNumber: order.case_number || null, court: order.court || null, clientReference: order.client_reference || null,
-            tier: TIERS[order.tier]?.name || order.tier, addons: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
-            amountPaid: money(order.amount_due_cents), paidAt: order.paid_at, clientName: order.client_name, clientFirm: order.client_firm || null,
-        } : null,
-        canReply: !isLocked && ['action_required', 'received', 'awaiting_payment', 'paid', 'accepted', 'attempting'].includes(order.status),
+        receipt: isLocked ? null : receiptForOrder(order),
+        canReply: !isLocked && CLIENT_NOTE_STATUSES.includes(order.status),
         actionNote: order.status === 'action_required' && !isLocked ? order.action_note : null,
         docLock: !!order.doc_lock,
         unlocked: !isLocked,
@@ -154,19 +182,78 @@ export function canMarkPaid(order, amountCents, sessionId) {
 
 export async function markPaid(orderId, amountCents, sessionId) {
     uuid(orderId, 'Order');
-    const { data: order, error } = await db().from('orders').select('id, status, paid_at, stripe_session_id, amount_due_cents, legal_hold').eq('id', orderId).maybeSingle();
+    const cents = Number(amountCents);
+    if (!Number.isSafeInteger(cents) || cents <= 0 || typeof sessionId !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(sessionId)) return false;
+    // The row lock and sealed event insert live in one Postgres transaction. If either fails, Stripe can retry safely.
+    const { data, error } = await db().rpc('record_paid_order', { p_order: orderId, p_amount_cents: cents, p_session_id: sessionId });
     if (error) throw error;
-    if (!canMarkPaid(order, amountCents, sessionId)) return false;
-    // Paying after the job was served (Nick serves first for some clients): record the money, keep the status "Served".
-    // The legal hold would refuse moving a served order back to "Paid", and the webhook would then fail for days.
-    const patch = { paid_at: new Date().toISOString(), stripe_session_id: sessionId, ...(order.legal_hold ? {} : { status: 'paid' }) };
-    // Only the call that actually flips paid_at writes the timeline entry, so the webhook and the client's return from
-    // Stripe arriving together can't log the payment twice (timeline entries can never be removed).
-    const { data: changed, error: uErr } = await db().from('orders').update(patch).eq('id', orderId).is('paid_at', null).select('id');
-    if (uErr) throw uErr;
-    if (!changed?.length) return false;
-    await addEvent(orderId, 'payment', `Payment received: ${money(Number(amountCents))}`);
-    return true;
+    return !!data;
+}
+
+// Closes a Checkout session this request created but could not save on the order (another request or a payment got
+// there first), so only one link can be paid. Never closes the session the order now holds: if Stripe ever returned the
+// same session to two requests, that one is the live link.
+export async function expireLosingSession(orderId, sessionId) {
+    try {
+        const { data: current } = await db().from('orders').select('stripe_session_id').eq('id', orderId).maybeSingle();
+        if (current?.stripe_session_id === sessionId) return;
+        await stripeClient().checkout.sessions.expire(sessionId);
+    } catch (err) {
+        console.error('Could not expire a losing payment link:', err?.message);
+    }
+}
+
+export async function renewExpiredPaymentLink(order, origin) {
+    if (order.paid_at) throw new HttpError(409, 'This order is already paid.');
+    if (!Number.isSafeInteger(order.amount_due_cents) || order.amount_due_cents < 100 ||
+        typeof order.stripe_session_id !== 'string' || !/^cs_[A-Za-z0-9_]{8,128}$/.test(order.stripe_session_id)) {
+        throw new HttpError(409, 'There is no payment link to renew. Contact Nick.');
+    }
+    let old;
+    try { old = await stripeClient().checkout.sessions.retrieve(order.stripe_session_id); }
+    catch { throw new HttpError(503, 'Stripe could not check the current payment link. Try again shortly.'); }
+    if (!old || old.id !== order.stripe_session_id || old.metadata?.order_id !== order.id ||
+        old.amount_total !== order.amount_due_cents) {
+        throw new HttpError(503, 'The current payment link could not be verified. Contact Nick.');
+    }
+    if (old.payment_status === 'paid') {
+        await markPaid(order.id, old.amount_total, old.id);
+        throw new HttpError(409, 'Your payment was already received. Refresh this page.');
+    }
+    if (old.status === 'open') {
+        if (!Number.isSafeInteger(old.expires_at) || old.expires_at * 1000 > Date.now()) {
+            throw new HttpError(409, 'The current payment link is still active.');
+        }
+        try { await stripeClient().checkout.sessions.expire(old.id); }
+        catch { throw new HttpError(503, 'Stripe could not close the expired link. Try again shortly.'); }
+    } else if (old.status !== 'expired') {
+        throw new HttpError(409, 'A payment is still processing. Check again shortly.');
+    }
+    const session = await createCheckout(order, order.amount_due_cents, `Process service ${order.code}`, origin);
+    let expiresAt;
+    try { expiresAt = checkoutExpiresAt(session); }
+    catch (err) { await stripeClient().checkout.sessions.expire(session.id).catch(() => {}); throw err; }
+    const { data: saved, error } = await db().from('orders').update({
+        stripe_session_id: session.id, payment_url: session.url, payment_expires_at: expiresAt,
+    }).eq('id', order.id).eq('stripe_session_id', order.stripe_session_id).eq('amount_due_cents', order.amount_due_cents)
+        .is('paid_at', null).select('id').maybeSingle();
+    if (error || !saved) {
+        await expireLosingSession(order.id, session.id);
+        if (error) throw error;
+        throw new HttpError(409, 'This payment link was already renewed. Refresh for the latest one.');
+    }
+    // The CAS above is the payment-link commit point. A later timeline or email failure must not make the caller
+    // think renewal failed and retry a link that is already live; the client can use the returned link immediately.
+    try { await addEvent(order.id, 'payment', `Payment link renewed: ${money(order.amount_due_cents)}`); }
+    catch { console.error('Payment renewal timeline event failed', order.id); }
+    try {
+        await sendEmail({ to: order.client_email, subject: `${order.code}: your renewed payment link`,
+            heading: 'Your payment link was renewed',
+            lines: [`The previous link expired. The amount due is still ${money(order.amount_due_cents)}.`,
+                'Use the new secure link below to pay. It expires in 24 hours.'],
+            button: { label: `Pay ${money(order.amount_due_cents)}`, url: session.url } });
+    } catch { console.error('Payment renewal email failed', order.id); }
+    return session;
 }
 
 // A paid Stripe session that markPaid would not apply: an older link Nick replaced, less than the amount due, or a
@@ -268,32 +355,61 @@ ${button ? `<p style="margin:24px 0 8px"><a href="${escHtml(button.url)}" style=
 </table></td></tr></table></body></html>`;
 }
 
-// A refund or a card dispute on an order's payment. The money moved inside Stripe, so the order is never changed
-// automatically: Nick gets a private timeline entry and an email, once per Stripe event, and decides what to do. Like
-// flagUnappliedPayment, the entry is written only after an email was accepted; otherwise this throws and Stripe retries.
-export async function flagPaymentReversal(orderId, { eventId, kind, amountCents, reason }) {
+// A refund, a card dispute or an early fraud warning on an order's payment. The money moved (or may move) inside
+// Stripe, so the order is never changed automatically: Nick gets a private timeline entry and an email, once per Stripe
+// event, and decides what to do. The Stripe account is shared with another site, so only payments carrying one of these
+// orders' ids get here. Like flagUnappliedPayment, the entry is written only after an email was accepted; otherwise this
+// throws and Stripe retries. The entry names both the Stripe event and the dispute/warning, and either one already on
+// the timeline counts as flagged, so a redelivered event or a second event for the same dispute isn't emailed twice.
+const STRIPE_EVENT_RE = /^evt_[A-Za-z0-9_]{8,128}$/;
+const STRIPE_OBJECT_RE = /^(?:dp|du|issfr|ch|re)_[A-Za-z0-9_]{1,128}$/;
+export async function flagPaymentReversal(orderId, { eventId, objectId = null, kind, amountCents, reason, dueBy = null }) {
     uuid(orderId, 'Order');
-    if (typeof eventId !== 'string' || !/^evt_[A-Za-z0-9_]{8,128}$/.test(eventId)) return false;
+    if (!['refund', 'dispute', 'fraud_warning'].includes(kind)) return false;
+    const ids = [eventId, objectId].filter(id => typeof id === 'string' && (STRIPE_EVENT_RE.test(id) || STRIPE_OBJECT_RE.test(id)));
+    if (!ids.length) return false;
     const { data: order, error } = await db().from('orders').select('id, code').eq('id', orderId).maybeSingle();
     if (error) throw error;
     if (!order) return false;
     const { data: earlier, error: eErr } = await db().from('order_events').select('detail').eq('order_id', orderId).eq('kind', 'payment').eq('client_visible', false);
     if (eErr) throw eErr;
-    if ((earlier || []).some(e => String(e.detail || '').includes(eventId))) return false;   // already flagged
-    const amount = money(Number(amountCents) || 0);
-    const what = kind === 'dispute' ? `disputed (${String(reason || 'no reason given').slice(0, 60)})` : 'refunded';
-    const title = kind === 'dispute' ? 'Payment disputed' : 'Payment refunded';
-    const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({
-        to, subject: `${order.code}: a payment was ${kind === 'dispute' ? 'disputed' : 'refunded'}`,
-        heading: title,
+    if ((earlier || []).some(e => ids.some(id => String(e.detail || '').includes(id)))) return false;   // already flagged
+    // Early fraud warnings carry no amount, only the charge.
+    const amount = Number.isFinite(Number(amountCents)) && amountCents != null ? money(Number(amountCents)) : null;
+    const why = String(reason || 'no reason given').replaceAll('_', ' ').slice(0, 60);
+    const due = Number.isSafeInteger(dueBy) && dueBy > 0
+        ? new Date(dueBy * 1000).toLocaleDateString('en-US', { dateStyle: 'long', timeZone: 'America/Los_Angeles' }) : null;
+    const payment = amount ? `the ${amount} payment` : 'a payment';
+    const title = { refund: 'Payment refunded', dispute: 'Payment disputed', fraud_warning: 'Fraud warning on payment' }[kind];
+    const subject = { refund: 'a payment was refunded', dispute: 'a payment was disputed', fraud_warning: 'a payment was flagged as possible fraud' }[kind];
+    const lines = {
         // charge.refunded carries the charge's running total (amount_refunded) as of that event, not this one refund,
         // and Stripe may deliver events out of order, so it is described as of the event rather than as current.
-        lines: [kind === 'dispute' ? `${amount} of the card payment on ${order.code} was ${what}.` : `When this refund happened, the card payment on ${order.code} had been refunded ${amount} in total. Stripe can deliver refund events out of order, so check Stripe for the current total.`,
-            kind === 'dispute' ? 'Open Stripe to respond before its deadline. The order export has your evidence.' : 'The order still shows as paid. Check Stripe and update the order if needed.'],
-    }).catch(() => false)));
+        refund: [`When this refund happened, the card payment on ${order.code} had been refunded ${amount || '$0.00'} in total. Stripe can deliver refund events out of order, so check Stripe for the current total.`,
+            'The order still shows as paid. Check Stripe and update the order if needed.'],
+        dispute: [`${amount || 'The'} card payment on ${order.code} was disputed by the cardholder (${why}).`,
+            due ? `Respond in Stripe before ${due}, or the dispute is lost by default.` : 'Respond to it in Stripe as soon as possible.',
+            'Download the evidence pack for this order from your dashboard and upload it to the dispute in Stripe.'],
+        fraud_warning: [`Stripe flagged ${payment} on ${order.code} as possibly fraudulent (${why}).`,
+            'No money has been taken back yet. Consider refunding it in Stripe before it becomes a dispute.'],
+    }[kind];
+    console.error(`Stripe ${title.toLowerCase()} on ${order.code}: ${ids.join(' / ')}${amount ? ` (${amount})` : ''}`);
+    const sent = await Promise.all(ADMIN_EMAILS.map(to => sendEmail({ to, subject: `${order.code}: ${subject}`, heading: title, lines }).catch(() => false)));
     if (!sent.some(Boolean)) throw new Error(`${title} alert for ${order.code} could not be emailed`);
-    await addEvent(orderId, 'payment', title, `Stripe event ${eventId}: ${kind === 'dispute' ? `${amount} ${what}` : `${amount} refunded in total as of this event`}. Nothing was changed on the order automatically.`, false);
+    const what = kind === 'refund' ? `${amount || '$0.00'} refunded in total as of this event`
+        : kind === 'dispute' ? `${amount || 'payment'} disputed (${why})${due ? `; evidence due by ${due}` : ''}`
+        : `early fraud warning on ${payment} (${why})`;
+    await addEvent(orderId, 'payment', title, `Stripe ${ids.join(' / ')}: ${what}. Nothing was changed on the order automatically.`, false);
     return true;
+}
+
+// The branch-era entry point for disputes and early fraud warnings; same rules, one implementation.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export async function flagDispute(orderId, eventType, obj, eventId = null) {
+    if (!UUID_RE.test(String(orderId))) return false;
+    const fraud = eventType === 'radar.early_fraud_warning.created';
+    return flagPaymentReversal(orderId, { eventId, objectId: obj?.id ?? null, kind: fraud ? 'fraud_warning' : 'dispute',
+        amountCents: fraud ? null : obj?.amount, reason: obj?.reason || obj?.fraud_type || null, dueBy: obj?.evidence_details?.due_by ?? null });
 }
 
 // Records what a client did on their tracking page, for Nick's dispute evidence. Never blocks the client: if the table

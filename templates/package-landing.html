@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="index,follow">
+  <meta name="theme-color" content="#0d422e">
+  <title>{{TITLE}}</title>
+  <link rel="icon" href="assets/logo-base.svg" type="image/svg+xml">
+  <link rel="preload" href="assets/fonts/librecaslondisplay-400.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="assets/fonts/montserrat-var.woff2" as="font" type="font/woff2" crossorigin>
+  <style>
+    @font-face{font-family:Display;src:url(assets/fonts/librecaslondisplay-400.woff2) format('woff2');font-display:swap}
+    @font-face{font-family:Body;src:url(assets/fonts/montserrat-var.woff2) format('woff2');font-display:swap}
+    :root{--pine:#0d422e;--deep:#082b1e;--gold:#efa833;--cream:#fbf6ea;--mist:#e6eee9;--ink:#10221a;--muted:#566860}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--cream);color:var(--ink);font-family:Body,Arial,sans-serif;line-height:1.55}a{color:inherit}.wrap{max-width:1120px;margin:auto;padding:0 24px}.nav{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:22px 0}.brand{font-weight:800;letter-spacing:.08em;text-decoration:none}.brand span{color:var(--gold)}.nav a{font-size:.79rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;text-decoration:none}.cta{display:inline-flex;align-items:center;justify-content:center;padding:14px 20px;border:1px solid var(--gold);background:var(--gold);color:var(--deep);font-size:.76rem;font-weight:800;letter-spacing:.09em;text-decoration:none;text-transform:uppercase;box-shadow:0 8px 18px -10px #000}.hero{background:linear-gradient(125deg,var(--deep),var(--pine));color:var(--cream);padding:84px 0 94px}.eyebrow{color:#f6d9a0;font-family:Display,Georgia,serif;font-style:italic;font-size:1.05rem}.hero h1,.section h2{font-family:Display,Georgia,serif;font-weight:400;line-height:1.04}.hero h1{max-width:800px;font-size:clamp(3.1rem,7vw,6.2rem);margin:12px 0 24px}.hero p{max-width:680px;font-size:1.08rem;color:#d6e1da}.hero-actions{display:flex;flex-wrap:wrap;gap:13px;margin-top:34px}.secondary{display:inline-flex;align-items:center;justify-content:center;padding:13px 19px;border:1px solid #d9c17a;color:var(--cream);font-size:.76rem;font-weight:800;letter-spacing:.09em;text-decoration:none;text-transform:uppercase}.section{padding:80px 0}.section h2{font-size:clamp(2.4rem,4vw,3.8rem);margin:8px 0 14px;color:var(--pine)}.lede{max-width:660px;color:var(--muted);font-size:1.03rem}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:34px}.card{border:1px solid #d3ddd6;background:#fff;padding:26px}.card h3{margin:0 0 10px;font-size:1rem;color:var(--pine)}.card p{margin:0;color:var(--muted);font-size:.92rem}.contact{background:var(--mist);border-top:1px solid #c7d4cb;border-bottom:1px solid #c7d4cb}.contact-box{display:flex;align-items:center;justify-content:space-between;gap:30px}.contact p{max-width:620px;color:var(--muted)}footer{padding:30px 0;font-size:.78rem;color:var(--muted)}
+    {{NEXUS_STYLE}}
+    @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*:before,*:after{animation:none!important;transition:none!important}}
+    @media(max-width:700px){.nav>nav{display:none}.hero{padding:62px 0 70px}.grid{grid-template-columns:1fr}.contact-box{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+  <header class="wrap"><nav class="nav"><a class="brand" href="#top">NICK'S <span>PROCESS</span> SERVICES</a><a href="#contact">Contact Nick</a></nav></header>
+  <main id="top">
+    <section class="hero"><div class="wrap nexus-reveal"><p class="eyebrow">Professional · Reliable · Local</p><h1>Process service handled with clarity and care.</h1><p>Nick’s Process Services provides prompt, professional support for service of process, court filings, and time-sensitive legal documents.</p><div class="hero-actions"><a class="cta" href="mailto:nicksprocessservices@outlook.com">Email Nick</a><a class="secondary" href="tel:+12099226817">Call (209) 922-6817</a></div></div></section>
+    <section class="section"><div class="wrap"><p class="eyebrow" style="color:#8a6420">What Nick can help with</p><h2>Built for the moments that cannot wait.</h2><p class="lede">Clear communication, careful handling, and practical updates from the first conversation through completion.</p><div class="grid"><article class="card nexus-reveal"><h3>Service of Process</h3><p>Professional handling of summons, complaints, subpoenas, restraining orders, notices, and other legal documents.</p></article><article class="card nexus-reveal"><h3>Rush & Time-Sensitive Service</h3><p>Responsive help for urgent timelines, coordinated attempts, and fast-moving case requirements.</p></article><article class="card nexus-reveal"><h3>Clear Communication</h3><p>Direct contact with Nick so you understand the next step and can move your matter forward confidently.</p></article></div></div></section>
+    <section id="contact" class="section contact"><div class="wrap contact-box"><div><p class="eyebrow" style="color:#8a6420">Start a conversation</p><h2>Need help with service?</h2><p>Tell Nick what you need. He will explain the next practical step and confirm whether the request is within his service area.</p></div><a class="cta" href="mailto:nicksprocessservices@outlook.com?subject=Process%20Service%20Inquiry">Contact Nick</a></div></section>
+  </main>
+  <footer class="wrap">© {{YEAR}} Nick's Process Services. This landing page does not collect payments, documents, account credentials, or private case information.</footer>
+</body>
+</html>

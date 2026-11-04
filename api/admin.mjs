@@ -3,11 +3,13 @@ import { randomInt } from 'node:crypto';
 import { db, handle, json, readJson, clientIp, siteOrigin, rateLimit, getCookie, text, longText, email,
          sha256, randomToken, cleanFileList, uuidList, cleanDate, prepareUploads, confirmUploads, addEvent, signedDownload, uuid,
          HttpError, ADMIN_EMAILS, IS_PROD, BUCKET, generateTotpSecret, verifyTotp, encryptSecret, decryptSecret, keyedHash } from './_lib/core.mjs';
-import { STATUSES, TIERS, ADDONS, money, sendEmail, sendSecurityAlert, markPaid, orderSeal, prefersDigest } from './_lib/orders.mjs';
-import { createCheckout, stripeClient } from './_lib/stripe.mjs';
+import { STATUSES, TIERS, ADDONS, money, receiptForOrder, sendEmail, sendSecurityAlert, markPaid, renewExpiredPaymentLink, expireLosingSession, orderSeal, attemptDetail, prefersDigest } from './_lib/orders.mjs';
+import { createCheckout, checkoutExpiresAt, stripeClient } from './_lib/stripe.mjs';
 import { saveNickAnswers, listAnswers, ownAnswers } from './_lib/surveys.mjs';
 import { getContact, setContact, activeWalk, startWalk, checkIn, alertOverdueWalks } from './_lib/safewalk.mjs';
 import { registrationOptions, registrationVerify, loginOptions, loginVerify, listPasskeys, removePasskey, clearChallengeCookie } from './_lib/passkeys.mjs';
+import { zipEvidencePack } from './_lib/evidence-pack.mjs';
+import { printingSummary } from './_lib/pdf-pages.mjs';
 
 const COOKIE = 'nps_admin';
 const SESSION_DAYS = 14;
@@ -26,7 +28,7 @@ export const POST = handle(async (request) => {
     if (a === 'logout-all') return logoutAll(request, admin);
     if (a === 'sessions') return sessions(request, admin);
     if (a === 'revoke-session') return revokeSession(request, body, admin);
-    if (a === 'stepup-send-code') return sendStepUpCode(admin);
+    if (a === 'stepup-send-code' || a === 'send-step-up-code') return sendStepUpCode(request, admin);
     if (a === 'passkeys') return json({ ok: true, passkeys: await listPasskeys('admin', admin) });
     if (a === 'passkey-register-options') return passkeyRegisterOptions(request, body, admin);
     if (a === 'passkey-register-verify') return passkeyRegisterVerify(request, body, admin);
@@ -42,11 +44,13 @@ export const POST = handle(async (request) => {
     if (a === 'toggle-doc-lock') return toggleDocLock(request, body, admin);
     if (a === 'unlock-legal-hold') return unlockLegalHold(request, body, admin);
     if (a === 'payment-link') return paymentLink(request, body, admin);
+    if (a === 'renew-payment-link') return renewPaymentLink(request, body, admin);
     if (a === 'proof-upload') return proofUpload(body);
     if (a === 'proof-finish') return proofFinish(request, body);
     if (a === 'file-url') return fileUrl(request, body, admin);
     if (a === 'export') return exportOrder(request, body, admin);
     if (a === 'evidence-pack') return evidencePack(request, body, admin);
+    if (a === 'dispute-pack') return disputePack(request, body, admin);
     if (a === 'bulk-close') return bulkClose(request, body, admin);
     if (a === 'expense-add') return addExpense(request, body, admin);
     if (a === 'survey-save') { await rateLimit(`admin-survey:${sha256(admin)}`, 60, 900); await saveNickAnswers(admin, body); return json({ ok: true }); }
@@ -131,9 +135,12 @@ async function requireStepUp(admin, code) {
     const row = await getAdminTotp(admin);
     const typed = String(code || '').trim().toUpperCase();
     if (!row?.enabled) {
+        await rateLimit(`admin-stepup:${sha256(admin)}`, 10, 900);
         const digits = typed.replace(/[\s-]+/g, '');
         if (!/^\d{8}$/.test(digits)) throw new HttpError(403, 'Email yourself a step-up code, then enter the 8-digit code to continue.');
-        const { data, error } = await db().rpc('use_admin_code', { p_email: admin, p_hash: stepUpHash(admin, digits) });
+        // Step-up codes are their own purpose in admin_codes (20261104000100), so a pending login code and a step-up
+        // code never replace each other or share guesses.
+        const { data, error } = await db().rpc('use_admin_stepup_code', { p_email: admin, p_hash: stepUpHash(admin, digits) });
         if (error) throw error;
         if (!data) throw new HttpError(403, 'That step-up code is wrong or expired. Email yourself a new one.');
         return true;
@@ -151,14 +158,16 @@ async function requireStepUp(admin, code) {
     }
     return true;
 }
-// Step-up codes share the login-code table and its guess limits, but hash differently, so one can't be used as the other.
+// Step-up codes live in the login-code table under their own purpose, and also hash differently, so one can never be
+// used as the other.
 const stepUpHash = (addr, digits) => sha256(`stepup:${addr}:${digits}`);
 const STEPUP_MINUTES = 5;
-async function sendStepUpCode(admin) {
+async function sendStepUpCode(request, admin) {
     await rateLimit(`admin-stepup-send:${sha256(admin)}`, 3, 900);
+    await rateLimit(`admin-stepup-send-ip:${clientIp(request)}`, 5, 900);
     if ((await getAdminTotp(admin))?.enabled) throw new HttpError(400, 'Use the code from your authenticator app instead.');
     const code = String(randomInt(0, 100000000)).padStart(8, '0');
-    const { error } = await db().from('admin_codes').insert({ email: admin, code_hash: stepUpHash(admin, code),
+    const { error } = await db().from('admin_codes').insert({ email: admin, code_hash: stepUpHash(admin, code), purpose: 'stepup',
         expires_at: new Date(Date.now() + STEPUP_MINUTES * 60e3).toISOString() });
     if (error) throw error;
     await sendEmail({
@@ -169,6 +178,7 @@ async function sendStepUpCode(admin) {
             "If you didn't start a change, someone may be signed in to your dashboard: use Log Out All Devices now."],
     });
     if (!IS_PROD && !process.env.RESEND_API_KEY) console.log(`[dev] admin step-up code for ${admin}: ${code}`);
+    await auditAdmin(request, admin, 'stepup_code_sent');
     return json({ ok: true, minutes: STEPUP_MINUTES });
 }
 
@@ -374,7 +384,8 @@ async function evidencePack(request, body, admin) {
             served_at: order.served_at || null, legal_hold: !!order.legal_hold,
         },
         attestation: pick(['attestation']),
-        payment: { amount_due: order.amount_due_cents != null ? money(order.amount_due_cents) : null, paid_at: order.paid_at || null,
+        payment: { amount_due: order.amount_due_cents != null ? money(order.amount_due_cents) : null,
+            amount_paid: Number.isSafeInteger(order.paid_amount_cents) ? money(order.paid_amount_cents) : null, paid_at: order.paid_at || null,
             stripe_session_id: order.stripe_session_id || null, entries: pick(['payment']) },
         attempts: pick(['attempt']),
         client_activity: cErr ? { unavailable: 'The client activity log is not set up yet.' }
@@ -588,29 +599,18 @@ async function list() {
     return json({ orders: await withClientReplied(data), statuses: STATUSES, tiers: TIERS });
 }
 
-// A job "has a client reply" when the client's answer is newer than anything Nick has done on it since.
-// Only "received" jobs can be in that state (answering sets it), which keeps the id list short enough for one query.
-const NICK_KINDS = ['action', 'status', 'attempt', 'payment', 'proof'];
-// Entries Nick wrote to or for the client: status changes, attempts, questions, payment requests, proof, and notes he
-// chose to share. System entries ("files added by you", lock changes) and the client's own replies don't count.
-const byNick = (e) => ['status', 'attempt', 'action', 'proof'].includes(e.kind) ||
-    (e.kind === 'payment' && String(e.title || '').startsWith('Payment requested')) || (e.kind === 'note' && e.title === 'Update from Nick');
-// For each job still in play: did the client reply after Nick's last entry, and when did Nick last contact the client
-// (his newest entry the client can see). Closed and cancelled jobs are skipped.
+// For each job still in play: has the client written (an answer or a message) since Nick's last entry, and when did
+// Nick last update the client (his newest entry the client can see)? "Nick's entries" are status changes, attempts,
+// questions, proof, payment requests and the notes he shares; system notes and the client's own entries don't count.
+// Worked out in the database (list_order_activity), with the ids in the request body: an .in() list in the URL fails
+// past ~200 jobs, and a row limit across all jobs hid older jobs' latest entries. Closed and cancelled jobs are skipped.
 async function withClientReplied(list) {
-    const ids = list.filter(o => !['closed', 'cancelled'].includes(o.status)).map(o => o.id).slice(0, 300);
+    const ids = list.filter(o => !['closed', 'cancelled'].includes(o.status)).map(o => o.id);
     if (!ids.length) return list.map(o => ({ ...o, client_replied: false, last_contact_at: null }));
-    const { data: evs, error } = await db().from('order_events').select('order_id, kind, title, created_at, client_visible')
-        .in('order_id', ids).in('kind', [...NICK_KINDS, 'note', 'action_response'])
-        .order('created_at', { ascending: false }).limit(10000);
+    const { data, error } = await db().rpc('list_order_activity', { p_order_ids: ids });
     if (error) throw error;
-    const latest = new Map(), contact = new Map();
-    for (const e of evs) {
-        const nick = byNick(e);
-        if ((nick || e.kind === 'action_response') && !latest.has(e.order_id)) latest.set(e.order_id, e.kind === 'action_response');
-        if (nick && e.client_visible && !contact.has(e.order_id)) contact.set(e.order_id, e.created_at);
-    }
-    return list.map(o => ({ ...o, client_replied: latest.get(o.id) === true, last_contact_at: contact.get(o.id) || null }));
+    const byId = new Map((data || []).map(r => [r.order_id, r]));
+    return list.map(o => ({ ...o, client_replied: !!byId.get(o.id)?.client_replied, last_contact_at: byId.get(o.id)?.last_contact_at || null }));
 }
 async function getOrder(id) {
     uuid(id, 'Order');
@@ -643,9 +643,11 @@ async function detail(id) {
             integrity_seal: integritySeal,
             tier_name: TIERS[order.tier]?.name,
             addon_names: (order.addons || []).map(k => ADDONS[k]?.name).filter(Boolean),
+            receipt: receiptForOrder(order),
         },
         events,
         files: uploadedFiles,
+        printing: printingSummary(uploadedFiles),
         integritySeal,
         expenses: await expenseTotals(order.id),
         statuses: STATUSES,
@@ -678,10 +680,17 @@ async function update(request, body, admin) {
         });
     } else if (kind === 'attempt') {
         const outcome = text(body.outcome, { max: 120, required: true, label: 'Outcome' });
-        const when = text(body.when, { max: 40 });   // blank means "now", which the entry's own timestamp already shows
-        const window = attemptWindow(body.at);
+        // The time Nick gives (the dashboard sends it as an ISO time in `at`; older pages sent it in `when`), or now. It
+        // is checked (not in the future, within the last 60 days), labels the attempt with its service window and is
+        // sealed into the entry as "Attempted at: <ISO time>"; the entry's own timestamp records when it was logged.
+        // With `at` given, `when` is only the dashboard's display text. Without it, `when` must itself be an ISO time:
+        // free text such as "yesterday" is ambiguous and refused.
+        const when = text(body.when, { max: 40 });
+        const at = typeof body.at === 'string' && body.at ? body.at : when;
+        const detail = attemptDetail(at, note);   // checks the format and that it isn't in the future
+        const window = attemptWindow(at);
         if (['received', 'paid', 'accepted'].includes(order.status)) await db().from('orders').update({ status: 'attempting' }).eq('id', order.id);
-        await addEvent(order.id, 'attempt', `Attempt (${window}): ${outcome}`, [when, note].filter(Boolean).join(' · '), body.clientVisible !== false);
+        await addEvent(order.id, 'attempt', `Attempt (${window}): ${outcome}`, detail, body.clientVisible !== false);
     } else if (kind === 'note') {
         if (!note) throw new HttpError(400, 'Write a note first.');
         await addEvent(order.id, 'note', body.clientVisible ? 'Update from Nick' : 'Internal note', note, !!body.clientVisible);
@@ -777,18 +786,38 @@ async function paymentLink(request, body, admin) {
     // A new link replaces the old one. If the client already paid the old one, record that and stop;
     // otherwise close it, so they can't end up paying twice.
     if (order.stripe_session_id?.startsWith('cs_')) {
-        const old = await stripeClient().checkout.sessions.retrieve(order.stripe_session_id).catch(() => null);
+        let old;
+        try { old = await stripeClient().checkout.sessions.retrieve(order.stripe_session_id); }
+        catch { throw new HttpError(503, 'Stripe could not confirm the current payment link. Try again shortly.'); }
+        if (!old || old.id !== order.stripe_session_id || old.metadata?.order_id !== order.id) {
+            throw new HttpError(503, 'The current payment link could not be verified. Contact support before replacing it.');
+        }
         if (old?.payment_status === 'paid') {
             await markPaid(order.id, old.amount_total, old.id);
             throw new HttpError(409, 'The client already paid the previous link. Refresh to see it.');
         }
-        if (old?.status === 'open') await stripeClient().checkout.sessions.expire(old.id).catch(() => {});
+        if (old.status === 'open') {
+            try { await stripeClient().checkout.sessions.expire(old.id); }
+            catch { throw new HttpError(503, 'Stripe could not close the current payment link. Try again shortly.'); }
+        } else if (old.status !== 'expired') {
+            throw new HttpError(409, 'The current payment link has a pending payment. Check Stripe before replacing it.');
+        }
     }
     const session = await createCheckout(order, cents, description, origin);
+    let expiresAt;
+    try { expiresAt = checkoutExpiresAt(session); }
+    catch (err) { await stripeClient().checkout.sessions.expire(session.id).catch(() => {}); throw err; }
     // A served order (under legal hold) keeps its "Served" status while it's billed; the Pay button still shows.
-    const { error: linkErr } = await db().from('orders').update({ amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id,
-        ...(order.legal_hold ? {} : { status: 'awaiting_payment' }) }).eq('id', order.id);
-    if (linkErr) throw linkErr;   // never email a payment link the system didn't record
+    let save = db().from('orders').update({ amount_due_cents: cents, payment_url: session.url, stripe_session_id: session.id,
+        payment_expires_at: expiresAt,
+        ...(order.legal_hold ? {} : { status: 'awaiting_payment' }) }).eq('id', order.id).is('paid_at', null);
+    save = order.stripe_session_id ? save.eq('stripe_session_id', order.stripe_session_id) : save.is('stripe_session_id', null);
+    const { data: saved, error: linkErr } = await save.select('id').maybeSingle();
+    if (linkErr || !saved) {
+        await expireLosingSession(order.id, session.id);
+        if (linkErr) throw linkErr;
+        throw new HttpError(409, 'The payment link changed while this one was being prepared. Refresh and try again.');
+    }
     await addEvent(order.id, 'payment', `Payment requested: ${money(cents)}`, description);
     await auditAdmin(request, admin, 'payment_link', order.code, money(cents));
     await sendEmail({
@@ -797,6 +826,14 @@ async function paymentLink(request, body, admin) {
         lines: [`Total due: ${money(cents)}${description ? ` (${description})` : ''}.`, 'Payment must be sent to effectuate service. Attempts begin once payment is received.', 'Pay securely by card or Apple Pay. The link works for 24 hours; ask Nick for a new one if it expires.'],
         button: { label: `Pay ${money(cents)}`, url: session.url },
     });
+    return json(await detail(order.id));
+}
+
+async function renewPaymentLink(request, body, admin) {
+    await rateLimit(`admin-paylink:${sha256(admin)}`, 20, 900);
+    const order = await getOrder(body.id);
+    await renewExpiredPaymentLink(order, siteOrigin(request));
+    await auditAdmin(request, admin, 'payment_link_renewed', order.code, money(order.amount_due_cents));
     return json(await detail(order.id));
 }
 
@@ -862,6 +899,49 @@ async function exportOrder(request, body, admin) {
         timeline: events.map(({ created_at, title, detail: d, client_visible }) => ({ created_at, title, detail: d, shown_to_client: client_visible })),
         files: files.map(({ filename, kind, size_bytes, sha256: h, created_at }) => ({ filename, kind, size_bytes, sha256: h || null, created_at })),
     });
+}
+
+async function allEvidenceRows(table, columns, orderId) {
+    const result = [];
+    for (let from = 0; ; from += 500) {
+        const { data, error } = await db().from(table).select(columns).eq('order_id', orderId)
+            .order('created_at', { ascending: true }).order('id', { ascending: true }).range(from, from + 499);
+        if (error) throw error;
+        result.push(...(data || []));
+        if (!data || data.length < 500) return result;
+    }
+}
+
+async function disputePack(request, body, admin) {
+    await rateLimit(`admin-dispute-pack:${sha256(admin)}`, 10, 900);
+    const order = await getOrder(body.id);
+    const [events, fileRows, auditRows, chain] = await Promise.all([
+        allEvidenceRows('order_events', 'id, kind, title, detail, created_at', order.id),
+        allEvidenceRows('order_files', 'id, filename, kind, sha256, uploaded, created_at', order.id),
+        allEvidenceRows('client_audit_logs', 'id, action, detail, ip_hash, created_at', order.id),
+        orderSeal(order.id),
+    ]);
+    if (!chain.verified) throw new HttpError(409, 'The event chain did not verify. Investigate before exporting evidence.');
+    const pack = {
+        exported_at: new Date().toISOString(),
+        order: { code: order.code, client_name: order.client_name, recipient_name: order.recipient_name,
+            case_number: order.case_number || null, court: order.court || null, tier: TIERS[order.tier]?.name || order.tier },
+        attestation: events.find(e => e.kind === 'attestation') || null,
+        payment: { stripe_session_id: order.stripe_session_id || null, amount_due_cents: order.amount_due_cents,
+            paid_at: order.paid_at || null },
+        attempts: events.filter(e => e.kind === 'attempt').map(({ created_at, title, detail }) => ({ created_at, title, detail })),
+        // client_audit_logs (20261030061450) names the downloaded file in `detail`.
+        downloads: auditRows.filter(e => e.action === 'download').map(({ created_at, detail }) => ({ created_at, filename: detail || null })),
+        client_activity: auditRows.map(({ created_at, action, detail, ip_hash }) => ({ created_at, action, detail: detail || null,
+            network: ip_hash ? ip_hash.slice(0, 12) : null })),
+        files: fileRows.filter(f => f.uploaded).map(({ filename, kind, sha256 }) => ({ filename, kind, sha256: sha256 || null })),
+        chain: { verified: chain.verified, head: chain.head, entries: chain.entries },
+    };
+    await auditAdmin(request, admin, 'dispute_pack_export', order.code);
+    return new Response(zipEvidencePack(pack), { status: 200, headers: {
+        'Content-Type': 'application/zip', 'Content-Disposition': `attachment; filename="${order.code}-dispute-evidence.zip"`,
+        'Cache-Control': 'no-store',
+    } });
 }
 
 // Permanent: removes the stored documents, then the request with its timeline and file records (cascade).

@@ -258,6 +258,14 @@ const NPS = (() => {
             ? { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }
             : { month: 'short', day: 'numeric', year: 'numeric' });
     };
+    const fmtAttemptDetail = (detail) => {
+        const match = /^Attempted at: (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z)(.*)$/.exec(detail || '');
+        if (!match) return detail || '';
+        const time = new Date(match[1]);
+        if (!Number.isFinite(time.getTime())) return detail;
+        const shown = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }).format(time);
+        return `Attempted ${shown}${match[2]}`;
+    };
     const fmtSize = (bytes) => bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB';
 
     // Printable service record for Nick (court files, disputes). It states what the system really does, nothing more:
@@ -302,8 +310,10 @@ const NPS = (() => {
 
     // A plain printable page in a new tab, with a Print button wired by a listener (the pop-up inherits the page's
     // Content Security Policy, so no inline script).
-    function printPage(title, bodyHtml) {
-        const w = window.open('', '_blank', 'width=900,height=800');
+    // A caller that must await something first can open the tab during the click (pop-up blockers allow only that) and
+    // pass it in as openedWindow.
+    function printPage(title, bodyHtml, openedWindow = null) {
+        const w = openedWindow || window.open('', '_blank', 'width=900,height=800');
         if (!w) { alert('Allow pop-ups for this site to print.'); return; }
         w.opener = null;
         w.document.write(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>${esc(title)}</title>
@@ -318,13 +328,17 @@ const NPS = (() => {
     }
     const rows = (pairs) => pairs.filter(([, v]) => v).map(([k, v]) => `<tr><th style="width:35%">${esc(k)}</th><td>${esc(v)}</td></tr>`).join('');
 
-    // Itemized receipt for a paid request (client's tracking page, or Nick's dashboard).
-    function printReceipt(r) {
+    // Itemized receipt for a paid request (client's tracking page or account, or Nick's dashboard). The amount is the
+    // one Stripe captured; a receipt without it (an older payment needing review) is never printed.
+    function printReceipt(r, openedWindow = null) {
+        if (!r || !Number.isSafeInteger(r.amountPaidCents)) { openedWindow?.close(); return; }
+        const items = (r.items || []).map(item => `<tr><td>${esc(item.label)}</td><td style="text-align:right">${esc(money(item.cents))}</td></tr>`).join('');
         printPage(`Receipt ${r.code}`, `<h1>Receipt</h1>
             <p style="margin-top:0;color:#566860;font-size:13px">Nick's Process Services · printed ${esc(fmtDate(new Date().toISOString()))}</p>
             <table><tbody>${rows([['Reference', r.code], ['Client', [r.clientName, r.clientFirm].filter(Boolean).join(', ')], ['Your reference', r.clientReference],
                 ['Case number', r.caseNumber], ['Court', r.court], ['Service', r.tier], ['Add-ons', (r.addons || []).join(', ')],
-                ['Amount paid', r.amountPaid], ['Date paid', fmtDate(r.paidAt)], ['Paid through', 'Stripe (card details are never seen by this site)']])}</tbody></table>`);
+                ['Date paid', fmtDate(r.paidAt)], ['Paid through', 'Stripe (card details are never seen by this site)']])}</tbody></table>
+            <h2>Charges</h2><table><tbody>${items}<tr><th>Amount paid</th><th style="text-align:right">${esc(money(r.amountPaidCents))}</th></tr></tbody></table>`, openedWindow);
     }
 
     // Nick's dispute evidence pack: the record's own facts, laid out for a card dispute or a court question.
@@ -339,7 +353,7 @@ const NPS = (() => {
                 ['Case number', o.case_number], ['Court', o.court], ['Client reference', o.client_reference], ['Person served', o.recipient], ['Document', o.document],
                 ['Service', [o.tier, ...(o.addons || [])].filter(Boolean).join(' + ')], ['Requested', fmtDate(o.created_at)], ['Status', o.status], ['Served', o.served_at ? fmtDate(o.served_at) : '']])}</tbody></table>
             <h2>Client's confirmation when submitting</h2><table><thead><tr><th>When</th><th>Entry</th><th>Details</th></tr></thead><tbody>${list(p.attestation, [i => fmtDate(i.created_at), 'title', 'detail'])}</tbody></table>
-            <h2>Payment</h2><table><tbody>${rows([['Amount', p.payment.amount_due], ['Paid at', p.payment.paid_at ? fmtDate(p.payment.paid_at) : 'Not paid'], ['Stripe checkout session', p.payment.stripe_session_id]])}</tbody></table>
+            <h2>Payment</h2><table><tbody>${rows([['Amount due', p.payment.amount_due], ['Amount paid', p.payment.amount_paid], ['Paid at', p.payment.paid_at ? fmtDate(p.payment.paid_at) : 'Not paid'], ['Stripe checkout session', p.payment.stripe_session_id]])}</tbody></table>
             <table><thead><tr><th>When</th><th>Payment entry</th><th>Details</th></tr></thead><tbody>${list(p.payment.entries, [i => fmtDate(i.created_at), 'title', 'detail'])}</tbody></table>
             <h2>Service attempts</h2><table><thead><tr><th>Logged</th><th>Attempt</th><th>Details</th><th>Shown to client</th></tr></thead><tbody>${list(p.attempts, [i => fmtDate(i.created_at), 'title', 'detail', i => i.shown_to_client ? 'Yes' : 'No'])}</tbody></table>
             <h2>Client activity on the tracking page</h2>${activity.length || !p.client_activity?.unavailable ? `<table><thead><tr><th>When</th><th>Action</th><th>Details</th><th>Network (hashed)</th></tr></thead><tbody>${list(activity, [i => fmtDate(i.created_at), 'action', 'detail', 'network'])}</tbody></table>` : `<p>${esc(p.client_activity.unavailable)}</p>`}
@@ -351,6 +365,6 @@ const NPS = (() => {
     return {
         esc, post, get, onChange, fileMeta, checkFiles, uploadAll, stripPhotoBytes,
         verifyFileSha256, printChainOfCustody, printReceipt, printEvidencePack, printPage,
-        money, fmtDate, fmtSize,
+        money, fmtDate, fmtSize, fmtAttemptDetail,
     };
 })();
